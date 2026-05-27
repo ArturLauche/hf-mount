@@ -7,25 +7,45 @@
 //! Each volume's config is a plain args file (one flag per line) using the same
 //! CLI syntax as hf-mount-fuse, written by the CSI driver to a shared emptyDir.
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("hf-mount-fuse-sidecar is Unix-only. On Windows, use the NFS backend.");
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use clap::Parser;
+#[cfg(unix)]
 use tracing::{error, info, warn};
 
+#[cfg(unix)]
 use hf_mount::fuse::mount_fuse;
+#[cfg(unix)]
 use hf_mount::setup::{Args as MountArgs, build_runtime, build_with_runtime, init_tracing, raise_fd_limit};
+#[cfg(unix)]
 use hf_mount::virtual_fs::VirtualFs;
 
 /// Set of running mounts, exposed to the SIGTERM handler so it can drain
 /// dirty data before the process exits.
+#[cfg(unix)]
 type VfsRegistry = Arc<Mutex<Vec<Arc<VirtualFs>>>>;
 
+#[cfg(unix)]
 #[derive(Parser)]
 #[command(about = "CSI sidecar mounter for HF volumes")]
 struct Args {
@@ -47,11 +67,13 @@ struct Args {
     expected_mounts: usize,
 }
 
+#[cfg(unix)]
 struct PendingMount {
     mount_args: MountArgs,
     socket_path: PathBuf,
 }
 
+#[cfg(unix)]
 fn main() {
     let args = Args::parse();
     raise_fd_limit();
@@ -185,6 +207,7 @@ fn main() {
     info!("All mounts exited");
 }
 
+#[cfg(unix)]
 fn wait_for_configs(tmp_dir: &Path, poll_secs: u64, timeout_secs: u64, expected: usize) -> Vec<PendingMount> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
@@ -210,6 +233,7 @@ fn wait_for_configs(tmp_dir: &Path, poll_secs: u64, timeout_secs: u64, expected:
     }
 }
 
+#[cfg(unix)]
 fn discover_pending(tmp_dir: &Path) -> io::Result<Vec<PendingMount>> {
     let volumes_dir = tmp_dir.join(".volumes");
     let entries = match std::fs::read_dir(&volumes_dir) {
@@ -249,8 +273,10 @@ fn discover_pending(tmp_dir: &Path) -> io::Result<Vec<PendingMount>> {
 ///   - cmsg:   single SCM_RIGHTS carrying N i32 fds (1 primary + N-1 cloned).
 ///     The CSI driver decides the count; here we accept any non-zero N up
 ///     to `MAX_FUSE_FDS`.
+#[cfg(unix)]
 const MAX_FUSE_FDS: usize = 32;
 
+#[cfg(unix)]
 fn connect_and_receive_fds(socket_path: &Path, timeout_secs: u64) -> io::Result<Vec<OwnedFd>> {
     info!("Connecting to CSI driver socket at {}", socket_path.display());
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -346,11 +372,13 @@ fn connect_and_receive_fds(socket_path: &Path, timeout_secs: u64) -> io::Result<
 }
 
 /// Log an error and write it to the error file for the CSI driver to read.
+#[cfg(unix)]
 fn write_error(path: &Path, msg: &str) {
     error!("{}", msg);
     let _ = std::fs::write(path, msg);
 }
 
+#[cfg(unix)]
 fn run_mount(
     fuse_fds: Vec<OwnedFd>,
     mount_args: MountArgs,
@@ -403,7 +431,7 @@ fn run_mount(
     info!("FUSE session ended for {}", label);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;

@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use cap_std::fs::{Dir, DirBuilder, DirBuilderExt, OpenOptions, Permissions, PermissionsExt};
+use cap_std::fs::{Dir, DirBuilder, OpenOptions};
+#[cfg(unix)]
+use cap_std::fs::{DirBuilderExt, Permissions, PermissionsExt};
 
 #[derive(Debug, Clone)]
 pub struct OverlayDirEntry {
@@ -82,7 +84,10 @@ impl OverlayBacking {
     pub fn create_dir(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
         let rel = validate_rel_path(full_path)?;
         let mut builder = DirBuilder::new();
+        #[cfg(unix)]
         builder.mode(mode as u32);
+        #[cfg(not(unix))]
+        let _ = mode;
         self.dir.create_dir_with(rel, &builder)
     }
 
@@ -102,7 +107,15 @@ impl OverlayBacking {
                 "overlay chmod rejects symlinks",
             ));
         }
-        self.dir.set_permissions(target, Permissions::from_mode(mode as u32))
+        #[cfg(unix)]
+        {
+            self.dir.set_permissions(target, Permissions::from_mode(mode as u32))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            Ok(())
+        }
     }
 
     pub fn remove_file(&self, full_path: &str) -> std::io::Result<()> {
@@ -154,8 +167,19 @@ impl OverlayBacking {
                 is_symlink: false,
                 size: meta.len(),
                 mtime: meta.modified().map(|t| t.into_std()).unwrap_or(SystemTime::UNIX_EPOCH),
-                #[allow(clippy::unnecessary_cast)]
-                mode: (meta.permissions().mode() & 0o777) as u16,
+                mode: {
+                    #[cfg(unix)]
+                    {
+                        #[allow(clippy::unnecessary_cast)]
+                        {
+                            (meta.permissions().mode() & 0o777) as u16
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        if ft.is_dir() { 0o755 } else { 0o644 }
+                    }
+                },
             });
         }
         Ok(out)
@@ -183,7 +207,6 @@ fn validate_rel_path(full_path: &str) -> std::io::Result<&Path> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
     use std::time::UNIX_EPOCH;
 
     fn fresh_temp_dir(name: &str) -> std::path::PathBuf {
@@ -196,8 +219,11 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     #[test]
     fn overlay_open_file_sets_cloexec() {
+        use std::os::fd::AsRawFd;
+
         let root = fresh_temp_dir("cloexec_root");
         std::fs::write(root.join("file.txt"), b"hello").unwrap();
 
@@ -211,6 +237,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn overlay_open_file_rejects_final_symlink() {
         let root = fresh_temp_dir("final_symlink_root");
@@ -233,6 +260,7 @@ mod tests {
         std::fs::remove_dir_all(outside).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn overlay_create_parent_dirs_rejects_symlink_parent() {
         let root = fresh_temp_dir("parent_symlink_root");

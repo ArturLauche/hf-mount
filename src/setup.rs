@@ -84,7 +84,7 @@ pub struct MountOptions {
     pub hub_endpoint: String,
 
     /// Directory for on-disk caches (file chunks, staging files)
-    #[arg(long, default_value = "/tmp/hf-mount-cache")]
+    #[arg(long, default_value_os_t = default_cache_dir())]
     pub cache_dir: PathBuf,
 
     /// Override the UID for all files and directories (defaults to current user)
@@ -343,6 +343,16 @@ pub fn build_with_runtime(
         }
     };
 
+    if options.overlay && options.read_only {
+        panic!(
+            "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead."
+        );
+    }
+    #[cfg(windows)]
+    if options.overlay {
+        panic!("--overlay is not supported on Windows. Use a regular NFS mount without --overlay.");
+    }
+
     let backend = if is_nfs { "nfs" } else { "fuse" };
     let hub_client = runtime.block_on(async {
         HubApiClient::from_source(
@@ -364,12 +374,6 @@ pub fn build_with_runtime(
                 panic!("{e}");
             });
         });
-    }
-
-    if options.overlay && options.read_only {
-        panic!(
-            "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead."
-        );
     }
 
     let read_only = (options.read_only || hub_client.is_repo()) && !options.overlay;
@@ -451,13 +455,13 @@ pub fn build_with_runtime(
         None
     };
 
-    let uid = options.uid.unwrap_or_else(|| unsafe { libc::getuid() });
-    let gid = options.gid.unwrap_or_else(|| unsafe { libc::getgid() });
+    let uid = options.uid.unwrap_or_else(default_uid);
+    let gid = options.gid.unwrap_or_else(default_gid);
 
     // Ignore EEXIST: the directory may already exist from a previous (possibly
     // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
     if let Err(e) = std::fs::create_dir_all(&mount_point)
-        && e.raw_os_error() != Some(libc::EEXIST)
+        && e.kind() != std::io::ErrorKind::AlreadyExists
     {
         panic!("Failed to create mount point {:?}: {e}", mount_point);
     }
@@ -572,19 +576,48 @@ pub fn setup(is_nfs: bool) -> MountSetup {
 /// Try to raise the soft file descriptor limit to avoid "Too many open files"
 /// errors during large batch operations. Most FUSE/NFS filesystems do this.
 pub fn raise_fd_limit() {
-    const TARGET_NOFILE: u64 = 65536;
-    let mut rlim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: rlim is a plain C struct, getrlimit/setrlimit are standard POSIX.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 || rlim.rlim_cur >= TARGET_NOFILE {
-        return;
+    #[cfg(unix)]
+    {
+        const TARGET_NOFILE: u64 = 65536;
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: rlim is a plain C struct, getrlimit/setrlimit are standard POSIX.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 || rlim.rlim_cur >= TARGET_NOFILE {
+            return;
+        }
+        rlim.rlim_cur = TARGET_NOFILE.min(rlim.rlim_max);
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
+            eprintln!("warning: failed to raise file descriptor limit to {TARGET_NOFILE}");
+        }
     }
-    rlim.rlim_cur = TARGET_NOFILE.min(rlim.rlim_max);
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
-        eprintln!("warning: failed to raise file descriptor limit to {TARGET_NOFILE}");
-    }
+}
+
+fn default_cache_dir() -> PathBuf {
+    std::env::temp_dir().join("hf-mount-cache")
+}
+
+#[cfg(unix)]
+fn default_uid() -> u32 {
+    // SAFETY: getuid is a thread-safe POSIX call with no preconditions.
+    unsafe { libc::getuid() }
+}
+
+#[cfg(unix)]
+fn default_gid() -> u32 {
+    // SAFETY: getgid is a thread-safe POSIX call with no preconditions.
+    unsafe { libc::getgid() }
+}
+
+#[cfg(not(unix))]
+fn default_uid() -> u32 {
+    0
+}
+
+#[cfg(not(unix))]
+fn default_gid() -> u32 {
+    0
 }
 
 fn build_cas_config(

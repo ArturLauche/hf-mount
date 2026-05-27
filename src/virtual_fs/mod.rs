@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -23,6 +22,52 @@ use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
 use prefetch::{FetchPlan, PrefetchState};
 use staging::StagingCoordinator;
+
+/// Read at a fixed offset without moving the file cursor. This maps to
+/// pread(2) on Unix and overlapped ReadFile on Windows.
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, offset)
+    }
+}
+
+/// Write at a fixed offset without moving the file cursor.
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_write(buf, offset)
+    }
+}
+
+fn io_error_to_errno(err: std::io::Error) -> i32 {
+    #[cfg(unix)]
+    {
+        err.raw_os_error().unwrap_or(libc::EIO)
+    }
+    #[cfg(not(unix))]
+    {
+        match err.kind() {
+            std::io::ErrorKind::NotFound => libc::ENOENT,
+            std::io::ErrorKind::PermissionDenied => libc::EACCES,
+            std::io::ErrorKind::AlreadyExists => libc::EEXIST,
+            std::io::ErrorKind::InvalidInput => libc::EINVAL,
+            _ => libc::EIO,
+        }
+    }
+}
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -2053,25 +2098,11 @@ impl VirtualFs {
 
         match read_target {
             ReadTarget::LocalFd(file) => {
-                let file_descriptor = file.as_raw_fd();
                 let mut buf = BytesMut::zeroed(size as usize);
-                // SAFETY: fd is valid (Arc<File> keeps it alive), buf is correctly sized.
-                // pread is thread-safe (atomic offset, no shared seek cursor).
-                let n = unsafe {
-                    libc::pread(
-                        file_descriptor,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        size as usize,
-                        offset as i64,
-                    )
-                };
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    buf.truncate(n as usize);
-                    let eof = (n as u32) < size;
-                    Ok((buf.freeze(), eof))
-                }
+                let n = read_at(file.as_ref(), &mut buf, offset).map_err(io_error_to_errno)?;
+                buf.truncate(n);
+                let eof = (n as u32) < size;
+                Ok((buf.freeze(), eof))
             }
             ReadTarget::Remote { prefetch } => {
                 let mut prefetch_state = prefetch.lock().await;
@@ -2193,34 +2224,21 @@ impl VirtualFs {
 
         match target {
             WriteTarget::Local { file, ino: handle_ino } => {
-                let file_descriptor = file.as_raw_fd();
-                let n = unsafe {
-                    libc::pwrite(
-                        file_descriptor,
-                        data.as_ptr() as *const libc::c_void,
-                        data.len(),
-                        offset as i64,
-                    )
-                };
-
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    let written = n as u32;
-                    let new_end = offset + written as u64;
-                    let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(handle_ino) {
-                        if new_end > entry.size {
-                            if let Some(sd) = self.staging.dir() {
-                                sd.resize_bytes(entry.size, new_end);
-                            }
-                            entry.size = new_end;
+                let n = write_at(file.as_ref(), data, offset).map_err(io_error_to_errno)?;
+                let written = n as u32;
+                let new_end = offset + written as u64;
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                if let Some(entry) = inodes.get_mut(handle_ino) {
+                    if new_end > entry.size {
+                        if let Some(sd) = self.staging.dir() {
+                            sd.resize_bytes(entry.size, new_end);
                         }
-                        entry.set_dirty();
+                        entry.size = new_end;
                     }
-                    inodes.touch(handle_ino);
-                    Ok(written)
+                    entry.set_dirty();
                 }
+                inodes.touch(handle_ino);
+                Ok(written)
             }
             WriteTarget::Streaming {
                 ino: handle_ino,
@@ -2794,7 +2812,7 @@ impl VirtualFs {
             if let Err(e) = overlay.create_dir(&full_path, mode) {
                 error!("Failed to create overlay directory {}: {}", full_path, e);
                 self.inode_table.write().expect("inodes poisoned").remove(ino);
-                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                return Err(io_error_to_errno(e));
             }
         }
 
@@ -3013,7 +3031,7 @@ impl VirtualFs {
             && let Err(e) = overlay.remove_dir(&full_path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            return Err(e.raw_os_error().unwrap_or(libc::EIO));
+            return Err(io_error_to_errno(e));
         }
 
         // Re-check ENOTEMPTY + remove under a single write lock to prevent
@@ -3147,14 +3165,14 @@ impl VirtualFs {
             }
             if let Err(e) = overlay.create_parent_dirs(&info.new_full_path) {
                 error!("Overlay rename: failed to create destination parents: {}", e);
-                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                return Err(io_error_to_errno(e));
             }
             if let Err(e) = overlay.rename(&info.old_path, &info.new_full_path) {
                 error!(
                     "Overlay rename {} -> {} failed: {}",
                     info.old_path, info.new_full_path, e
                 );
-                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                return Err(io_error_to_errno(e));
             }
         }
 
@@ -3509,7 +3527,7 @@ impl VirtualFs {
 
                 let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
                     error!("Failed to check local backing file for ino={}: {}", ino, e);
-                    e.raw_os_error().unwrap_or(libc::EIO)
+                    io_error_to_errno(e)
                 })?;
 
                 if self.overlay() && !local_exists {
@@ -3604,7 +3622,7 @@ impl VirtualFs {
                 // would silently disappear at the next remote refresh.
                 let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
                     error!("Failed to check local backing file for ino={}: {}", ino, e);
-                    e.raw_os_error().unwrap_or(libc::EIO)
+                    io_error_to_errno(e)
                 })?;
                 if !local_exists {
                     return Err(libc::EPERM);
@@ -3612,7 +3630,7 @@ impl VirtualFs {
                 if let Some(new_mode) = mode {
                     self.set_local_backing_mode(&full_path, new_mode).map_err(|e| {
                         error!("Failed to update local backing mode for ino={}: {}", ino, e);
-                        e.raw_os_error().unwrap_or(libc::EIO)
+                        io_error_to_errno(e)
                     })?;
                 }
             }
