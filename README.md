@@ -51,31 +51,52 @@ Binaries are available on [GitHub Releases](https://github.com/huggingface/hf-mo
 | Linux x86_64 | `hf-mount-x86_64-linux` | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` |
 | Linux aarch64 | `hf-mount-aarch64-linux` | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` |
 | macOS Apple Silicon | `hf-mount-arm64-apple-darwin` | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` |
+| Windows x64 | Not available | `hf-mount-windows-x64.exe` | Not available |
 
 ### System dependencies (FUSE only)
 
-The NFS backend has no system dependencies. For FUSE:
+On Linux and macOS, the NFS backend has no system dependencies. For FUSE:
 
 **Linux**: `sudo apt-get install -y fuse3` (pre-built binaries only need the runtime; building from source also requires `libfuse3-dev`)
 
 **macOS**: install [macFUSE](https://osxfuse.github.io/) (`brew install macfuse`, requires reboot on first install)
+
+### System dependencies (Windows)
+
+Windows support uses the NFS backend only. FUSE, the `hf-mount start/stop/status` daemon controller, and the FUSE sidecar are Unix-only.
+
+Enable Microsoft's Client for NFS feature:
+
+```powershell
+# Windows Server
+Install-WindowsFeature -Name NFS-Client
+
+# Windows 10 / 11
+Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly,ClientForNFS-Infrastructure -All
+```
+
+Run `hf-mount-windows-x64.exe` from an Administrator PowerShell or Command Prompt. It binds the local NFS portmapper on `127.0.0.1:111`, which requires Administrator privileges. If a drive mounted from an Administrator shell is not visible in non-admin Explorer or applications, enable linked connections and reboot:
+
+```cmd
+reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v EnableLinkedConnections /t REG_DWORD /d 1 /f
+```
 
 ### Build from source
 
 Requires Rust 1.89+.
 
 ```bash
-# NFS only (no system deps, works everywhere)
+# NFS only (Windows builds produce hf-mount-nfs.exe)
 cargo build --release --features nfs
 
-# FUSE (requires macFUSE on macOS, fuse3 on Linux)
+# FUSE (requires macFUSE on macOS, fuse3 on Linux; not available on Windows)
 cargo build --release --features fuse
 
 # All backends
 cargo build --release --features fuse,nfs
 ```
 
-Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
+Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`. On Windows, use `target/release/hf-mount-nfs.exe`; release builds publish the same backend as `hf-mount-windows-x64.exe` with a statically linked C runtime.
 
 ## Best for / Not for
 
@@ -97,6 +118,36 @@ Advisory file locks (`flock`, `fcntl` POSIX record locks) are supported locally 
 See [Consistency model](#consistency-model) for details.
 
 ## Usage
+
+### Windows
+
+Download `hf-mount-windows-x64.exe` from [GitHub Releases](https://github.com/huggingface/hf-mount/releases), enable Client for NFS, then run it from an Administrator PowerShell or Command Prompt. The Windows executable is the foreground NFS backend, so commands do not use `hf-mount start`.
+
+```powershell
+$env:HF_TOKEN = "hf_..."
+
+# Mount to a drive letter
+.\hf-mount-windows-x64.exe repo openai/gpt-oss-20b Z:
+
+# Or mount to an empty NTFS directory
+New-Item -ItemType Directory -Force C:\hf-mounts\gpt-oss | Out-Null
+.\hf-mount-windows-x64.exe repo openai/gpt-oss-20b C:\hf-mounts\gpt-oss
+```
+
+Stop the mount with Ctrl+C in the foreground process, or unmount it from another Administrator shell:
+
+```powershell
+umount -f Z:
+```
+
+Windows differences and limitations:
+- NFS only; FUSE and the background daemon controller are Unix-only.
+- `hf-mount-windows-x64.exe` stays in the foreground and owns the local NFS server until stopped.
+- Administrator privileges are required because the Windows NFS client uses the local portmapper on port `111`.
+- The mount point should be a drive letter such as `Z:` or an empty NTFS directory.
+- Overlay mode (`--overlay`) is not supported on Windows.
+- Read-only repo mounts and `--read-only` are enforced by hf-mount; the Windows NFS client does not use a separate read-only mount option.
+- POSIX metadata such as uid, gid, chmod modes, and symlinks is best-effort through the Windows NFS client and may not behave exactly like Linux/macOS clients.
 
 ### Mount a repo (read-only)
 
@@ -211,7 +262,7 @@ hf-mount stop /tmp/data          # daemon mounts
 | --- | --- | --- |
 | `--hf-token` | `$HF_TOKEN` | HF API token (required for private repos/buckets) |
 | `--hub-endpoint` | `https://huggingface.co` | Hub API endpoint |
-| `--cache-dir` | `/tmp/hf-mount-cache` | Local cache directory |
+| `--cache-dir` | system temp dir + `hf-mount-cache` | Local cache directory |
 | `--cache-size` | `10000000000` (~10 GB) | Max on-disk chunk cache size in bytes |
 | `--read-only` | `false` | Mount read-only (always on for repos) |
 | `--advanced-writes` | `false` | Enable staging files + async flush (random writes, seek, overwrite) |
@@ -356,11 +407,38 @@ cargo test --release --features nfs --test repo_ops -- --test-threads=1 --nocapt
 HF_TOKEN=... cargo test --release --features fuse,nfs --test bench -- --nocapture
 ```
 
+Windows build smoke (run on Windows with Rust installed):
+
+```powershell
+cargo test --lib --target x86_64-pc-windows-msvc --no-default-features --features nfs
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
+cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs --bin hf-mount-nfs
+.\target\x86_64-pc-windows-msvc\release\hf-mount-nfs.exe --help
+```
+
 ## Troubleshooting
 
 > I'm getting `Operation not permitted` on MacOS while opening or listing files in a mounted bucket using VSCode
 
 You need to enable "Full disk access" to your VSCode (System settings > Privacy > Full disk access).
+
+### Windows
+
+**`mount.exe` or `umount.exe` is not recognized**
+
+Enable Client for NFS and open a new Administrator shell. On Windows 10/11, use `Enable-WindowsOptionalFeature`; on Windows Server, use `Install-WindowsFeature`.
+
+**`failed to bind portmapper on 127.0.0.1:111`**
+
+Run the executable as Administrator. If it still fails, another portmapper/NFS service is already using port `111`; stop that service or close the other hf-mount instance.
+
+**`mount.exe failed ... Client for NFS enabled?`**
+
+Confirm the Client for NFS feature is installed, the shell is elevated, and the mount point is a drive letter (`Z:`) or an empty NTFS directory.
+
+**The mounted drive is not visible in Explorer or non-admin apps**
+
+Windows separates elevated and non-elevated mapped drives by default. Set `EnableLinkedConnections` as shown in [System dependencies (Windows)](#system-dependencies-windows), then reboot.
 
 ## License
 

@@ -1,0 +1,69 @@
+name: Windows Build
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-build.yml"
+      - ".github/workflows/release.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-build.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C target-feature=+crt-static
+
+jobs:
+  build:
+    name: Build hf-mount-windows-x64.exe
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64
+
+      - name: Enable Client for NFS
+        shell: pwsh
+        run: Install-WindowsFeature -Name NFS-Client
+
+      - name: Unit tests
+        run: cargo test --lib --target x86_64-pc-windows-msvc --no-default-features --features nfs
+
+      - name: Build Windows executable
+        run: cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs --bin hf-mount-nfs
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\hf-mount-nfs.exe dist\hf-mount-windows-x64.exe
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          .\dist\hf-mount-windows-x64.exe --version
+          .\dist\hf-mount-windows-x64.exe --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hf-mount-windows-x64
+          path: dist/hf-mount-windows-x64.exe
+          if-no-files-found: error
