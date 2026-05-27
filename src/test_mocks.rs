@@ -585,8 +585,7 @@ pub fn make_test_vfs(
 
     let overlay_backing = if opts.overlay {
         let overlay_root = fresh_test_dir("hf_mount_overlay");
-        let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
-        Some(OverlayBacking::new(fd))
+        Some(OverlayBacking::open_dir(&overlay_root).expect("failed to open overlay root dir"))
     } else {
         None
     };
@@ -639,9 +638,8 @@ pub fn make_overlay_test_vfs_with_root(
         .build()
         .unwrap();
     let cache_dir = fresh_test_dir("hf_mount_test");
-    let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
     let staging_dir = Some(StagingDir::new(&cache_dir, 0));
-    let overlay_backing = Some(OverlayBacking::new(fd));
+    let overlay_backing = Some(OverlayBacking::open_dir(&overlay_root).expect("failed to open overlay root dir"));
 
     let vfs = crate::virtual_fs::VirtualFs::new(
         rt.handle().clone(),

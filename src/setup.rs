@@ -429,21 +429,19 @@ pub fn build_with_runtime(
 
     let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
 
-    // Overlay: open a pre-mount fd to the mount point directory. The fd is
-    // held by OverlayBacking so overlay-local filesystem ops can stay rooted
-    // at the covered directory after mount.
-    let overlay_fd = if options.overlay {
+    // Overlay: open the mount point directory before mounting over it. The
+    // handle is held by OverlayBacking so overlay-local filesystem ops stay
+    // rooted at the covered directory after mount.
+    let overlay_backing = if options.overlay {
         std::fs::create_dir_all(&mount_point)
             .unwrap_or_else(|e| panic!("Failed to create mount point {:?} for overlay: {e}", mount_point));
         Some(
-            std::fs::File::open(&mount_point)
+            OverlayBacking::open_dir(&mount_point)
                 .unwrap_or_else(|e| panic!("Failed to open mount point {:?} for overlay: {e}", mount_point)),
         )
     } else {
         None
     };
-
-    let overlay_backing = overlay_fd.map(OverlayBacking::new);
 
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
