@@ -83,12 +83,18 @@ impl OverlayBacking {
 
     pub fn create_dir(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
         let rel = validate_rel_path(full_path)?;
-        let mut builder = DirBuilder::new();
         #[cfg(unix)]
-        builder.mode(mode as u32);
+        {
+            let mut builder = DirBuilder::new();
+            builder.mode(mode as u32);
+            self.dir.create_dir_with(rel, &builder)
+        }
         #[cfg(not(unix))]
-        let _ = mode;
-        self.dir.create_dir_with(rel, &builder)
+        {
+            let _ = mode;
+            let builder = DirBuilder::new();
+            self.dir.create_dir_with(rel, &builder)
+        }
     }
 
     pub fn set_mode(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
@@ -227,12 +233,14 @@ mod tests {
         let root = fresh_temp_dir("cloexec_root");
         std::fs::write(root.join("file.txt"), b"hello").unwrap();
 
-        let overlay = OverlayBacking::open_dir(&root).unwrap();
-        let file = overlay.open_file("file.txt", true, false, false, false).unwrap();
+        {
+            let overlay = OverlayBacking::open_dir(&root).unwrap();
+            let file = overlay.open_file("file.txt", true, false, false, false).unwrap();
 
-        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-        assert!(flags >= 0, "F_GETFD should succeed");
-        assert_ne!(flags & libc::FD_CLOEXEC, 0, "overlay file fd should be close-on-exec");
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD should succeed");
+            assert_ne!(flags & libc::FD_CLOEXEC, 0, "overlay file fd should be close-on-exec");
+        }
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -246,14 +254,16 @@ mod tests {
         std::fs::write(&outside_file, b"outside").unwrap();
         std::os::unix::fs::symlink(&outside_file, root.join("link.txt")).unwrap();
 
-        let overlay = OverlayBacking::open_dir(&root).unwrap();
-        let err = overlay
-            .open_file("link.txt", true, false, false, false)
-            .expect_err("overlay open should not follow final symlink");
-        assert!(
-            err.kind() != std::io::ErrorKind::NotFound,
-            "final symlink should be rejected, not treated as a normal missing file"
-        );
+        {
+            let overlay = OverlayBacking::open_dir(&root).unwrap();
+            let err = overlay
+                .open_file("link.txt", true, false, false, false)
+                .expect_err("overlay open should not follow final symlink");
+            assert!(
+                err.kind() != std::io::ErrorKind::NotFound,
+                "final symlink should be rejected, not treated as a normal missing file"
+            );
+        }
         assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
 
         std::fs::remove_dir_all(root).unwrap();
@@ -267,10 +277,12 @@ mod tests {
         let outside = fresh_temp_dir("parent_symlink_outside");
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
 
-        let overlay = OverlayBacking::open_dir(&root).unwrap();
-        overlay
-            .create_parent_dirs("escape/nested/file.txt")
-            .expect_err("overlay mkdir walk should not follow parent symlink");
+        {
+            let overlay = OverlayBacking::open_dir(&root).unwrap();
+            overlay
+                .create_parent_dirs("escape/nested/file.txt")
+                .expect_err("overlay mkdir walk should not follow parent symlink");
+        }
         assert!(
             !outside.join("nested").exists(),
             "symlinked parent should not allow directory creation outside the overlay root"
@@ -284,8 +296,10 @@ mod tests {
     fn overlay_exists_returns_false_for_missing_parent() {
         let root = fresh_temp_dir("missing_parent_root");
 
-        let overlay = OverlayBacking::open_dir(&root).unwrap();
-        assert!(!overlay.exists("missing/child.txt").unwrap());
+        {
+            let overlay = OverlayBacking::open_dir(&root).unwrap();
+            assert!(!overlay.exists("missing/child.txt").unwrap());
+        }
 
         std::fs::remove_dir_all(root).unwrap();
     }
