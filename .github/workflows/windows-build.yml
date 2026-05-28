@@ -27,7 +27,7 @@ env:
 
 jobs:
   build:
-    name: Build hf-mount-windows-x64.exe
+    name: Build Windows executables
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -47,23 +47,36 @@ jobs:
       - name: Unit tests
         run: cargo test --lib --target x86_64-pc-windows-msvc --no-default-features --features nfs
 
-      - name: Build Windows executable
-        run: cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs --bin hf-mount-nfs
+      - name: Build Windows executables
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs --bin hf-mount-nfs
+          cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs,gui --bin hf-mount-gui
 
       - name: Stage artifact
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\hf-mount-nfs.exe dist\hf-mount-windows-x64.exe
+          Copy-Item target\x86_64-pc-windows-msvc\release\hf-mount-gui.exe dist\hf-mount-gui-windows-x64.exe
 
       - name: Smoke test
         shell: pwsh
         run: |
           .\dist\hf-mount-windows-x64.exe --version
           .\dist\hf-mount-windows-x64.exe --help
+          .\dist\hf-mount-gui-windows-x64.exe --version
+          .\dist\hf-mount-gui-windows-x64.exe --help
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
         with:
           name: hf-mount-windows-x64
           path: dist/hf-mount-windows-x64.exe
+          if-no-files-found: error
+
+      - name: Upload GUI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-mount-gui-windows-x64
+          path: dist/hf-mount-gui-windows-x64.exe
           if-no-files-found: error

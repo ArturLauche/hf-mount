@@ -46,12 +46,16 @@ On macOS, this installs the NFS backend only (`hf-mount`, `hf-mount-nfs`). For t
 
 Binaries are available on [GitHub Releases](https://github.com/huggingface/hf-mount/releases):
 
-| Platform | Daemon | NFS | FUSE |
-| --- | --- | --- | --- |
-| Linux x86_64 | `hf-mount-x86_64-linux` | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` |
-| Linux aarch64 | `hf-mount-aarch64-linux` | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` |
-| macOS Apple Silicon | `hf-mount-arm64-apple-darwin` | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` |
-| Windows x64 | Not available | `hf-mount-windows-x64.exe` | Not available |
+| Platform | Daemon | NFS | FUSE | GUI |
+| --- | --- | --- | --- | --- |
+| Linux x86_64 | `hf-mount-x86_64-linux` | `hf-mount-nfs-x86_64-linux` | `hf-mount-fuse-x86_64-linux` | Not available |
+| Linux aarch64 | `hf-mount-aarch64-linux` | `hf-mount-nfs-aarch64-linux` | `hf-mount-fuse-aarch64-linux` | Not available |
+| macOS Apple Silicon | `hf-mount-arm64-apple-darwin` | `hf-mount-nfs-arm64-apple-darwin` | `hf-mount-fuse-arm64-apple-darwin` | `hf-mount-gui-arm64-apple-darwin.app.zip` or `hf-mount-gui-arm64-apple-darwin` |
+| Windows x64 | Not available | `hf-mount-windows-x64.exe` | Not available | `hf-mount-gui-windows-x64.exe` |
+
+For non-release builds, GitHub Actions uploads these artifacts:
+- **Windows Build**: `hf-mount-windows-x64` and `hf-mount-gui-windows-x64`
+- **macOS GUI Build**: `hf-mount-gui-macos-arm64`
 
 ### System dependencies (FUSE only)
 
@@ -63,7 +67,7 @@ On Linux and macOS, the NFS backend has no system dependencies. For FUSE:
 
 ### System dependencies (Windows)
 
-Windows support uses the NFS backend only. FUSE, the `hf-mount start/stop/status` daemon controller, and the FUSE sidecar are Unix-only.
+Windows support uses the NFS backend only. FUSE, the `hf-mount start/stop/status` daemon controller, and the FUSE sidecar are Unix-only. The GUI executable uses the same Windows NFS backend and has the same setup requirements as the CLI executable.
 
 Enable Microsoft's Client for NFS feature:
 
@@ -89,6 +93,9 @@ Requires Rust 1.89+.
 # NFS only (Windows builds produce hf-mount-nfs.exe)
 cargo build --release --features nfs
 
+# Native GUI (NFS backend; Windows and macOS)
+cargo build --release --no-default-features --features nfs,gui --bin hf-mount-gui
+
 # FUSE (requires macFUSE on macOS, fuse3 on Linux; not available on Windows)
 cargo build --release --features fuse
 
@@ -96,7 +103,7 @@ cargo build --release --features fuse
 cargo build --release --features fuse,nfs
 ```
 
-Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`. On Windows, use `target/release/hf-mount-nfs.exe`; release builds publish the same backend as `hf-mount-windows-x64.exe` with a statically linked C runtime.
+Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`, and `target/release/hf-mount-gui` when the `gui` feature is enabled. On Windows, use `target/release/hf-mount-nfs.exe` for the CLI or `target/release/hf-mount-gui.exe` for the GUI; release builds publish them as `hf-mount-windows-x64.exe` and `hf-mount-gui-windows-x64.exe` with a statically linked C runtime.
 
 ## Best for / Not for
 
@@ -118,6 +125,32 @@ Advisory file locks (`flock`, `fcntl` POSIX record locks) are supported locally 
 See [Consistency model](#consistency-model) for details.
 
 ## Usage
+
+### GUI app (Windows and macOS)
+
+Download the GUI binary from [GitHub Releases](https://github.com/huggingface/hf-mount/releases):
+
+- Windows x64: `hf-mount-gui-windows-x64.exe`
+- macOS Apple Silicon app bundle: `hf-mount-gui-arm64-apple-darwin.app.zip`
+- macOS Apple Silicon raw binary: `hf-mount-gui-arm64-apple-darwin`
+
+Windows users must enable Client for NFS and run the GUI from an Administrator session. Fill in the repo or bucket ID, mount point, optional token, then press **Start mount**. Press **Stop mount** to unmount.
+
+On macOS, unzip the `.app.zip` and open `hf-mount.app`. If you use the raw binary instead, make it executable before first run:
+
+```bash
+chmod +x ./hf-mount-gui-arm64-apple-darwin
+./hf-mount-gui-arm64-apple-darwin
+```
+
+If macOS blocks the unsigned downloaded app or binary, remove the quarantine attribute or allow it in System Settings:
+
+```bash
+xattr -dr com.apple.quarantine ./hf-mount.app
+xattr -dr com.apple.quarantine ./hf-mount-gui-arm64-apple-darwin
+```
+
+The GUI uses the NFS backend on both Windows and macOS. It does not enable FUSE or overlay mode.
 
 ### Windows
 
@@ -413,7 +446,9 @@ Windows build smoke (run on Windows with Rust installed):
 cargo test --lib --target x86_64-pc-windows-msvc --no-default-features --features nfs
 $env:RUSTFLAGS = "-C target-feature=+crt-static"
 cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs --bin hf-mount-nfs
+cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs,gui --bin hf-mount-gui
 .\target\x86_64-pc-windows-msvc\release\hf-mount-nfs.exe --help
+.\target\x86_64-pc-windows-msvc\release\hf-mount-gui.exe --help
 ```
 
 ## Troubleshooting

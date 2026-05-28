@@ -1,0 +1,58 @@
+name: macOS GUI Build
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "scripts/package-macos-gui.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/macos-gui-build.yml"
+      - ".github/workflows/release.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "scripts/package-macos-gui.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/macos-gui-build.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build hf-mount-gui for macOS
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-gui-aarch64
+
+      - name: Build GUI
+        run: |
+          cargo build --release --target aarch64-apple-darwin --no-default-features --features nfs,gui,vendored-openssl --bin hf-mount-gui
+
+      - name: Smoke test
+        run: |
+          target/aarch64-apple-darwin/release/hf-mount-gui --version
+          target/aarch64-apple-darwin/release/hf-mount-gui --help
+
+      - name: Stage artifacts
+        run: bash scripts/package-macos-gui.sh aarch64-apple-darwin arm64 dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hf-mount-gui-macos-arm64
+          path: dist/
+          if-no-files-found: error
