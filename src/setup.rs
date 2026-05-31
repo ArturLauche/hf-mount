@@ -460,7 +460,12 @@ pub fn build_with_runtime(
 
     // Ignore EEXIST: the directory may already exist from a previous (possibly
     // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
-    if let Err(e) = std::fs::create_dir_all(&mount_point)
+    //
+    // On Windows, drive-letter NFS targets such as `Z:` or `Z:\` are created
+    // by mount.exe itself. Calling create_dir_all on them before the drive is
+    // mapped fails and prevents the mount command from ever running.
+    if should_create_mount_point(&mount_point, is_nfs)
+        && let Err(e) = std::fs::create_dir_all(&mount_point)
         && e.kind() != std::io::ErrorKind::AlreadyExists
     {
         panic!("Failed to create mount point {:?}: {e}", mount_point);
@@ -598,6 +603,35 @@ fn default_cache_dir() -> PathBuf {
     std::env::temp_dir().join("hf-mount-cache")
 }
 
+fn should_create_mount_point(mount_point: &Path, is_nfs: bool) -> bool {
+    #[cfg(windows)]
+    {
+        if is_nfs && is_windows_drive_mount_point(mount_point) {
+            return false;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (mount_point, is_nfs);
+    true
+}
+
+#[cfg(windows)]
+fn is_windows_drive_mount_point(path: &Path) -> bool {
+    let text = path.as_os_str().to_string_lossy();
+    let mut chars = text.chars();
+    let Some(drive) = chars.next() else {
+        return false;
+    };
+    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+        return false;
+    }
+    match (chars.next(), chars.next()) {
+        (None, None) => true,
+        (Some('\\' | '/'), None) => true,
+        _ => false,
+    }
+}
+
 #[cfg(unix)]
 fn default_uid() -> u32 {
     // SAFETY: getuid is a thread-safe POSIX call with no preconditions.
@@ -639,4 +673,17 @@ fn build_cas_config(
         )
         .unwrap_or_else(|e| panic!("Failed to build TranslatorConfig: {e}")),
     )
+}
+
+#[cfg(all(test, windows))]
+mod windows_mount_point_tests {
+    use super::*;
+
+    #[test]
+    fn nfs_drive_letters_are_not_created_as_directories() {
+        assert!(!should_create_mount_point(Path::new("Z:"), true));
+        assert!(!should_create_mount_point(Path::new("Z:\\"), true));
+        assert!(should_create_mount_point(Path::new("C:\\hf-mounts\\repo"), true));
+        assert!(should_create_mount_point(Path::new("Z:"), false));
+    }
 }

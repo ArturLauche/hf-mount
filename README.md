@@ -134,7 +134,7 @@ Download the GUI binary from [GitHub Releases](https://github.com/huggingface/hf
 - macOS Apple Silicon app bundle: `hf-mount-gui-arm64-apple-darwin.app.zip`
 - macOS Apple Silicon raw binary: `hf-mount-gui-arm64-apple-darwin`
 
-Windows users must enable Client for NFS and run the GUI from an Administrator session. Fill in the repo or bucket ID, mount point, optional token, then press **Start mount**. Press **Stop mount** to unmount.
+Windows users must enable Client for NFS and run the GUI from an Administrator session. The GUI includes a **Check setup** action that validates elevation, the Windows NFS client tools, and the mount target before starting. Fill in the repo or bucket ID, mount point, optional token, then press **Start mount**. Press **Stop mount** to unmount.
 
 On macOS, unzip the `.app.zip` and open `hf-mount.app`. If you use the raw binary instead, make it executable before first run:
 
@@ -178,6 +178,7 @@ Windows differences and limitations:
 - `hf-mount-windows-x64.exe` stays in the foreground and owns the local NFS server until stopped.
 - Administrator privileges are required because the Windows NFS client uses the local portmapper on port `111`.
 - The mount point should be a drive letter such as `Z:` or an empty NTFS directory.
+- Drive-letter targets such as `Z:` are mapped by Windows `mount.exe`; hf-mount does not try to create them as directories first.
 - Overlay mode (`--overlay`) is not supported on Windows.
 - Read-only repo mounts and `--read-only` are enforced by hf-mount; the Windows NFS client does not use a separate read-only mount option.
 - POSIX metadata such as uid, gid, chmod modes, and symlinks is best-effort through the Windows NFS client and may not behave exactly like Linux/macOS clients.
@@ -449,6 +450,14 @@ cargo build --release --target x86_64-pc-windows-msvc --no-default-features --fe
 cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features nfs,gui --bin hf-mount-gui
 .\target\x86_64-pc-windows-msvc\release\hf-mount-nfs.exe --help
 .\target\x86_64-pc-windows-msvc\release\hf-mount-gui.exe --help
+```
+
+macOS GUI build smoke (run on Apple Silicon macOS with Rust installed):
+
+```bash
+cargo build --release --target aarch64-apple-darwin --no-default-features --features nfs,gui,vendored-openssl --bin hf-mount-gui
+target/aarch64-apple-darwin/release/hf-mount-gui --help
+bash scripts/package-macos-gui.sh aarch64-apple-darwin arm64 dist
 ```
 
 ## Troubleshooting

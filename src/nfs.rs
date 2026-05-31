@@ -498,6 +498,36 @@ pub async fn mount_nfs(
     read_only: bool,
     daemon_guard: Option<&mut DaemonGuard>,
 ) -> std::io::Result<()> {
+    mount_nfs_with_callback(
+        virtual_fs,
+        mount_point,
+        metadata_ttl_ms,
+        read_only,
+        daemon_guard,
+        |_| {},
+    )
+    .await
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NfsMountEvent {
+    ServerListening { port: u16 },
+    MountCommand { command: String },
+    Mounted { mount_point: String },
+    ShuttingDown { reason: String },
+}
+
+pub async fn mount_nfs_with_callback<F>(
+    virtual_fs: Arc<VirtualFs>,
+    mount_point: &Path,
+    metadata_ttl_ms: u64,
+    read_only: bool,
+    daemon_guard: Option<&mut DaemonGuard>,
+    mut on_event: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(NfsMountEvent) + Send,
+{
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs, read_only);
     let pool_for_shutdown = adapter.handle_pool.clone();
@@ -525,6 +555,7 @@ pub async fn mount_nfs(
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
     let port = listener.get_listen_port();
     info!("NFS server listening on 127.0.0.1:{}", port);
+    on_event(NfsMountEvent::ServerListening { port });
 
     // Register mount/unmount listener: nfsserve sends `false` on UMNT.
     let (mount_tx, mut mount_rx) = tokio::sync::mpsc::channel::<bool>(1);
@@ -560,7 +591,11 @@ pub async fn mount_nfs(
         } else {
             opts = format!("{opts},wsize=1048576");
         }
-        let status = std::process::Command::new("mount_nfs")
+        let mount_cmd = mount_nfs_command_path();
+        on_event(NfsMountEvent::MountCommand {
+            command: format!("{} -o {} 127.0.0.1:/ {}", mount_cmd.display(), opts, mount_point_str),
+        });
+        let status = std::process::Command::new(mount_cmd)
             .args(["-o", &opts, "127.0.0.1:/", mount_point_str])
             .status()?;
         if !status.success() {
@@ -575,6 +610,9 @@ pub async fn mount_nfs(
         if !read_only {
             mount_opts = format!("{mount_opts},wsize=1048576");
         }
+        on_event(NfsMountEvent::MountCommand {
+            command: format!("mount.nfs -o {mount_opts} 127.0.0.1:/ {mount_point_str}"),
+        });
         let output = if unsafe { libc::getuid() } == 0 {
             std::process::Command::new("mount.nfs")
                 .args(["-o", &mount_opts, "127.0.0.1:/", mount_point_str])
@@ -614,7 +652,10 @@ pub async fn mount_nfs(
         let _ = actimeo; // mount.exe has no actimeo equivalent.
         let opts = String::from("nolock,anon,mtype=hard,rsize=32,wsize=32,timeout=60");
         let share = "\\\\127.0.0.1\\!";
-        let cmd = format!("mount.exe -o {opts} {share} {mount_point_str}");
+        let mount_target = windows_nfs_mount_target(mount_point_str);
+        let mount_cmd = mount_nfs_command_path();
+        let cmd = format!("{} -o {opts} {share} {mount_target}", mount_cmd.display());
+        on_event(NfsMountEvent::MountCommand { command: cmd.clone() });
         if skip_auto_mount {
             info!(
                 "HF_MOUNT_SKIP_AUTO_MOUNT set; server and portmapper are running, mount.exe was not invoked.\n\
@@ -622,8 +663,8 @@ pub async fn mount_nfs(
             );
         } else {
             info!("Running: {cmd}");
-            let output = tokio::process::Command::new("mount")
-                .args(["-o", &opts, share, mount_point_str])
+            let output = tokio::process::Command::new(mount_cmd)
+                .args(["-o", &opts, share, &mount_target])
                 .output()
                 .await?;
             if !output.status.success() {
@@ -640,6 +681,9 @@ pub async fn mount_nfs(
     }
 
     info!("NFS mount active at {}", mount_point_str);
+    on_event(NfsMountEvent::Mounted {
+        mount_point: mount_point_str.to_string(),
+    });
 
     // Signal the parent process that the mount is live (daemon mode).
     if let Some(guard) = daemon_guard {
@@ -668,6 +712,9 @@ pub async fn mount_nfs(
                     Some(true) => continue,  // mount event, keep waiting
                     _ => {
                         info!("NFS unmount detected via UMNT, shutting down");
+                        on_event(NfsMountEvent::ShuttingDown {
+                            reason: "unmount detected".to_string(),
+                        });
                         break;
                     }
                 }
@@ -675,21 +722,33 @@ pub async fn mount_nfs(
             _ = &mut server_handle => {
                 server_exited = true;
                 info!("NFS server exited");
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "server exited".to_string(),
+                });
                 break;
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C, unmounting...");
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "Ctrl+C received".to_string(),
+                });
                 unmount_nfs(mount_point_str);
                 break;
             }
             _ = &mut sigterm_fut => {
                 info!("Received SIGTERM, unmounting...");
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "termination signal received".to_string(),
+                });
                 unmount_nfs(mount_point_str);
                 break;
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
                 if !skip_auto_mount && !is_mounted(mount_point_str) {
                     info!("NFS mount disappeared, shutting down");
+                    on_event(NfsMountEvent::ShuttingDown {
+                        reason: "mount disappeared".to_string(),
+                    });
                     break;
                 }
             }
@@ -913,7 +972,7 @@ fn unmount_nfs(mount_point: &str) {
 
     // Fallback: external command.
     #[cfg(target_os = "macos")]
-    if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
+    if let Err(e) = std::process::Command::new("/sbin/umount").arg(mount_point).status() {
         tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
     }
     #[cfg(target_os = "linux")]
@@ -930,7 +989,10 @@ fn unmount_nfs(mount_point: &str) {
         }
     }
     #[cfg(windows)]
-    if let Err(e) = std::process::Command::new("umount").args(["-f", mount_point]).status() {
+    if let Err(e) = std::process::Command::new(umount_command_path())
+        .args(["-f", &windows_nfs_mount_target(mount_point)])
+        .status()
+    {
         tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
     }
 }
@@ -967,7 +1029,81 @@ fn is_mounted(path: &str) -> bool {
         // Best-effort for drive-letter mounts. Directory mount points may
         // continue to exist after unmount, but Windows sends UMNT for normal
         // unmounts and Ctrl+C still tears the server down explicitly.
-        std::fs::metadata(path).is_ok()
+        std::fs::metadata(windows_nfs_probe_path(path)).is_ok()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mount_nfs_command_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/sbin/mount_nfs")
+}
+
+#[cfg(windows)]
+fn mount_nfs_command_path() -> std::path::PathBuf {
+    windows_system32_exe("mount.exe")
+}
+
+#[cfg(windows)]
+fn umount_command_path() -> std::path::PathBuf {
+    windows_system32_exe("umount.exe")
+}
+
+#[cfg(windows)]
+fn windows_system32_exe(name: &str) -> std::path::PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join(name)
+}
+
+#[cfg(windows)]
+fn windows_nfs_mount_target(path: &str) -> String {
+    match windows_drive_letter(path) {
+        Some(drive) => format!("{drive}:"),
+        None => path.to_string(),
+    }
+}
+
+#[cfg(windows)]
+fn windows_nfs_probe_path(path: &str) -> String {
+    match windows_drive_letter(path) {
+        Some(drive) => format!("{drive}:\\"),
+        None => path.to_string(),
+    }
+}
+
+#[cfg(windows)]
+fn windows_drive_letter(path: &str) -> Option<char> {
+    let mut chars = path.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+        return None;
+    }
+    match (chars.next(), chars.next()) {
+        (None, None) => Some(drive),
+        (Some('\\' | '/'), None) => Some(drive),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_nfs_path_tests {
+    use super::*;
+
+    #[test]
+    fn drive_letter_mount_targets_are_normalized_for_mount_exe() {
+        assert_eq!(windows_nfs_mount_target("Z:"), "Z:");
+        assert_eq!(windows_nfs_mount_target("Z:\\"), "Z:");
+        assert_eq!(windows_nfs_mount_target("z:/"), "z:");
+        assert_eq!(windows_nfs_mount_target(r"C:\hf-mounts\repo"), r"C:\hf-mounts\repo");
+    }
+
+    #[test]
+    fn drive_letter_probe_paths_use_a_root_separator() {
+        assert_eq!(windows_nfs_probe_path("Z:"), "Z:\\");
+        assert_eq!(windows_nfs_probe_path("Z:\\"), "Z:\\");
+        assert_eq!(windows_nfs_probe_path(r"C:\hf-mounts\repo"), r"C:\hf-mounts\repo");
     }
 }
 
