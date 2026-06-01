@@ -651,7 +651,7 @@ where
     {
         let _ = actimeo; // mount.exe has no actimeo equivalent.
         let opts = String::from("nolock,anon,mtype=hard,rsize=32,wsize=32,timeout=60");
-        let share = "\\\\127.0.0.1\\!";
+        let share = windows_nfs_share();
         let mount_target = windows_nfs_mount_target(mount_point_str);
         let mount_cmd = mount_nfs_command_path();
         let cmd = format!("{} -o {opts} {share} {mount_target}", mount_cmd.display());
@@ -1049,6 +1049,11 @@ fn umount_command_path() -> std::path::PathBuf {
 }
 
 #[cfg(windows)]
+fn windows_nfs_share() -> &'static str {
+    "127.0.0.1:/"
+}
+
+#[cfg(windows)]
 fn windows_system32_exe(name: &str) -> std::path::PathBuf {
     std::env::var_os("SystemRoot")
         .map(std::path::PathBuf::from)
@@ -1104,6 +1109,11 @@ mod windows_nfs_path_tests {
         assert_eq!(windows_nfs_probe_path("Z:"), "Z:\\");
         assert_eq!(windows_nfs_probe_path("Z:\\"), "Z:\\");
         assert_eq!(windows_nfs_probe_path(r"C:\hf-mounts\repo"), r"C:\hf-mounts\repo");
+    }
+
+    #[test]
+    fn windows_mount_uses_root_nfs_export_syntax() {
+        assert_eq!(windows_nfs_share(), "127.0.0.1:/");
     }
 }
 

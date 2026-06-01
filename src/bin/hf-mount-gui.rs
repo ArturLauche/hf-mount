@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
 #[cfg(windows)]
+use std::net::{TcpListener, UdpSocket};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::process::Stdio;
@@ -66,6 +68,17 @@ fn handle_cli_info() -> bool {
             println!("hf-mount-gui {}", env!("CARGO_PKG_VERSION"));
             true
         }
+        "--check-setup" => {
+            let mount_point = args.next().unwrap_or_else(default_mount_point);
+            let checks = run_preflight_checks(&mount_point);
+            for check in &checks {
+                println!("[{}] {}: {}", check_level_label(check.level), check.label, check.detail);
+            }
+            if checks.iter().any(|check| check.level == CheckLevel::Fail) {
+                std::process::exit(1);
+            }
+            true
+        }
         other => {
             eprintln!("unknown argument: {other}");
             print_help();
@@ -81,7 +94,8 @@ fn print_help() {
          USAGE:\n\
            hf-mount-gui\n\
            hf-mount-gui --help\n\
-           hf-mount-gui --version\n\n\
+           hf-mount-gui --version\n\
+           hf-mount-gui --check-setup [MOUNT_POINT]\n\n\
          Windows requires Client for NFS and an Administrator session.",
         version = env!("CARGO_PKG_VERSION")
     );
@@ -253,11 +267,13 @@ struct MountGuiApp {
 
 impl Default for MountGuiApp {
     fn default() -> Self {
+        let mount_point = default_mount_point();
+        let checks = run_preflight_checks(&mount_point);
         Self {
             source: GuiSource::Repo,
             source_id: "openai-community/gpt2".to_string(),
             revision: "main".to_string(),
-            mount_point: default_mount_point(),
+            mount_point,
             hf_token: std::env::var("HF_TOKEN").unwrap_or_default(),
             hub_endpoint: "https://huggingface.co".to_string(),
             cache_dir: std::env::temp_dir()
@@ -266,7 +282,7 @@ impl Default for MountGuiApp {
                 .into_owned(),
             read_only: true,
             show_advanced: false,
-            checks: Vec::new(),
+            checks,
             status: Arc::new(Mutex::new(SharedStatus::default())),
             mount_thread: None,
             active_mount_point: None,
@@ -291,7 +307,7 @@ impl eframe::App for MountGuiApp {
                 ui.horizontal_top(|ui| {
                     ui.set_height(ui.available_height());
                     ui.vertical(|ui| {
-                        ui.set_width(315.0);
+                        ui.set_width(330.0);
                         self.draw_status_panel(ui);
                         ui.add_space(12.0);
                         self.draw_checks_panel(ui);
@@ -321,12 +337,13 @@ impl MountGuiApp {
     fn draw_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("hf-mount").size(26.0).strong().color(text_primary()));
-                ui.label(RichText::new("Desktop mount controller").color(text_secondary()));
+                ui.label(RichText::new("hf-mount").size(27.0).strong().color(text_primary()));
+                ui.label(RichText::new("Mount Hugging Face storage from a desktop app").color(text_secondary()));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let status = self.status.lock().expect("status mutex poisoned").clone();
                 status_pill(ui, &status.state);
+                pill(ui, "NFS backend", text_secondary(), egui::Color32::from_rgb(31, 34, 40));
                 pill(
                     ui,
                     platform_label(),
@@ -352,6 +369,15 @@ impl MountGuiApp {
             ui.label(RichText::new(status.headline).strong().color(text_primary()));
             ui.add_space(4.0);
             ui.label(RichText::new(status.detail).color(text_secondary()));
+            if let Some(blocker) = self.first_blocking_check() {
+                ui.add_space(10.0);
+                callout(
+                    ui,
+                    error_fg(),
+                    "Blocked",
+                    format!("{}: {}", blocker.label, blocker.detail),
+                );
+            }
             ui.add_space(16.0);
             self.draw_action_buttons(ui);
         });
@@ -363,27 +389,25 @@ impl MountGuiApp {
             let status = self.status.lock().expect("status mutex poisoned");
             status.state == MountState::Mounted
         };
-        ui.horizontal(|ui| {
-            let start = egui::Button::new(RichText::new("Start mount").strong().color(egui::Color32::WHITE))
-                .fill(if running { input_bg() } else { accent() })
-                .min_size(egui::vec2(138.0, 38.0));
-            if ui.add_enabled(!running, start).clicked() {
-                self.start_mount();
-            }
+        let full_width = ui.available_width();
+        let small_gap = ui.spacing().item_spacing.x;
+        let half_width = ((full_width - small_gap) / 2.0).max(96.0);
+        let button_height = 38.0;
 
-            let stop = egui::Button::new(RichText::new("Stop").strong().color(text_primary()))
-                .fill(egui::Color32::from_rgb(69, 35, 39))
-                .min_size(egui::vec2(74.0, 38.0));
-            if ui.add_enabled(running, stop).clicked() {
-                self.stop_mount();
-            }
-        });
+        let start_label = if running { "Mount running" } else { "Start mount" };
+        let start = egui::Button::new(RichText::new(start_label).strong().color(egui::Color32::WHITE))
+            .fill(if running { input_bg() } else { accent() })
+            .min_size(egui::vec2(full_width, button_height));
+        if ui.add_enabled(!running, start).clicked() {
+            self.start_mount();
+        }
+
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui
-                .add(
-                    egui::Button::new(RichText::new("Check setup").color(text_primary()))
-                        .min_size(egui::vec2(112.0, 34.0)),
+                .add_sized(
+                    [half_width, button_height],
+                    egui::Button::new(RichText::new("Check setup").color(text_primary())),
                 )
                 .clicked()
             {
@@ -391,22 +415,56 @@ impl MountGuiApp {
                 push_log(&self.status, summarize_checks(&self.checks));
             }
 
-            let open = egui::Button::new(RichText::new("Open").color(text_primary())).min_size(egui::vec2(74.0, 34.0));
+            let stop = egui::Button::new(RichText::new("Stop").strong().color(text_primary()))
+                .fill(egui::Color32::from_rgb(69, 35, 39));
+            ui.add_enabled_ui(running, |ui| {
+                if ui.add_sized([half_width, button_height], stop).clicked() {
+                    self.stop_mount();
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let open = egui::Button::new(RichText::new("Open mount").color(text_primary()));
+            ui.add_enabled_ui(mounted && self.active_mount_point.is_some(), |ui| {
+                if ui.add_sized([ui.available_width(), button_height], open).clicked() {
+                    match open_mount_point(self.active_mount_point.as_deref()) {
+                        Ok(()) => push_log(&self.status, "Opened mount point"),
+                        Err(e) => set_status(&self.status, MountState::Failed, "Could not open mount point", e),
+                    }
+                }
+            });
+        });
+
+        #[cfg(windows)]
+        if self.has_failed_check("Administrator") {
+            ui.add_space(8.0);
             if ui
-                .add_enabled(mounted && self.active_mount_point.is_some(), open)
+                .add_sized(
+                    [ui.available_width(), button_height],
+                    egui::Button::new(RichText::new("Restart as admin").strong().color(text_primary())),
+                )
                 .clicked()
             {
-                match open_mount_point(self.active_mount_point.as_deref()) {
-                    Ok(()) => push_log(&self.status, "Opened mount point"),
-                    Err(e) => set_status(&self.status, MountState::Failed, "Could not open mount point", e),
+                match restart_as_administrator() {
+                    Ok(()) => set_status(
+                        &self.status,
+                        MountState::Stopped,
+                        "Elevation requested",
+                        "Approve the Windows UAC prompt, then use the elevated window.",
+                    ),
+                    Err(e) => set_status(&self.status, MountState::Failed, "Could not relaunch as admin", e),
                 }
             }
-        });
+        }
     }
 
     fn draw_checks_panel(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
             section_title(ui, "Readiness");
+            ui.add_space(8.0);
+            checks_summary(ui, &self.checks);
             ui.add_space(8.0);
             if self.checks.is_empty() {
                 ui.label(RichText::new("Run setup checks before mounting.").color(text_secondary()));
@@ -472,6 +530,15 @@ impl MountGuiApp {
             ui.add_space(12.0);
             field_row(ui, "Mount point", |ui| {
                 text_field(ui, &mut self.mount_point, default_mount_hint(), false);
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(mount_point_hint()).small().color(muted_text()));
+                    #[cfg(windows)]
+                    if ui.small_button("Use Z:").clicked() {
+                        self.mount_point = "Z:".to_string();
+                        self.checks = run_preflight_checks(&self.mount_point);
+                    }
+                });
             });
             field_row(ui, "Access", |ui| {
                 if self.source == GuiSource::Repo {
@@ -499,6 +566,12 @@ impl MountGuiApp {
             ui.add_space(12.0);
             field_row(ui, "HF token", |ui| {
                 text_field(ui, &mut self.hf_token, "Optional access token", true);
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new("Uses HF_TOKEN automatically when set.")
+                        .small()
+                        .color(muted_text()),
+                );
             });
             if self.show_advanced {
                 field_row(ui, "Hub endpoint", |ui| {
@@ -525,6 +598,7 @@ impl MountGuiApp {
             return;
         }
 
+        push_log(&self.status, summarize_checks(&self.checks));
         let source = match self.mount_source() {
             Ok(source) => source,
             Err(e) => {
@@ -609,6 +683,16 @@ impl MountGuiApp {
         self.mount_thread.as_ref().is_some_and(|handle| !handle.is_finished())
     }
 
+    fn first_blocking_check(&self) -> Option<&CheckItem> {
+        self.checks.iter().find(|check| check.level == CheckLevel::Fail)
+    }
+
+    fn has_failed_check(&self, label: &str) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.label == label && check.level == CheckLevel::Fail)
+    }
+
     fn mount_source(&self) -> Result<Source, String> {
         let source_id = self.source_id.trim();
         if source_id.is_empty() {
@@ -671,6 +755,19 @@ fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 
 fn section_title(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).strong().color(text_primary()));
+}
+
+fn callout(ui: &mut egui::Ui, color: egui::Color32, label: &str, detail: impl Into<String>) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(31, 26, 27))
+        .stroke(egui::Stroke::new(1.0, color))
+        .rounding(8.0)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).small().strong().color(color));
+            ui.add_space(3.0);
+            ui.label(RichText::new(detail.into()).small().color(text_secondary()));
+        });
 }
 
 fn field_row(ui: &mut egui::Ui, label: &str, add_field: impl FnOnce(&mut egui::Ui)) {
@@ -767,6 +864,31 @@ fn status_pill(ui: &mut egui::Ui, state: &MountState) {
     pill(ui, label, fg, bg);
 }
 
+fn checks_summary(ui: &mut egui::Ui, checks: &[CheckItem]) {
+    let failures = checks.iter().filter(|check| check.level == CheckLevel::Fail).count();
+    let warnings = checks.iter().filter(|check| check.level == CheckLevel::Warn).count();
+
+    let (label, color) = if checks.is_empty() {
+        ("Not checked", text_secondary())
+    } else if failures > 0 {
+        ("Action needed", error_fg())
+    } else if warnings > 0 {
+        ("Usable with warnings", warning_fg())
+    } else {
+        ("Ready to mount", accent_hover())
+    };
+    ui.horizontal(|ui| {
+        pill(ui, label, color, elevated_bg());
+        if !checks.is_empty() {
+            ui.label(
+                RichText::new(format!("{failures} blocking / {warnings} warning"))
+                    .small()
+                    .color(muted_text()),
+            );
+        }
+    });
+}
+
 fn pill(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
     egui::Frame::none()
         .fill(bg)
@@ -780,8 +902,8 @@ fn pill(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
 fn check_row(ui: &mut egui::Ui, check: &CheckItem) {
     let (label, color) = match check.level {
         CheckLevel::Pass => ("OK", accent_hover()),
-        CheckLevel::Warn => ("Warn", warning_fg()),
-        CheckLevel::Fail => ("Fail", error_fg()),
+        CheckLevel::Warn => ("WARN", warning_fg()),
+        CheckLevel::Fail => ("FIX", error_fg()),
     };
     ui.horizontal_top(|ui| {
         pill(ui, label, color, elevated_bg());
@@ -790,6 +912,14 @@ fn check_row(ui: &mut egui::Ui, check: &CheckItem) {
             ui.label(RichText::new(&check.detail).small().color(text_secondary()));
         });
     });
+}
+
+fn check_level_label(level: CheckLevel) -> &'static str {
+    match level {
+        CheckLevel::Pass => "OK",
+        CheckLevel::Warn => "WARN",
+        CheckLevel::Fail => "FAIL",
+    }
 }
 
 fn run_mount(source: Source, options: MountOptions, shared_status: SharedMountStatus) {
@@ -894,7 +1024,8 @@ fn run_preflight_checks(mount_point: &str) -> Vec<CheckItem> {
 #[cfg(windows)]
 fn windows_preflight_checks(mount_point: &str) -> Vec<CheckItem> {
     let mut checks = Vec::new();
-    checks.push(if windows_is_elevated() {
+    let elevated = windows_is_elevated();
+    checks.push(if elevated {
         CheckItem {
             level: CheckLevel::Pass,
             label: "Administrator".to_string(),
@@ -904,7 +1035,7 @@ fn windows_preflight_checks(mount_point: &str) -> Vec<CheckItem> {
         CheckItem {
             level: CheckLevel::Fail,
             label: "Administrator".to_string(),
-            detail: "Start the GUI as Administrator so it can bind the local NFS portmapper.".to_string(),
+            detail: "Restart as Administrator so hf-mount can bind the local NFS portmapper.".to_string(),
         }
     });
 
@@ -921,6 +1052,16 @@ fn windows_preflight_checks(mount_point: &str) -> Vec<CheckItem> {
             level: CheckLevel::Fail,
             label: "Client for NFS".to_string(),
             detail: "Enable Microsoft's Client for NFS optional feature and reboot if Windows asks.".to_string(),
+        }
+    });
+
+    checks.push(if elevated {
+        windows_portmapper_check()
+    } else {
+        CheckItem {
+            level: CheckLevel::Warn,
+            label: "Portmapper".to_string(),
+            detail: "Port 111 is checked after elevation.".to_string(),
         }
     });
 
@@ -951,9 +1092,9 @@ fn validate_windows_mount_point(mount_point: &str) -> CheckItem {
         let probe = format!("{drive}:\\");
         return if Path::new(&probe).exists() {
             CheckItem {
-                level: CheckLevel::Warn,
+                level: CheckLevel::Fail,
                 label: "Mount point".to_string(),
-                detail: format!("{drive}: already exists. Pick an unused drive letter if mounting fails."),
+                detail: format!("{drive}: already exists. Pick an unused drive letter such as Y: or X:."),
             }
         } else {
             CheckItem {
@@ -966,10 +1107,22 @@ fn validate_windows_mount_point(mount_point: &str) -> CheckItem {
 
     let path = Path::new(trimmed);
     if path.is_absolute() {
+        if path.exists() && !path.is_dir() {
+            return CheckItem {
+                level: CheckLevel::Fail,
+                label: "Mount point".to_string(),
+                detail: "The target exists but is not a directory.".to_string(),
+            };
+        }
+        let detail = if path.exists() {
+            "Directory target is absolute. A drive letter such as Z: is still the most reliable Windows target."
+        } else {
+            "Directory target is absolute and will be created if the Windows NFS client accepts it. A drive letter is more reliable."
+        };
         CheckItem {
-            level: CheckLevel::Pass,
+            level: CheckLevel::Warn,
             label: "Mount point".to_string(),
-            detail: "Directory target is valid.".to_string(),
+            detail: detail.to_string(),
         }
     } else {
         CheckItem {
@@ -977,6 +1130,41 @@ fn validate_windows_mount_point(mount_point: &str) -> CheckItem {
             label: "Mount point".to_string(),
             detail: "Use a drive letter or an absolute directory path.".to_string(),
         }
+    }
+}
+
+#[cfg(windows)]
+fn windows_portmapper_check() -> CheckItem {
+    match (
+        UdpSocket::bind(("127.0.0.1", 111)),
+        TcpListener::bind(("127.0.0.1", 111)),
+    ) {
+        (Ok(udp), Ok(tcp)) => {
+            drop(udp);
+            drop(tcp);
+            CheckItem {
+                level: CheckLevel::Pass,
+                label: "Portmapper".to_string(),
+                detail: "TCP and UDP port 111 are available for the local NFS portmapper.".to_string(),
+            }
+        }
+        (udp_result, tcp_result) => CheckItem {
+            level: CheckLevel::Fail,
+            label: "Portmapper".to_string(),
+            detail: format!(
+                "Port 111 is not available: UDP={} TCP={}. Close other NFS/portmap services or another hf-mount instance.",
+                bind_result_label(&udp_result),
+                bind_result_label(&tcp_result),
+            ),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn bind_result_label<T>(result: &std::io::Result<T>) -> String {
+    match result {
+        Ok(_) => "ok".to_string(),
+        Err(e) => e.to_string(),
     }
 }
 
@@ -1193,6 +1381,52 @@ fn default_mount_hint() -> &'static str {
     #[cfg(not(windows))]
     {
         "/tmp/hf-mount"
+    }
+}
+
+fn mount_point_hint() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Use an unused drive letter. Directory targets are less reliable."
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Use an absolute folder path."
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        "Use an absolute folder path."
+    }
+}
+
+#[cfg(windows)]
+fn restart_as_administrator() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Could not locate current executable: {e}"))?;
+    let powershell = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+
+    let status = Command::new(powershell)
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Start-Process -FilePath $args[0] -Verb RunAs",
+        ])
+        .arg(exe)
+        .status()
+        .map_err(|e| format!("Failed to launch the UAC prompt: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("PowerShell exited with {status}"))
     }
 }
 

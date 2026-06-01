@@ -47,6 +47,7 @@ jobs:
         run: |
           target/aarch64-apple-darwin/release/hf-mount-gui --version
           target/aarch64-apple-darwin/release/hf-mount-gui --help
+          target/aarch64-apple-darwin/release/hf-mount-gui --check-setup /tmp/hf-mount-gui-ci
 
       - name: Stage artifacts
         run: bash scripts/package-macos-gui.sh aarch64-apple-darwin arm64 dist

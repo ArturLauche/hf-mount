@@ -66,6 +66,7 @@ jobs:
           .\dist\hf-mount-windows-x64.exe --help
           .\dist\hf-mount-gui-windows-x64.exe --version
           .\dist\hf-mount-gui-windows-x64.exe --help
+          .\dist\hf-mount-gui-windows-x64.exe --check-setup Z:
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4

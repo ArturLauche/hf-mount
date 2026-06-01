@@ -225,6 +225,7 @@ jobs:
         run: |
           target/${{ matrix.target }}/release/hf-mount-gui --version
           target/${{ matrix.target }}/release/hf-mount-gui --help
+          target/${{ matrix.target }}/release/hf-mount-gui --check-setup /tmp/hf-mount-gui-ci
 
       - uses: actions/upload-artifact@v4
         with:
@@ -279,6 +280,7 @@ jobs:
           .\dist\hf-mount-windows-x64.exe --help
           .\dist\hf-mount-gui-windows-x64.exe --version
           .\dist\hf-mount-gui-windows-x64.exe --help
+          .\dist\hf-mount-gui-windows-x64.exe --check-setup Z:
 
       - uses: actions/upload-artifact@v4
         with:
