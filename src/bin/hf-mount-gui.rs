@@ -1,31 +1,51 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
 #[cfg(windows)]
 use std::net::{TcpListener, UdpSocket};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-use std::process::Stdio;
 
 use eframe::egui::{self, RichText, TextEdit};
 use hf_mount::nfs::NfsMountEvent;
 use hf_mount::setup::{CacheMode, MountOptions, Source};
+use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x00000008;
 
+const BACKGROUND_WORKER_ARG: &str = "--background-worker";
+const AUTOSTART_NAME: &str = "hf-mount autostart";
+#[cfg(target_os = "macos")]
+const AUTOSTART_LABEL: &str = "co.huggingface.hf-mount-gui-autostart";
 const MAX_LOG_LINES: usize = 80;
 
 static BACKEND_INIT: Once = Once::new();
 
+fn load_icon() -> egui::IconData {
+    let icon_bytes = include_bytes!("../../assets/icon.rgba");
+    egui::IconData {
+        rgba: icon_bytes.to_vec(),
+        width: 64,
+        height: 64,
+    }
+}
+
 fn main() {
-    if handle_cli_info() {
+    if handle_cli_command() {
         return;
     }
 
@@ -37,7 +57,8 @@ fn main() {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([820.0, 560.0]),
+            .with_min_inner_size([820.0, 560.0])
+            .with_icon(load_icon()),
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(
@@ -45,7 +66,7 @@ fn main() {
         native_options,
         Box::new(|cc| {
             apply_theme(&cc.egui_ctx);
-            Ok(Box::new(MountGuiApp::default()))
+            Ok(Box::new(MountGuiApp::load()))
         }),
     ) {
         eprintln!("failed to start hf-mount GUI: {e}");
@@ -53,7 +74,7 @@ fn main() {
     }
 }
 
-fn handle_cli_info() -> bool {
+fn handle_cli_command() -> bool {
     let mut args = std::env::args().skip(1);
     let Some(arg) = args.next() else {
         return false;
@@ -79,6 +100,13 @@ fn handle_cli_info() -> bool {
             }
             true
         }
+        BACKGROUND_WORKER_ARG => {
+            if let Err(e) = run_background_worker() {
+                eprintln!("background worker failed: {e}");
+                std::process::exit(1);
+            }
+            true
+        }
         other => {
             eprintln!("unknown argument: {other}");
             print_help();
@@ -95,7 +123,8 @@ fn print_help() {
            hf-mount-gui\n\
            hf-mount-gui --help\n\
            hf-mount-gui --version\n\
-           hf-mount-gui --check-setup [MOUNT_POINT]\n\n\
+           hf-mount-gui --check-setup [MOUNT_POINT]\n\
+           hf-mount-gui --background-worker\n\n\
          Windows requires Client for NFS and an Administrator session.",
         version = env!("CARGO_PKG_VERSION")
     );
@@ -208,7 +237,7 @@ fn error_fg() -> egui::Color32 {
     egui::Color32::from_rgb(238, 107, 107)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum GuiSource {
     Repo,
     Bucket,
@@ -261,6 +290,47 @@ struct CheckItem {
     detail: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MountProfile {
+    source: GuiSource,
+    source_id: String,
+    revision: String,
+    mount_point: String,
+    hf_token: String,
+    hub_endpoint: String,
+    cache_dir: String,
+    read_only: bool,
+    run_in_background: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum WorkerState {
+    Mounting,
+    Mounted,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkerStatus {
+    state: WorkerState,
+    headline: String,
+    detail: String,
+}
+
+impl WorkerState {
+    fn mount_state(&self) -> MountState {
+        match self {
+            WorkerState::Mounting => MountState::Mounting,
+            WorkerState::Mounted => MountState::Mounted,
+            WorkerState::Stopping => MountState::Stopping,
+            WorkerState::Stopped => MountState::Stopped,
+            WorkerState::Failed => MountState::Failed,
+        }
+    }
+}
+
 struct MountGuiApp {
     source: GuiSource,
     source_id: String,
@@ -270,10 +340,14 @@ struct MountGuiApp {
     hub_endpoint: String,
     cache_dir: String,
     read_only: bool,
+    run_in_background: bool,
+    autostart_enabled: bool,
     show_advanced: bool,
     checks: Vec<CheckItem>,
     status: SharedMountStatus,
     mount_thread: Option<JoinHandle<()>>,
+    background_child: Option<Child>,
+    active_background: bool,
     active_mount_point: Option<PathBuf>,
 }
 
@@ -293,10 +367,14 @@ impl Default for MountGuiApp {
                 .to_string_lossy()
                 .into_owned(),
             read_only: true,
+            run_in_background: false,
+            autostart_enabled: autostart_is_enabled(),
             show_advanced: false,
             checks,
             status: Arc::new(Mutex::new(SharedStatus::default())),
             mount_thread: None,
+            background_child: None,
+            active_background: false,
             active_mount_point: None,
         }
     }
@@ -331,13 +409,98 @@ impl eframe::App for MountGuiApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(mount_point) = &self.active_mount_point {
+        if !self.active_background
+            && let Some(mount_point) = &self.active_mount_point
+        {
             let _ = unmount_path(mount_point);
         }
     }
 }
 
 impl MountGuiApp {
+    fn load() -> Self {
+        let mut app = Self::default();
+        match load_mount_profile() {
+            Ok(Some(profile)) => {
+                app.apply_profile(profile);
+                app.checks = run_preflight_checks(&app.mount_point);
+            }
+            Ok(None) => {}
+            Err(e) => push_log(&app.status, format!("Could not load saved settings: {e}")),
+        }
+        app.autostart_enabled = autostart_is_enabled();
+        app
+    }
+
+    fn apply_profile(&mut self, profile: MountProfile) {
+        self.source = profile.source;
+        self.source_id = profile.source_id;
+        self.revision = profile.revision;
+        self.mount_point = profile.mount_point;
+        self.hf_token = profile.hf_token;
+        self.hub_endpoint = profile.hub_endpoint;
+        self.cache_dir = profile.cache_dir;
+        self.read_only = profile.read_only || self.source == GuiSource::Repo;
+        self.run_in_background = profile.run_in_background;
+    }
+
+    fn profile(&self) -> MountProfile {
+        MountProfile {
+            source: self.source,
+            source_id: self.source_id.clone(),
+            revision: self.revision.clone(),
+            mount_point: self.mount_point.clone(),
+            hf_token: self.hf_token.clone(),
+            hub_endpoint: self.hub_endpoint.clone(),
+            cache_dir: self.cache_dir.clone(),
+            read_only: self.source == GuiSource::Repo || self.read_only,
+            run_in_background: self.run_in_background,
+        }
+    }
+
+    fn save_profile(&self) -> Result<(), String> {
+        save_mount_profile(&self.profile())
+    }
+
+    fn apply_autostart_setting(&mut self) {
+        let requested = self.autostart_enabled;
+        if requested
+            && let Err(e) = self.save_profile()
+        {
+            self.autostart_enabled = false;
+            set_status(&self.status, MountState::Failed, "Could not save settings", e);
+            return;
+        }
+
+        match set_autostart_enabled(requested) {
+            Ok(()) => {
+                let (headline, detail) = if requested {
+                    ("Autostart enabled", "The saved mount will start at login.")
+                } else {
+                    ("Autostart disabled", "The login startup entry was removed.")
+                };
+                set_status(&self.status, MountState::Stopped, headline, detail);
+            }
+            Err(e) => {
+                self.autostart_enabled = !requested;
+                set_status(&self.status, MountState::Failed, "Could not update autostart", e);
+            }
+        }
+    }
+
+    fn apply_worker_status(&mut self) {
+        match read_worker_status() {
+            Ok(Some(status)) => set_status_if_changed(
+                &self.status,
+                status.state.mount_state(),
+                status.headline,
+                status.detail,
+            ),
+            Ok(None) => {}
+            Err(e) => push_log(&self.status, format!("Could not read background status: {e}")),
+        }
+    }
+
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
         let status = self.status.lock().expect("status mutex poisoned").clone();
         ui.set_height(ui.available_height());
@@ -443,6 +606,8 @@ impl MountGuiApp {
 
         let start_label = if running {
             "Mount running"
+        } else if self.run_in_background {
+            "Start in background"
         } else {
             "Start mount"
         };
@@ -547,6 +712,15 @@ impl MountGuiApp {
             } else {
                 ui.checkbox(&mut self.read_only, "Read-only");
             }
+        });
+        field_row(ui, "Run", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.run_in_background, "Background");
+                let changed = ui.checkbox(&mut self.autostart_enabled, "Start at login").changed();
+                if changed {
+                    self.apply_autostart_setting();
+                }
+            });
         });
         field_row(ui, "HF token", |ui| {
             text_field(ui, &mut self.hf_token, "Optional access token", true);
@@ -700,6 +874,11 @@ impl MountGuiApp {
         let mount_label = mount_point.display().to_string();
         let shared_status = self.status.clone();
 
+        if let Err(e) = self.save_profile() {
+            set_status(&self.status, MountState::Failed, "Could not save settings", e);
+            return;
+        }
+
         set_status(
             &shared_status,
             MountState::Mounting,
@@ -707,6 +886,26 @@ impl MountGuiApp {
             format!("Target: {mount_label}"),
         );
         self.active_mount_point = Some(mount_point);
+        if self.run_in_background {
+            match spawn_background_worker() {
+                Ok(child) => {
+                    self.background_child = Some(child);
+                    self.active_background = true;
+                    set_status(
+                        &self.status,
+                        MountState::Mounting,
+                        "Background mount starting",
+                        format!("Target: {mount_label}"),
+                    );
+                }
+                Err(e) => {
+                    self.active_mount_point = None;
+                    set_status(&self.status, MountState::Failed, "Could not start background mount", e);
+                }
+            }
+            return;
+        }
+        self.active_background = false;
         self.mount_thread = Some(thread::spawn(move || run_mount(source, options, shared_status)));
     }
 
@@ -734,6 +933,45 @@ impl MountGuiApp {
     }
 
     fn collect_finished_mount(&mut self) {
+        if self.active_background {
+            self.apply_worker_status();
+        }
+
+        let background_result = self.background_child.as_mut().map(Child::try_wait).transpose();
+        match background_result {
+            Ok(Some(Some(status))) => {
+                self.background_child = None;
+                self.active_background = false;
+                self.active_mount_point = None;
+                if status.success() {
+                    set_status(
+                        &self.status,
+                        MountState::Stopped,
+                        "Background mount stopped",
+                        "The background worker exited cleanly.",
+                    );
+                } else {
+                    set_status(
+                        &self.status,
+                        MountState::Failed,
+                        "Background mount exited",
+                        format!("Worker exited with {status}."),
+                    );
+                }
+            }
+            Ok(Some(None)) | Ok(None) => {}
+            Err(e) => {
+                self.background_child = None;
+                self.active_background = false;
+                set_status(
+                    &self.status,
+                    MountState::Failed,
+                    "Could not inspect background mount",
+                    e.to_string(),
+                );
+            }
+        }
+
         let finished = self.mount_thread.as_ref().is_some_and(JoinHandle::is_finished);
         if !finished {
             return;
@@ -763,7 +1001,7 @@ impl MountGuiApp {
     }
 
     fn is_mount_thread_running(&self) -> bool {
-        self.mount_thread.as_ref().is_some_and(|handle| !handle.is_finished())
+        self.background_child.is_some() || self.mount_thread.as_ref().is_some_and(|handle| !handle.is_finished())
     }
 
     fn first_blocking_check(&self) -> Option<&CheckItem> {
@@ -1050,6 +1288,24 @@ fn set_status(status: &SharedMountStatus, state: MountState, headline: impl Into
     let headline = headline.into();
     let detail = detail.into();
     let mut status = status.lock().expect("status mutex poisoned");
+    status.state = state;
+    status.headline = headline.clone();
+    status.detail = detail.clone();
+    push_log_locked(&mut status, format!("{headline}: {detail}"));
+}
+
+fn set_status_if_changed(
+    status: &SharedMountStatus,
+    state: MountState,
+    headline: impl Into<String>,
+    detail: impl Into<String>,
+) {
+    let headline = headline.into();
+    let detail = detail.into();
+    let mut status = status.lock().expect("status mutex poisoned");
+    if status.state == state && status.headline == headline && status.detail == detail {
+        return;
+    }
     status.state = state;
     status.headline = headline.clone();
     status.detail = detail.clone();
@@ -1395,6 +1651,480 @@ fn unmount_target(mount_point: &str) -> String {
         }
     }
     mount_point.to_string()
+}
+
+fn run_background_worker() -> Result<(), String> {
+    BACKEND_INIT.call_once(|| {
+        hf_mount::setup::raise_fd_limit();
+        hf_mount::setup::init_tracing(false);
+    });
+
+    append_worker_log("Background worker starting");
+    let profile = load_mount_profile()?.ok_or_else(|| "No saved mount settings were found.".to_string())?;
+    let source = profile_mount_source(&profile)?;
+    let options = profile_mount_options(&profile)?;
+    let mount_label = source.mount_point().display().to_string();
+    write_worker_status(
+        WorkerState::Mounting,
+        "Background worker starting",
+        format!("Target: {mount_label}"),
+    )?;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let setup = hf_mount::setup::build(source, options, true);
+        let virtual_fs = setup.virtual_fs.clone();
+        let mount_point = setup.mount_point.clone();
+        let metadata_ttl_ms = setup.metadata_ttl_ms;
+        let read_only = setup.read_only;
+        setup.runtime.block_on(hf_mount::nfs::mount_nfs_with_callback(
+            virtual_fs,
+            &mount_point,
+            metadata_ttl_ms,
+            read_only,
+            None,
+            handle_background_mount_event,
+        ))
+    }));
+
+    match result {
+        Ok(Ok(())) => {
+            append_worker_log("Background worker stopped cleanly");
+            write_worker_status(
+                WorkerState::Stopped,
+                "Background mount stopped",
+                "The background worker exited cleanly.",
+            )?;
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            let message = e.to_string();
+            append_worker_log(format!("NFS mount failed: {message}"));
+            let _ = write_worker_status(WorkerState::Failed, "NFS mount failed", &message);
+            Err(message)
+        }
+        Err(payload) => {
+            let message = panic_message(payload);
+            append_worker_log(format!("Mount setup failed: {message}"));
+            let _ = write_worker_status(WorkerState::Failed, "Mount setup failed", &message);
+            Err(message)
+        }
+    }
+}
+
+fn spawn_background_worker() -> Result<Child, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Could not locate current executable: {e}"))?;
+    let _ = std::fs::remove_file(worker_status_path()?);
+    write_worker_status(
+        WorkerState::Mounting,
+        "Background worker launching",
+        "Starting detached process.",
+    )?;
+    let log = worker_log_file()?;
+    let log_for_stderr = log
+        .try_clone()
+        .map_err(|e| format!("Failed to duplicate background log handle: {e}"))?;
+    let mut command = Command::new(exe);
+    command
+        .arg(BACKGROUND_WORKER_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_for_stderr));
+    detach_command(&mut command);
+    command
+        .spawn()
+        .map_err(|e| format!("Failed to launch background worker: {e}"))
+}
+
+fn handle_background_mount_event(event: NfsMountEvent) {
+    match event {
+        NfsMountEvent::ServerListening { port } => {
+            append_worker_log(format!("Local NFS server is listening on 127.0.0.1:{port}"));
+            let _ = write_worker_status(
+                WorkerState::Mounting,
+                "Local NFS server is listening",
+                format!("127.0.0.1:{port}"),
+            );
+        }
+        NfsMountEvent::MountCommand { command } => {
+            append_worker_log(format!("Running {command}"));
+        }
+        NfsMountEvent::Mounted { mount_point } => {
+            append_worker_log(format!("Mounted at {mount_point}"));
+            let _ = write_worker_status(WorkerState::Mounted, "Mounted", format!("Mounted at {mount_point}"));
+        }
+        NfsMountEvent::ShuttingDown { reason } => {
+            append_worker_log(format!("Shutting down: {reason}"));
+            let _ = write_worker_status(WorkerState::Stopping, "Shutting down", reason);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn detach_command(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+#[cfg(unix)]
+fn detach_command(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(any(windows, unix)))]
+fn detach_command(_command: &mut Command) {}
+
+fn read_worker_status() -> Result<Option<WorkerStatus>, String> {
+    let path = worker_status_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+}
+
+fn write_worker_status(
+    state: WorkerState,
+    headline: impl Into<String>,
+    detail: impl Into<String>,
+) -> Result<(), String> {
+    let path = worker_status_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    let status = WorkerStatus {
+        state,
+        headline: headline.into(),
+        detail: detail.into(),
+    };
+    let json = serde_json::to_vec_pretty(&status).map_err(|e| format!("Failed to serialize worker status: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+fn append_worker_log(message: impl AsRef<str>) {
+    let Ok(mut file) = worker_log_file() else {
+        return;
+    };
+    let _ = writeln!(file, "{}", message.as_ref());
+}
+
+fn worker_log_file() -> Result<std::fs::File, String> {
+    let path = worker_log_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("Failed to open {}: {e}", path.display()))
+}
+
+fn profile_mount_source(profile: &MountProfile) -> Result<Source, String> {
+    let source_id = profile.source_id.trim();
+    if source_id.is_empty() {
+        return Err("Source ID is required.".to_string());
+    }
+    let mount_point = parse_path(&profile.mount_point, "Mount point")?;
+    Ok(match profile.source {
+        GuiSource::Repo => Source::Repo {
+            repo_id: source_id.to_string(),
+            mount_point,
+            revision: non_empty_or_default(&profile.revision, "main"),
+        },
+        GuiSource::Bucket => Source::Bucket {
+            bucket_id: source_id.to_string(),
+            mount_point,
+        },
+    })
+}
+
+fn profile_mount_options(profile: &MountProfile) -> Result<MountOptions, String> {
+    Ok(MountOptions {
+        hf_token: optional_text(&profile.hf_token),
+        token_file: None,
+        hub_endpoint: non_empty_or_default(&profile.hub_endpoint, "https://huggingface.co"),
+        cache_dir: parse_path(&profile.cache_dir, "Cache directory")?,
+        uid: None,
+        gid: None,
+        read_only: profile.source == GuiSource::Repo || profile.read_only,
+        advanced_writes: false,
+        poll_interval_secs: 30,
+        poll_listing_concurrency: 4,
+        cache_size: 10_000_000_000,
+        max_staging_size: 0,
+        no_disk_cache: false,
+        cache_mode: CacheMode::Chunk,
+        direct_io: false,
+        metadata_ttl_ms: 10_000,
+        metadata_ttl_minimal: false,
+        max_threads: 16,
+        flush_debounce_ms: 2_000,
+        flush_max_batch_window_ms: 30_000,
+        no_filter_os_files: false,
+        fuse_owner_only: false,
+        inode_soft_limit: 0,
+        lru_sweep_interval_ms: 5_000,
+        overlay: false,
+    })
+}
+
+fn load_mount_profile() -> Result<Option<MountProfile>, String> {
+    let path = profile_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+}
+
+fn save_mount_profile(profile: &MountProfile) -> Result<(), String> {
+    let path = profile_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(profile).map_err(|e| format!("Failed to serialize settings: {e}"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    file.write_all(&json)
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+fn profile_path() -> Result<PathBuf, String> {
+    Ok(app_config_dir()?.join("mount-profile.json"))
+}
+
+fn worker_status_path() -> Result<PathBuf, String> {
+    Ok(app_config_dir()?.join("background-status.json"))
+}
+
+fn worker_log_path() -> Result<PathBuf, String> {
+    Ok(app_config_dir()?.join("background.log"))
+}
+
+fn app_config_dir() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| "APPDATA is not set.".to_string())?;
+        return Ok(base.join("hf-mount"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set.".to_string())?;
+        return Ok(home.join("Library").join("Application Support").join("hf-mount"));
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+            return Ok(base.join("hf-mount"));
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set.".to_string())?;
+        Ok(home.join(".config").join("hf-mount"))
+    }
+}
+
+#[cfg(windows)]
+fn autostart_is_enabled() -> bool {
+    let mut command = Command::new(windows_system32_exe("schtasks.exe"));
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+        .args(["/Query", "/TN", AUTOSTART_NAME])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(windows))]
+fn autostart_is_enabled() -> bool {
+    autostart_path().is_ok_and(|path| path.exists())
+}
+
+fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
+    if enabled {
+        install_autostart()
+    } else {
+        remove_autostart()
+    }
+}
+
+#[cfg(windows)]
+fn install_autostart() -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Could not locate current executable: {e}"))?
+        .to_string_lossy()
+        .replace('"', "\\\"");
+    let task_run = format!("\"{exe}\" {BACKGROUND_WORKER_ARG}");
+    let output = windows_schtasks()
+        .args([
+            "/Create",
+            "/TN",
+            AUTOSTART_NAME,
+            "/TR",
+            &task_run,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to create scheduled task: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_output_error("schtasks /Create", output))
+    }
+}
+
+#[cfg(windows)]
+fn remove_autostart() -> Result<(), String> {
+    let output = windows_schtasks()
+        .args(["/Delete", "/TN", AUTOSTART_NAME, "/F"])
+        .output()
+        .map_err(|e| format!("Failed to remove scheduled task: {e}"))?;
+    if output.status.success() || !autostart_is_enabled() {
+        Ok(())
+    } else {
+        Err(command_output_error("schtasks /Delete", output))
+    }
+}
+
+#[cfg(windows)]
+fn windows_schtasks() -> Command {
+    let mut command = Command::new(windows_system32_exe("schtasks.exe"));
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(windows)]
+fn command_output_error(label: &str, output: std::process::Output) -> String {
+    format!(
+        "{label} failed with {}: stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+#[cfg(not(windows))]
+fn install_autostart() -> Result<(), String> {
+    let path = autostart_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    let content = autostart_file_contents()?;
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+#[cfg(not(windows))]
+fn remove_autostart() -> Result<(), String> {
+    let path = autostart_path()?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to remove {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set.".to_string())?;
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{AUTOSTART_LABEL}.plist")))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn autostart_path() -> Result<PathBuf, String> {
+    let base = if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+        config_home
+    } else {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set.".to_string())?;
+        home.join(".config")
+    };
+    Ok(base.join("autostart").join("hf-mount.desktop"))
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_file_contents() -> Result<String, String> {
+    let exe = xml_escape(
+        &std::env::current_exe()
+            .map_err(|e| format!("Could not locate current executable: {e}"))?
+            .to_string_lossy(),
+    );
+    let name = xml_escape(AUTOSTART_NAME);
+    let log_path = xml_escape(&worker_log_path()?.to_string_lossy());
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+             <key>Label</key>\n\
+             <string>{AUTOSTART_LABEL}</string>\n\
+             <key>ServiceDescription</key>\n\
+             <string>{name}</string>\n\
+             <key>ProgramArguments</key>\n\
+             <array>\n\
+                 <string>{exe}</string>\n\
+                 <string>{BACKGROUND_WORKER_ARG}</string>\n\
+             </array>\n\
+             <key>RunAtLoad</key>\n\
+             <true/>\n\
+             <key>StandardOutPath</key>\n\
+             <string>{log_path}</string>\n\
+             <key>StandardErrorPath</key>\n\
+             <string>{log_path}</string>\n\
+         </dict>\n\
+         </plist>\n"
+    ))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn autostart_file_contents() -> Result<String, String> {
+    let exe = desktop_exec_quote(
+        &std::env::current_exe()
+            .map_err(|e| format!("Could not locate current executable: {e}"))?
+            .to_string_lossy(),
+    );
+    Ok(format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name={AUTOSTART_NAME}\n\
+         Exec={exe} {BACKGROUND_WORKER_ARG}\n\
+         Terminal=false\n\
+         X-GNOME-Autostart-enabled=true\n"
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn desktop_exec_quote(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn open_mount_point(mount_point: Option<&Path>) -> Result<(), String> {

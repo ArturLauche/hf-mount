@@ -136,6 +136,8 @@ Download the GUI binary from [GitHub Releases](https://github.com/huggingface/hf
 
 Windows users must enable Client for NFS and run the GUI from an Administrator session. The GUI includes a **Check setup** action that validates elevation, the Windows NFS client tools, port `111`, and the mount target before starting. If it was launched without elevation, use **Restart as admin** in the GUI and approve the Windows UAC prompt. Fill in the repo or bucket ID, mount point, optional token, then press **Start mount**. Press **Stop mount** to unmount.
 
+Enable **Background** before starting if the mount should keep running after the GUI window is closed. Enable **Start at login** to register the saved GUI mount profile for autostart. On Windows this creates a user logon Scheduled Task with highest privileges; on macOS it writes a user LaunchAgent; on Linux desktops it writes an XDG autostart entry. The GUI saves the mount profile under the user config directory and writes background status/log files there as well.
+
 You can run the same setup validation without opening the window:
 
 ```powershell
@@ -184,6 +186,7 @@ umount -f Z:
 Windows differences and limitations:
 - NFS only; FUSE and the background daemon controller are Unix-only.
 - `hf-mount-windows-x64.exe` stays in the foreground and owns the local NFS server until stopped.
+- The GUI can run its NFS backend in a detached background worker and can register that worker for login autostart.
 - Administrator privileges are required because the Windows NFS client uses the local portmapper on port `111`.
 - Use a drive letter such as `Z:` for the most reliable Windows mount target. Empty NTFS directory targets depend on the Windows NFS client and may fail on some systems.
 - Drive-letter targets such as `Z:` are mapped by Windows `mount.exe`; hf-mount does not try to create them as directories first.
