@@ -663,18 +663,18 @@ where
             );
         } else {
             info!("Running: {cmd}");
-            let output = tokio::process::Command::new(mount_cmd)
-                .args(["-o", &opts, share, &mount_target])
-                .output()
-                .await?;
+            let output = mount_windows_nfs_with_retry(&mount_cmd, &opts, share, &mount_target).await?;
             if !output.status.success() {
                 server_handle.abort();
                 portmapper_handle.abort();
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
+                let hint = windows_mount_failure_hint(&output);
                 return Err(std::io::Error::other(format!(
-                    "mount.exe failed with {} (is Client for NFS enabled, and is this process running as Administrator?): cmd=`{cmd}` stdout={stdout} stderr={stderr}",
-                    output.status
+                    "mount.exe failed with {}: {hint} cmd=`{cmd}` stdout={} stderr={}",
+                    output.status,
+                    stdout.trim(),
+                    stderr.trim()
                 )));
             }
         }
@@ -1049,8 +1049,68 @@ fn umount_command_path() -> std::path::PathBuf {
 }
 
 #[cfg(windows)]
+const WINDOWS_ERROR_53_RETRY_ATTEMPTS: usize = 6;
+#[cfg(windows)]
+const WINDOWS_ERROR_53_RETRY_DELAY_MS: u64 = 300;
+
+#[cfg(windows)]
+async fn mount_windows_nfs_with_retry(
+    mount_cmd: &Path,
+    opts: &str,
+    share: &str,
+    mount_target: &str,
+) -> std::io::Result<std::process::Output> {
+    for attempt in 1..=WINDOWS_ERROR_53_RETRY_ATTEMPTS {
+        let output = tokio::process::Command::new(mount_cmd)
+            .args(["-o", opts, share, mount_target])
+            .output()
+            .await?;
+
+        if output.status.success()
+            || !windows_mount_output_is_network_error_53(&output)
+            || attempt == WINDOWS_ERROR_53_RETRY_ATTEMPTS
+        {
+            return Ok(output);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(WINDOWS_ERROR_53_RETRY_DELAY_MS)).await;
+    }
+
+    unreachable!("mount retry loop always returns on the final attempt")
+}
+
+#[cfg(windows)]
+fn windows_mount_output_is_network_error_53(output: &std::process::Output) -> bool {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    windows_mount_text_is_network_error_53(stdout.as_ref())
+        || windows_mount_text_is_network_error_53(stderr.as_ref())
+}
+
+#[cfg(windows)]
+fn windows_mount_text_is_network_error_53(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    (text.contains("network error") || text.contains("netzwerkfehler")) && windows_text_contains_code_53(&text)
+}
+
+#[cfg(windows)]
+fn windows_text_contains_code_53(text: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_digit())
+        .any(|part| part == "53")
+}
+
+#[cfg(windows)]
+fn windows_mount_failure_hint(output: &std::process::Output) -> &'static str {
+    if windows_mount_output_is_network_error_53(output) {
+        "Windows reported Network Error 53 while mounting the local NFS export. hf-mount uses the root export `\\\\127.0.0.1\\\\`; confirm the process is elevated, Client for NFS is enabled, port 111 is available, and localhost NFS/RPC traffic is not blocked."
+    } else {
+        "Client for NFS may be disabled, the process may not be elevated, or the mount target may be invalid."
+    }
+}
+
+#[cfg(windows)]
 fn windows_nfs_share() -> &'static str {
-    "127.0.0.1:/"
+    r"\\127.0.0.1\\"
 }
 
 #[cfg(windows)]
@@ -1112,8 +1172,29 @@ mod windows_nfs_path_tests {
     }
 
     #[test]
-    fn windows_mount_uses_root_nfs_export_syntax() {
-        assert_eq!(windows_nfs_share(), "127.0.0.1:/");
+    fn windows_mount_uses_unc_root_nfs_export_syntax() {
+        assert_eq!(windows_nfs_share(), r"\\127.0.0.1\\");
+    }
+
+    #[test]
+    fn detects_english_network_error_53() {
+        assert!(windows_mount_text_is_network_error_53(
+            "Network Error - 53\nType NET HELPMSG 53 for more information."
+        ));
+    }
+
+    #[test]
+    fn detects_german_network_error_53() {
+        assert!(windows_mount_text_is_network_error_53(
+            "Netzwerkfehler - 53\nGeben Sie \"NET HELPMSG 53\" ein, um weitere Informationen zu erhalten."
+        ));
+    }
+
+    #[test]
+    fn ignores_other_mount_errors() {
+        assert!(!windows_mount_text_is_network_error_53("Network Error - 67"));
+        assert!(!windows_mount_text_is_network_error_53("Network Error - 153"));
+        assert!(!windows_mount_text_is_network_error_53("The network path was not found."));
     }
 }
 

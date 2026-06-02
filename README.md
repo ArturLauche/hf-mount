@@ -495,9 +495,9 @@ For the GUI, use **Check setup** or run:
 .\hf-mount-gui-windows-x64.exe --check-setup Z:
 ```
 
-**`mount.exe failed ... Client for NFS enabled?`**
+**`mount.exe failed ...` or `Network Error - 53` / `Netzwerkfehler - 53`**
 
-Confirm the Client for NFS feature is installed, the shell is elevated, and the mount point is an unused drive letter such as `Z:`.
+Confirm the Client for NFS feature is installed, the shell is elevated, and the mount point is an unused drive letter such as `Z:`. On Windows, hf-mount mounts the local root export as `\\127.0.0.1\\`; network error 53 means Windows could not reach that local NFS export, usually because the process is not elevated, port `111` is unavailable, or localhost NFS/RPC traffic is blocked.
 
 **The mounted drive is not visible in Explorer or non-admin apps**
 

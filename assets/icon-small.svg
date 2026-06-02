@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">hf-mount small folder icon</title>
+  <path fill="#000000" fill-opacity=".14" d="M36 202h184c9 0 17 8 17 17s-8 17-17 17H36c-9 0-17-8-17-17s8-17 17-17z"/>
+  <path fill="#f3b83f" d="M27 70c0-13 10-23 23-23h67c8 0 15 4 19 10l14 18h55c13 0 23 10 23 23v22H27V70z"/>
+  <path fill="#ffd45a" d="M20 95c0-14 12-26 26-26h72c8 0 15 4 20 10l14 18h70c14 0 26 12 26 26v72c0 14-12 26-26 26H46c-14 0-26-12-26-26V95z"/>
+  <path fill="#ffc247" d="M20 125h228v70c0 14-12 26-26 26H46c-14 0-26-12-26-26v-70z"/>
+  <path fill="#f88f45" d="M70 156c-9 5-21 3-28-6-3-4 2-9 6-7 8 4 17 3 24-4 4-3 10 0 9 5 0 4-3 7-11 12z"/>
+  <path fill="#f88f45" d="M186 156c9 5 21 3 28-6 3-4-2-9-6-7-8 4-17 3-24-4-4-3-10 0-9 5 0 4 3 7 11 12z"/>
+  <path fill="none" stroke="#4f2a16" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" d="M88 142c6-11 22-11 28 0"/>
+  <path fill="none" stroke="#4f2a16" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" d="M140 142c6-11 22-11 28 0"/>
+  <path fill="none" stroke="#6b321d" stroke-width="10" stroke-linecap="round" d="M91 166c19 20 47 20 66 0"/>
+</svg>

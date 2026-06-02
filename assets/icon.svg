@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">hf-mount folder icon</title>
+  <path fill="#000000" fill-opacity=".14" d="M170 800h684c38 0 68 30 68 68s-30 68-68 68H170c-38 0-68-30-68-68s30-68 68-68z"/>
+  <path fill="#f3b83f" d="M118 284c0-51 41-92 92-92h264c30 0 58 14 76 38l55 73h209c51 0 92 41 92 92v89H118V284z"/>
+  <path fill="#ffd45a" d="M92 382c0-57 46-103 103-103h281c31 0 61 14 80 38l56 70h265c57 0 103 46 103 103v286c0 57-46 103-103 103H195c-57 0-103-46-103-103V382z"/>
+  <path fill="#ffc247" d="M92 500h888v276c0 57-46 103-103 103H195c-57 0-103-46-103-103V500z"/>
+  <path fill="#f0a92f" d="M140 775h840c-1 55-46 100-103 100H195c-57 0-102-45-103-100h48z" fill-opacity=".45"/>
+  <path fill="#ffe48a" d="M196 326h278c20 0 39 9 51 25l57 70c24 30 60 47 98 47h226v34H92V430c0-57 46-104 104-104z" fill-opacity=".72"/>
+  <path fill="#f88f45" d="M285 615c-37 20-84 11-111-22-12-15 6-35 23-26 34 18 68 13 97-15 15-14 39-3 37 18-2 16-12 28-46 45z"/>
+  <path fill="#f88f45" d="M739 615c37 20 84 11 111-22 12-15-6-35-23-26-34 18-68 13-97-15-15-14-39-3-37 18 2 16 12 28 46 45z"/>
+  <path fill="none" stroke="#4f2a16" stroke-width="34" stroke-linecap="round" stroke-linejoin="round" d="M347 560c21-43 83-43 104 0"/>
+  <path fill="none" stroke="#4f2a16" stroke-width="34" stroke-linecap="round" stroke-linejoin="round" d="M573 560c21-43 83-43 104 0"/>
+  <path fill="none" stroke="#6b321d" stroke-width="36" stroke-linecap="round" d="M365 653c65 75 159 75 224 0"/>
+  <path fill="#ff9e64" d="M292 637a49 31 0 1 0 98 0 49 31 0 1 0-98 0z" fill-opacity=".45"/>
+  <path fill="#ff9e64" d="M634 637a49 31 0 1 0 98 0 49 31 0 1 0-98 0z" fill-opacity=".45"/>
+</svg>
