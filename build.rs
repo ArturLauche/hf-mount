@@ -1,4 +1,8 @@
 fn main() {
+    println!("cargo:rerun-if-changed=assets/icon.ico");
+    println!("cargo:rerun-if-changed=assets/icon.svg");
+    println!("cargo:rerun-if-changed=assets/icon-small.svg");
+
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "windows" {
         #[cfg(target_os = "windows")]
         {

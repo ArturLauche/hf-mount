@@ -138,6 +138,8 @@ Windows users must enable Client for NFS and run the GUI from an Administrator s
 
 Enable **Background** before starting if the mount should keep running after the GUI window is closed. Enable **Start at login** to register the saved GUI mount profile for autostart. On Windows this creates a user logon Scheduled Task with highest privileges; on macOS it writes a user LaunchAgent; on Linux desktops it writes an XDG autostart entry. The GUI saves the mount profile under the user config directory and writes background status/log files there as well.
 
+If the GUI is opened while a background worker is already running, it reconnects to the saved worker status so you can stop or open the active mount from the new window.
+
 You can run the same setup validation without opening the window:
 
 ```powershell

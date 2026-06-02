@@ -1083,8 +1083,7 @@ async fn mount_windows_nfs_with_retry(
 fn windows_mount_output_is_network_error_53(output: &std::process::Output) -> bool {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    windows_mount_text_is_network_error_53(stdout.as_ref())
-        || windows_mount_text_is_network_error_53(stderr.as_ref())
+    windows_mount_text_is_network_error_53(stdout.as_ref()) || windows_mount_text_is_network_error_53(stderr.as_ref())
 }
 
 #[cfg(windows)]
@@ -1095,8 +1094,7 @@ fn windows_mount_text_is_network_error_53(text: &str) -> bool {
 
 #[cfg(windows)]
 fn windows_text_contains_code_53(text: &str) -> bool {
-    text.split(|ch: char| !ch.is_ascii_digit())
-        .any(|part| part == "53")
+    text.split(|ch: char| !ch.is_ascii_digit()).any(|part| part == "53")
 }
 
 #[cfg(windows)]
@@ -1194,7 +1192,9 @@ mod windows_nfs_path_tests {
     fn ignores_other_mount_errors() {
         assert!(!windows_mount_text_is_network_error_53("Network Error - 67"));
         assert!(!windows_mount_text_is_network_error_53("Network Error - 153"));
-        assert!(!windows_mount_text_is_network_error_53("The network path was not found."));
+        assert!(!windows_mount_text_is_network_error_53(
+            "The network path was not found."
+        ));
     }
 }
 
