@@ -36,8 +36,8 @@ fn main() {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([760.0, 540.0]),
+            .with_inner_size([1120.0, 720.0])
+            .with_min_inner_size([820.0, 560.0]),
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(
@@ -109,11 +109,11 @@ fn apply_theme(ctx: &egui::Context) {
     visuals.panel_fill = app_bg();
     visuals.window_fill = panel_bg();
     visuals.extreme_bg_color = input_bg();
-    visuals.faint_bg_color = egui::Color32::from_rgb(28, 30, 36);
-    visuals.code_bg_color = egui::Color32::from_rgb(24, 26, 31);
-    visuals.selection.bg_fill = accent();
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    visuals.hyperlink_color = egui::Color32::from_rgb(139, 180, 248);
+    visuals.faint_bg_color = elevated_bg();
+    visuals.code_bg_color = input_bg();
+    visuals.selection.bg_fill = egui::Color32::from_rgb(74, 74, 70);
+    visuals.selection.stroke = egui::Stroke::new(1.0, text_primary());
+    visuals.hyperlink_color = action_orange();
     visuals.warn_fg_color = warning_fg();
     visuals.error_fg_color = error_fg();
     visuals.window_rounding = rounding;
@@ -133,67 +133,79 @@ fn apply_theme(ctx: &egui::Context) {
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border());
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_primary());
     visuals.widgets.inactive.bg_fill = input_bg();
-    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(31, 33, 39);
+    visuals.widgets.inactive.weak_bg_fill = elevated_bg();
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border());
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_primary());
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(42, 45, 53);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(74, 78, 90));
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(48, 52, 61);
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent());
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(70, 70, 66);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(86, 86, 82));
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(76, 76, 72);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, text_secondary());
 
     style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(10.0, 9.0);
-    style.spacing.button_padding = egui::vec2(14.0, 8.0);
-    style.spacing.window_margin = egui::Margin::same(18.0);
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(13.0, 7.0);
+    style.spacing.window_margin = egui::Margin::same(0.0);
     ctx.set_style(style);
 }
 
 fn app_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(13, 14, 17)
+    egui::Color32::from_rgb(40, 40, 38)
+}
+
+fn sidebar_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(27, 27, 27)
 }
 
 fn panel_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(21, 23, 28)
+    egui::Color32::from_rgb(59, 59, 57)
 }
 
 fn elevated_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(25, 27, 33)
+    egui::Color32::from_rgb(48, 48, 47)
 }
 
 fn input_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(16, 18, 22)
+    egui::Color32::from_rgb(48, 48, 47)
 }
 
 fn border() -> egui::Color32 {
-    egui::Color32::from_rgb(47, 50, 59)
+    egui::Color32::from_rgb(74, 74, 71)
 }
 
-fn accent() -> egui::Color32 {
-    egui::Color32::from_rgb(77, 141, 106)
+fn primary_button_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(242, 242, 242)
 }
 
-fn accent_hover() -> egui::Color32 {
-    egui::Color32::from_rgb(88, 158, 120)
+fn primary_button_text() -> egui::Color32 {
+    egui::Color32::from_rgb(36, 36, 34)
+}
+
+fn action_orange() -> egui::Color32 {
+    egui::Color32::from_rgb(240, 122, 50)
+}
+
+fn success_fg() -> egui::Color32 {
+    egui::Color32::from_rgb(102, 192, 133)
 }
 
 fn text_primary() -> egui::Color32 {
-    egui::Color32::from_rgb(238, 239, 243)
+    egui::Color32::from_rgb(242, 242, 242)
 }
 
 fn text_secondary() -> egui::Color32 {
-    egui::Color32::from_rgb(158, 165, 177)
+    egui::Color32::from_rgb(167, 167, 162)
 }
 
 fn muted_text() -> egui::Color32 {
-    egui::Color32::from_rgb(112, 119, 132)
+    egui::Color32::from_rgb(126, 126, 120)
 }
 
 fn warning_fg() -> egui::Color32 {
-    egui::Color32::from_rgb(235, 188, 105)
+    egui::Color32::from_rgb(240, 122, 50)
 }
 
 fn error_fg() -> egui::Color32 {
-    egui::Color32::from_rgb(234, 116, 116)
+    egui::Color32::from_rgb(238, 107, 107)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,34 +307,26 @@ impl eframe::App for MountGuiApp {
         self.collect_finished_mount();
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
+        egui::SidePanel::left("left-rail")
+            .resizable(false)
+            .exact_width(268.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(sidebar_bg())
+                    .inner_margin(egui::Margin::symmetric(18.0, 18.0)),
+            )
+            .show(ctx, |ui| {
+                self.draw_sidebar(ui);
+            });
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
                     .fill(app_bg())
-                    .inner_margin(egui::Margin::same(18.0)),
+                    .inner_margin(egui::Margin::symmetric(30.0, 24.0)),
             )
             .show(ctx, |ui| {
-                self.draw_header(ui);
-                ui.add_space(14.0);
-                ui.horizontal_top(|ui| {
-                    ui.set_height(ui.available_height());
-                    ui.vertical(|ui| {
-                        ui.set_width(330.0);
-                        self.draw_status_panel(ui);
-                        ui.add_space(12.0);
-                        self.draw_checks_panel(ui);
-                        ui.add_space(12.0);
-                        self.draw_activity_panel(ui);
-                    });
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical()
-                        .id_source("config-scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            self.draw_config_panel(ui);
-                        });
-                });
+                self.draw_main_workspace(ui);
             });
     }
 
@@ -334,51 +338,93 @@ impl eframe::App for MountGuiApp {
 }
 
 impl MountGuiApp {
-    fn draw_header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new("hf-mount").size(27.0).strong().color(text_primary()));
-                ui.label(RichText::new("Mount Hugging Face storage from a desktop app").color(text_secondary()));
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
+        let status = self.status.lock().expect("status mutex poisoned").clone();
+        ui.set_height(ui.available_height());
+
+        ui.label(RichText::new("hf-mount").size(21.0).strong().color(text_primary()));
+        ui.label(RichText::new("Native NFS mounter").size(13.0).color(text_secondary()));
+        ui.add_space(22.0);
+
+        nav_row(ui, "Mount", true);
+        nav_row(ui, "Setup", false);
+        nav_row(ui, "Activity", false);
+
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(14.0);
+
+        section_title(ui, "Session");
+        ui.add_space(8.0);
+        status_chip(ui, &status.state);
+        ui.add_space(8.0);
+        ui.label(RichText::new(status.headline).strong().color(text_primary()));
+        ui.label(RichText::new(status.detail).size(12.0).color(text_secondary()));
+
+        ui.add_space(18.0);
+        section_title(ui, "Readiness");
+        ui.add_space(8.0);
+        checks_summary(ui, &self.checks);
+        ui.add_space(10.0);
+        for check in &self.checks {
+            compact_check_row(ui, check);
+            ui.add_space(5.0);
+        }
+
+        ui.add_space(18.0);
+        section_title(ui, "Activity");
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .id_source("activity-log")
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for line in status.log {
+                    ui.label(RichText::new(line).monospace().size(11.0).color(text_secondary()));
+                }
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let status = self.status.lock().expect("status mutex poisoned").clone();
-                status_pill(ui, &status.state);
-                pill(ui, "NFS backend", text_secondary(), egui::Color32::from_rgb(31, 34, 40));
-                pill(
-                    ui,
-                    platform_label(),
-                    text_secondary(),
-                    egui::Color32::from_rgb(31, 34, 40),
-                );
+    }
+
+    fn draw_main_workspace(&mut self, ui: &mut egui::Ui) {
+        self.draw_header(ui);
+        ui.add_space(44.0);
+
+        let composer_width = ui.available_width().min(860.0);
+        let leading_space = ((ui.available_width() - composer_width) / 2.0).max(0.0);
+        ui.horizontal_top(|ui| {
+            ui.add_space(leading_space);
+            ui.vertical(|ui| {
+                ui.set_width(composer_width);
+                self.draw_composer_panel(ui);
             });
         });
     }
 
-    fn draw_status_panel(&mut self, ui: &mut egui::Ui) {
-        let status = self.status.lock().expect("status mutex poisoned").clone();
-        card(ui, |ui| {
-            section_title(ui, "Session");
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                status_pill(ui, &status.state);
-                if matches!(status.state, MountState::Mounting | MountState::Stopping) {
-                    ui.add(egui::Spinner::new().size(16.0));
-                }
+    fn draw_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Mount Hugging Face storage").size(25.0).strong().color(text_primary()));
+                ui.label(RichText::new("Choose a repo or bucket, then start the local NFS mount.").color(text_secondary()));
             });
-            ui.add_space(12.0);
-            ui.label(RichText::new(status.headline).strong().color(text_primary()));
-            ui.add_space(4.0);
-            ui.label(RichText::new(status.detail).color(text_secondary()));
-            if let Some(blocker) = self.first_blocking_check() {
-                ui.add_space(10.0);
-                callout(
-                    ui,
-                    error_fg(),
-                    "Blocked",
-                    format!("{}: {}", blocker.label, blocker.detail),
-                );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let status = self.status.lock().expect("status mutex poisoned").clone();
+                meta_label(ui, platform_label());
+                meta_label(ui, "NFS backend");
+                status_chip(ui, &status.state);
+            });
+        });
+    }
+
+    fn draw_composer_panel(&mut self, ui: &mut egui::Ui) {
+        composer(ui, |ui| {
+            section_title(ui, "Mount");
+            ui.add_space(14.0);
+            self.draw_config_fields(ui);
+            ui.add_space(14.0);
+            if let Some(blocker) = self.first_blocking_check().cloned() {
+                self.draw_blocker_row(ui, &blocker);
+                ui.add_space(12.0);
             }
-            ui.add_space(16.0);
             self.draw_action_buttons(ui);
         });
     }
@@ -389,16 +435,32 @@ impl MountGuiApp {
             let status = self.status.lock().expect("status mutex poisoned");
             status.state == MountState::Mounted
         };
+        let blocked = self.first_blocking_check().is_some();
         let full_width = ui.available_width();
         let small_gap = ui.spacing().item_spacing.x;
         let half_width = ((full_width - small_gap) / 2.0).max(96.0);
         let button_height = 38.0;
 
-        let start_label = if running { "Mount running" } else { "Start mount" };
+        let start_label = if running {
+            "Mount running"
+        } else {
+            "Start mount"
+        };
         let start = egui::Button::new(RichText::new(start_label).strong().color(egui::Color32::WHITE))
-            .fill(if running { input_bg() } else { accent() })
+            .fill(if running || blocked {
+                input_bg()
+            } else {
+                primary_button_bg()
+            })
             .min_size(egui::vec2(full_width, button_height));
-        if ui.add_enabled(!running, start).clicked() {
+        let start = if running || blocked {
+            start
+        } else {
+            egui::Button::new(RichText::new(start_label).strong().color(primary_button_text()))
+                .fill(primary_button_bg())
+                .min_size(egui::vec2(full_width, button_height))
+        };
+        if ui.add_enabled(!running && !blocked, start).clicked() {
             self.start_mount();
         }
 
@@ -416,7 +478,7 @@ impl MountGuiApp {
             }
 
             let stop = egui::Button::new(RichText::new("Stop").strong().color(text_primary()))
-                .fill(egui::Color32::from_rgb(69, 35, 39));
+                .fill(egui::Color32::from_rgb(77, 42, 42));
             ui.add_enabled_ui(running, |ui| {
                 if ui.add_sized([half_width, button_height], stop).clicked() {
                     self.stop_mount();
@@ -437,151 +499,172 @@ impl MountGuiApp {
             });
         });
 
-        #[cfg(windows)]
-        if self.has_failed_check("Administrator") {
-            ui.add_space(8.0);
-            if ui
-                .add_sized(
-                    [ui.available_width(), button_height],
-                    egui::Button::new(RichText::new("Restart as admin").strong().color(text_primary())),
-                )
-                .clicked()
-            {
-                match restart_as_administrator() {
-                    Ok(()) => set_status(
-                        &self.status,
-                        MountState::Stopped,
-                        "Elevation requested",
-                        "Approve the Windows UAC prompt, then use the elevated window.",
-                    ),
-                    Err(e) => set_status(&self.status, MountState::Failed, "Could not relaunch as admin", e),
-                }
+    }
+
+    fn draw_config_fields(&mut self, ui: &mut egui::Ui) {
+        field_row(ui, "Type", |ui| {
+            let before = self.source;
+            source_selector(ui, &mut self.source);
+            if before != self.source && self.source == GuiSource::Repo {
+                self.read_only = true;
             }
+        });
+        field_row(
+            ui,
+            match self.source {
+                GuiSource::Repo => "Repo ID",
+                GuiSource::Bucket => "Bucket ID",
+            },
+            |ui| {
+                let hint = match self.source {
+                    GuiSource::Repo => "openai-community/gpt2",
+                    GuiSource::Bucket => "namespace/bucket",
+                };
+                text_field(ui, &mut self.source_id, hint, false);
+            },
+        );
+        if self.source == GuiSource::Repo {
+            field_row(ui, "Revision", |ui| text_field(ui, &mut self.revision, "main", false));
+        }
+        field_row(ui, "Mount point", |ui| {
+            text_field(ui, &mut self.mount_point, default_mount_hint(), false);
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(mount_point_hint()).small().color(muted_text()));
+                #[cfg(windows)]
+                if ui.small_button("Use Z:").clicked() {
+                    self.mount_point = "Z:".to_string();
+                    self.checks = run_preflight_checks(&self.mount_point);
+                }
+            });
+        });
+        field_row(ui, "Access", |ui| {
+            if self.source == GuiSource::Repo {
+                self.read_only = true;
+                let mut locked = true;
+                ui.add_enabled(false, egui::Checkbox::new(&mut locked, "Read-only"));
+                ui.label(RichText::new("Repos are always read-only").small().color(muted_text()));
+            } else {
+                ui.checkbox(&mut self.read_only, "Read-only");
+            }
+        });
+        field_row(ui, "HF token", |ui| {
+            text_field(ui, &mut self.hf_token, "Optional access token", true);
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new("Uses HF_TOKEN automatically when set.")
+                    .small()
+                    .color(muted_text()),
+            );
+        });
+        ui.add_space(2.0);
+        if ui
+            .button(if self.show_advanced {
+                "Hide advanced"
+            } else {
+                "Show advanced"
+            })
+            .clicked()
+        {
+            self.show_advanced = !self.show_advanced;
+        }
+        if self.show_advanced {
+            ui.add_space(8.0);
+            field_row(ui, "Hub endpoint", |ui| {
+                text_field(ui, &mut self.hub_endpoint, "https://huggingface.co", false);
+            });
+            field_row(ui, "Cache dir", |ui| {
+                text_field(ui, &mut self.cache_dir, "Cache directory", false);
+            });
         }
     }
 
-    fn draw_checks_panel(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
-            section_title(ui, "Readiness");
-            ui.add_space(8.0);
-            checks_summary(ui, &self.checks);
-            ui.add_space(8.0);
-            if self.checks.is_empty() {
-                ui.label(RichText::new("Run setup checks before mounting.").color(text_secondary()));
-            } else {
-                for check in &self.checks {
-                    check_row(ui, check);
-                    ui.add_space(6.0);
-                }
-            }
-        });
-    }
-
-    fn draw_activity_panel(&mut self, ui: &mut egui::Ui) {
-        let status = self.status.lock().expect("status mutex poisoned").clone();
-        card(ui, |ui| {
-            section_title(ui, "Activity");
-            ui.add_space(8.0);
-            egui::ScrollArea::vertical()
-                .id_source("activity-log")
-                .stick_to_bottom(true)
-                .max_height(190.0)
-                .show(ui, |ui| {
-                    for line in status.log {
-                        ui.label(RichText::new(line).monospace().small().color(text_secondary()));
-                    }
+    fn draw_blocker_row(&mut self, ui: &mut egui::Ui, blocker: &CheckItem) {
+        let detail = format!("{}: {}", blocker.label, blocker.detail);
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(58, 46, 39))
+            .stroke(egui::Stroke::new(1.0, action_orange()))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.label(RichText::new("Blocked").strong().color(action_orange()));
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&detail).color(text_primary()));
+                        if let Some(command) = blocker_command(blocker) {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(command).monospace().size(11.0).color(text_secondary()));
+                        }
+                    });
                 });
-        });
-    }
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    self.draw_primary_blocker_action(ui, blocker);
 
-    fn draw_config_panel(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
-            section_title(ui, "Source");
-            ui.add_space(12.0);
-            field_row(ui, "Type", |ui| {
-                let before = self.source;
-                source_selector(ui, &mut self.source);
-                if before != self.source && self.source == GuiSource::Repo {
-                    self.read_only = true;
-                }
-            });
-            field_row(
-                ui,
-                match self.source {
-                    GuiSource::Repo => "Repo ID",
-                    GuiSource::Bucket => "Bucket ID",
-                },
-                |ui| {
-                    let hint = match self.source {
-                        GuiSource::Repo => "openai-community/gpt2",
-                        GuiSource::Bucket => "namespace/bucket",
-                    };
-                    text_field(ui, &mut self.source_id, hint, false);
-                },
-            );
-            if self.source == GuiSource::Repo {
-                field_row(ui, "Revision", |ui| text_field(ui, &mut self.revision, "main", false));
-            }
-        });
+                    if let Some(command) = blocker_command(blocker) {
+                        if ui.button("Copy command").clicked() {
+                            ui.output_mut(|output| output.copied_text = command.to_string());
+                            push_log(&self.status, "Copied setup command");
+                        }
+                    }
 
-        ui.add_space(12.0);
-        card(ui, |ui| {
-            section_title(ui, "Mount");
-            ui.add_space(12.0);
-            field_row(ui, "Mount point", |ui| {
-                text_field(ui, &mut self.mount_point, default_mount_hint(), false);
-                ui.add_space(3.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(mount_point_hint()).small().color(muted_text()));
-                    #[cfg(windows)]
-                    if ui.small_button("Use Z:").clicked() {
+                    if blocker.label == "Mount point" && ui.button("Use Z:").clicked() {
                         self.mount_point = "Z:".to_string();
                         self.checks = run_preflight_checks(&self.mount_point);
+                        push_log(&self.status, summarize_checks(&self.checks));
                     }
-                });
-            });
-            field_row(ui, "Access", |ui| {
-                if self.source == GuiSource::Repo {
-                    self.read_only = true;
-                    let mut locked = true;
-                    ui.add_enabled(false, egui::Checkbox::new(&mut locked, "Read-only"));
-                    ui.label(RichText::new("Repos are always read-only").small().color(muted_text()));
-                } else {
-                    ui.checkbox(&mut self.read_only, "Read-only");
-                }
-            });
-        });
 
-        ui.add_space(12.0);
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                section_title(ui, "Connection");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let label = if self.show_advanced { "Hide" } else { "Show" };
-                    if ui.button(label).clicked() {
-                        self.show_advanced = !self.show_advanced;
+                    if ui.button("Recheck").clicked() {
+                        self.checks = run_preflight_checks(&self.mount_point);
+                        push_log(&self.status, summarize_checks(&self.checks));
                     }
                 });
             });
-            ui.add_space(12.0);
-            field_row(ui, "HF token", |ui| {
-                text_field(ui, &mut self.hf_token, "Optional access token", true);
-                ui.add_space(3.0);
-                ui.label(
-                    RichText::new("Uses HF_TOKEN automatically when set.")
-                        .small()
-                        .color(muted_text()),
-                );
-            });
-            if self.show_advanced {
-                field_row(ui, "Hub endpoint", |ui| {
-                    text_field(ui, &mut self.hub_endpoint, "https://huggingface.co", false);
-                });
-                field_row(ui, "Cache dir", |ui| {
-                    text_field(ui, &mut self.cache_dir, "Cache directory", false);
-                });
+    }
+
+    fn draw_primary_blocker_action(&mut self, ui: &mut egui::Ui, blocker: &CheckItem) {
+        #[cfg(windows)]
+        {
+            if blocker.label == "Client for NFS" {
+                let enable = egui::Button::new(RichText::new("Enable NFS").strong().color(egui::Color32::WHITE))
+                    .fill(action_orange());
+                if ui.add(enable).clicked() {
+                    match enable_windows_nfs_client() {
+                        Ok(()) => set_status(
+                            &self.status,
+                            MountState::Stopped,
+                            "NFS enable requested",
+                            "Approve the UAC prompt. Reboot if Windows asks, then press Recheck.",
+                        ),
+                        Err(e) => set_status(&self.status, MountState::Failed, "Could not enable NFS", e),
+                    }
+                }
+                return;
             }
-        });
+
+            if blocker.label == "Administrator" {
+                let restart =
+                    egui::Button::new(RichText::new("Restart as admin").strong().color(text_primary()));
+                if ui.add(restart).clicked() {
+                    match restart_as_administrator() {
+                        Ok(()) => set_status(
+                            &self.status,
+                            MountState::Stopped,
+                            "Elevation requested",
+                            "Approve the Windows UAC prompt, then use the elevated window.",
+                        ),
+                        Err(e) => set_status(&self.status, MountState::Failed, "Could not relaunch as admin", e),
+                    }
+                }
+                return;
+            }
+        }
+
+        if blocker.label == "Mount point" {
+            return;
+        }
+
+        ui.label(RichText::new("Fix this blocker, then recheck.").small().color(text_secondary()));
     }
 
     fn start_mount(&mut self) {
@@ -684,13 +767,10 @@ impl MountGuiApp {
     }
 
     fn first_blocking_check(&self) -> Option<&CheckItem> {
-        self.checks.iter().find(|check| check.level == CheckLevel::Fail)
-    }
-
-    fn has_failed_check(&self, label: &str) -> bool {
         self.checks
             .iter()
-            .any(|check| check.label == label && check.level == CheckLevel::Fail)
+            .find(|check| check.label == "Client for NFS" && check.level == CheckLevel::Fail)
+            .or_else(|| self.checks.iter().find(|check| check.level == CheckLevel::Fail))
     }
 
     fn mount_source(&self) -> Result<Source, String> {
@@ -744,29 +824,28 @@ impl MountGuiApp {
     }
 }
 
-fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+fn composer(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
         .fill(panel_bg())
         .stroke(egui::Stroke::new(1.0, border()))
-        .rounding(8.0)
-        .inner_margin(egui::Margin::symmetric(16.0, 14.0))
+        .rounding(10.0)
+        .inner_margin(egui::Margin::symmetric(18.0, 16.0))
         .show(ui, add_contents);
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str) {
-    ui.label(RichText::new(title).strong().color(text_primary()));
+    ui.label(RichText::new(title).size(14.0).strong().color(text_primary()));
 }
 
-fn callout(ui: &mut egui::Ui, color: egui::Color32, label: &str, detail: impl Into<String>) {
+fn nav_row(ui: &mut egui::Ui, label: &str, selected: bool) {
+    let fill = if selected { elevated_bg() } else { egui::Color32::TRANSPARENT };
+    let text = if selected { text_primary() } else { text_secondary() };
     egui::Frame::none()
-        .fill(egui::Color32::from_rgb(31, 26, 27))
-        .stroke(egui::Stroke::new(1.0, color))
+        .fill(fill)
         .rounding(8.0)
-        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
-            ui.label(RichText::new(label).small().strong().color(color));
-            ui.add_space(3.0);
-            ui.label(RichText::new(detail.into()).small().color(text_secondary()));
+            ui.label(RichText::new(label).strong().color(text));
         });
 }
 
@@ -813,11 +892,11 @@ fn source_selector(ui: &mut egui::Ui, source: &mut GuiSource) {
 
 fn source_button(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> egui::Response {
     let text_color = if selected {
-        egui::Color32::WHITE
+        text_primary()
     } else {
         text_secondary()
     };
-    let fill = if selected { accent() } else { egui::Color32::TRANSPARENT };
+    let fill = if selected { egui::Color32::from_rgb(70, 70, 66) } else { egui::Color32::TRANSPARENT };
     ui.add_sized(
         [width, 32.0],
         egui::Button::new(RichText::new(label).strong().color(text_color))
@@ -836,32 +915,20 @@ fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, password: bool)
     );
 }
 
-fn status_pill(ui: &mut egui::Ui, state: &MountState) {
+fn meta_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(12.0).color(text_secondary()));
+}
+
+fn status_chip(ui: &mut egui::Ui, state: &MountState) {
     let (label, fg, bg) = match state {
-        MountState::Ready => ("Ready", text_secondary(), egui::Color32::from_rgb(31, 34, 40)),
-        MountState::Mounting => (
-            "Mounting",
-            egui::Color32::from_rgb(248, 222, 166),
-            egui::Color32::from_rgb(77, 57, 27),
-        ),
-        MountState::Mounted => (
-            "Mounted",
-            egui::Color32::from_rgb(190, 235, 208),
-            egui::Color32::from_rgb(29, 58, 43),
-        ),
-        MountState::Stopping => (
-            "Stopping",
-            egui::Color32::from_rgb(248, 222, 166),
-            egui::Color32::from_rgb(77, 57, 27),
-        ),
-        MountState::Stopped => ("Stopped", text_secondary(), egui::Color32::from_rgb(31, 34, 40)),
-        MountState::Failed => (
-            "Error",
-            egui::Color32::from_rgb(255, 199, 199),
-            egui::Color32::from_rgb(76, 35, 40),
-        ),
+        MountState::Ready => ("Ready", text_secondary(), elevated_bg()),
+        MountState::Mounting => ("Mounting", action_orange(), egui::Color32::from_rgb(58, 46, 39)),
+        MountState::Mounted => ("Mounted", success_fg(), egui::Color32::from_rgb(34, 55, 42)),
+        MountState::Stopping => ("Stopping", action_orange(), egui::Color32::from_rgb(58, 46, 39)),
+        MountState::Stopped => ("Stopped", text_secondary(), elevated_bg()),
+        MountState::Failed => ("Error", error_fg(), egui::Color32::from_rgb(63, 39, 39)),
     };
-    pill(ui, label, fg, bg);
+    chip(ui, label, fg, bg);
 }
 
 fn checks_summary(ui: &mut egui::Ui, checks: &[CheckItem]) {
@@ -875,10 +942,10 @@ fn checks_summary(ui: &mut egui::Ui, checks: &[CheckItem]) {
     } else if warnings > 0 {
         ("Usable with warnings", warning_fg())
     } else {
-        ("Ready to mount", accent_hover())
+        ("Ready to mount", success_fg())
     };
     ui.horizontal(|ui| {
-        pill(ui, label, color, elevated_bg());
+        chip(ui, label, color, elevated_bg());
         if !checks.is_empty() {
             ui.label(
                 RichText::new(format!("{failures} blocking / {warnings} warning"))
@@ -889,27 +956,30 @@ fn checks_summary(ui: &mut egui::Ui, checks: &[CheckItem]) {
     });
 }
 
-fn pill(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
+fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
     egui::Frame::none()
         .fill(bg)
-        .rounding(egui::Rounding::same(999.0))
-        .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+        .rounding(egui::Rounding::same(7.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
         .show(ui, |ui| {
             ui.label(RichText::new(text).small().strong().color(fg));
         });
 }
 
-fn check_row(ui: &mut egui::Ui, check: &CheckItem) {
-    let (label, color) = match check.level {
-        CheckLevel::Pass => ("OK", accent_hover()),
-        CheckLevel::Warn => ("WARN", warning_fg()),
+fn compact_check_row(ui: &mut egui::Ui, check: &CheckItem) {
+    let (mark, color) = match check.level {
+        CheckLevel::Pass => ("OK", success_fg()),
+        CheckLevel::Warn => ("--", warning_fg()),
         CheckLevel::Fail => ("FIX", error_fg()),
     };
     ui.horizontal_top(|ui| {
-        pill(ui, label, color, elevated_bg());
+        ui.add_sized(
+            [34.0, 18.0],
+            egui::Label::new(RichText::new(mark).size(11.0).strong().color(color)),
+        );
         ui.vertical(|ui| {
-            ui.label(RichText::new(&check.label).strong().color(text_primary()));
-            ui.label(RichText::new(&check.detail).small().color(text_secondary()));
+            ui.label(RichText::new(&check.label).size(13.0).strong().color(text_primary()));
+            ui.label(RichText::new(&check.detail).size(11.0).color(text_secondary()));
         });
     });
 }
@@ -1210,6 +1280,64 @@ fn summarize_checks(checks: &[CheckItem]) -> String {
         "Setup checks passed with warnings".to_string()
     } else {
         "Setup checks passed".to_string()
+    }
+}
+
+fn blocker_command(check: &CheckItem) -> Option<&'static str> {
+    #[cfg(windows)]
+    {
+        match check.label.as_str() {
+            "Client for NFS" => Some(windows_enable_nfs_command()),
+            "Administrator" => Some("Start-Process hf-mount-gui.exe -Verb RunAs"),
+            "Portmapper" => Some("Close other NFS/portmap services or another hf-mount instance, then recheck."),
+            "Mount point" => Some("Use an unused drive letter such as Z:, Y:, or X:."),
+            _ => None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = check;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_enable_nfs_command() -> &'static str {
+    "Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly,ClientForNFS-Infrastructure -All"
+}
+
+#[cfg(windows)]
+fn enable_windows_nfs_client() -> Result<(), String> {
+    let powershell = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let elevated_args = format!(
+        "-NoProfile -ExecutionPolicy Bypass -Command \"{}\"",
+        windows_enable_nfs_command()
+    );
+
+    let status = Command::new(&powershell)
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Start-Process -FilePath $args[0] -Verb RunAs -ArgumentList $args[1]",
+        ])
+        .arg(&powershell)
+        .arg(elevated_args)
+        .status()
+        .map_err(|e| format!("Failed to launch the UAC prompt: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("PowerShell exited with {status}"))
     }
 }
 
