@@ -180,10 +180,19 @@ pub struct MountOptions {
     pub no_filter_os_files: bool,
 
     /// Restrict mount access to the mounting user only (FUSE only).
-    /// By default all users can access the mount.
-    /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
-    #[arg(long, default_value_t = false)]
+    /// This is the default; kept for compatibility with older command lines.
+    #[arg(long, default_value_t = false, hide = true)]
     pub fuse_owner_only: bool,
+
+    /// Allow other local users to access a FUSE mount.
+    /// This restores the previous default and requires `user_allow_other` in /etc/fuse.conf on Linux.
+    #[arg(long, default_value_t = false)]
+    pub fuse_allow_other: bool,
+
+    /// Permit NFS operation without enforceable local caller authorization.
+    /// Needed only on platforms where AUTH_SYS + privileged source-port checks are unavailable.
+    #[arg(long, default_value_t = false)]
+    pub nfs_allow_unsafe_loopback: bool,
 
     /// Soft cap on the number of inodes kept in memory. When exceeded, a
     /// background task asks the kernel (via FUSE `notify_inval_entry`) to
@@ -235,6 +244,27 @@ pub struct MountSetup {
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
     pub fuse_owner_only: bool,
+    pub nfs_security: NfsSecurity,
+}
+
+#[derive(Clone, Debug)]
+pub struct NfsSecurity {
+    pub owner_uid: u32,
+    pub allow_unsafe_loopback: bool,
+    pub export_name: String,
+    pub filehandle_secret: [u8; 16],
+}
+
+impl NfsSecurity {
+    fn new(owner_uid: u32, allow_unsafe_loopback: bool) -> Self {
+        let id = uuid::Uuid::new_v4();
+        Self {
+            owner_uid,
+            allow_unsafe_loopback,
+            export_name: format!("hf-mount-{}", id.simple()),
+            filehandle_secret: *id.as_bytes(),
+        }
+    }
 }
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
@@ -357,6 +387,18 @@ pub fn build_with_runtime(
         panic!("--overlay is not supported on Windows. Use a regular NFS mount without --overlay.");
     }
 
+    #[cfg(not(unix))]
+    let private_nfs_credentials = is_nfs && (options.hf_token.is_some() || options.token_file.is_some());
+    #[cfg(not(unix))]
+    if private_nfs_credentials && !options.nfs_allow_unsafe_loopback {
+        panic!(
+            "credential-backed NFS mounts require --nfs-allow-unsafe-loopback on this platform because local NFS caller authorization cannot be enforced"
+        );
+    }
+
+    ensure_private_cache_dir(&options.cache_dir)
+        .unwrap_or_else(|e| panic!("Failed to prepare private cache dir {:?}: {e}", options.cache_dir));
+
     let backend = if is_nfs { "nfs" } else { "fuse" };
     let hub_client = runtime.block_on(async {
         HubApiClient::from_source(
@@ -390,10 +432,6 @@ pub fn build_with_runtime(
     let refresher = hub_client.token_refresher(remote_read_only);
     let xet_ctx = XetContext::default().expect("Failed to create XetContext");
     let cas_config = build_cas_config(&xet_ctx, &runtime, &refresher);
-
-    // Ensure cache directory exists and is writable (needed for staging even without chunk cache).
-    std::fs::create_dir_all(&options.cache_dir)
-        .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", options.cache_dir));
 
     // The chunk cache and the whole-file cache are mutually exclusive: when
     // `cache_mode=file` we explicitly disable xet-core's chunk_cache so we
@@ -567,8 +605,13 @@ pub fn build_with_runtime(
         metadata_ttl,
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
-        fuse_owner_only: options.fuse_owner_only,
+        fuse_owner_only: effective_fuse_owner_only(&options),
+        nfs_security: NfsSecurity::new(uid, options.nfs_allow_unsafe_loopback),
     }
+}
+
+fn effective_fuse_owner_only(options: &MountOptions) -> bool {
+    options.fuse_owner_only || !options.fuse_allow_other
 }
 
 // ── Combined entry point (foreground binaries) ──────────────────────
@@ -603,8 +646,81 @@ pub fn raise_fd_limit() {
     }
 }
 
-fn default_cache_dir() -> PathBuf {
-    std::env::temp_dir().join("hf-mount-cache")
+pub fn default_cache_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(base) = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("APPDATA")) {
+            return PathBuf::from(base).join("hf-mount").join("cache");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Caches")
+                .join("hf-mount");
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(base) = std::env::var_os("XDG_CACHE_HOME") {
+            return PathBuf::from(base).join("hf-mount");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".cache").join("hf-mount");
+        }
+    }
+    PathBuf::from(".hf-mount-cache")
+}
+
+fn ensure_private_cache_dir(path: &Path) -> std::io::Result<()> {
+    ensure_private_dir(path)
+}
+
+fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "path must not be a symlink",
+                ));
+            }
+        }
+
+        std::fs::create_dir_all(path)?;
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path must be an owner-private directory, not a symlink or file",
+            ));
+        }
+
+        let uid = default_uid();
+        if meta.uid() != uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("directory is owned by uid {}, expected {}", meta.uid(), uid),
+            ));
+        }
+
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            let mut perms = std::fs::metadata(path)?.permissions();
+            perms.set_mode(mode & !0o077);
+            std::fs::set_permissions(path, perms)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
 }
 
 fn should_create_mount_point(mount_point: &Path, is_nfs: bool) -> bool {
@@ -689,5 +805,52 @@ mod windows_mount_point_tests {
         assert!(!should_create_mount_point(Path::new("Z:\\"), true));
         assert!(should_create_mount_point(Path::new("C:\\hf-mounts\\repo"), true));
         assert!(should_create_mount_point(Path::new("Z:"), false));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod storage_security_tests {
+    use super::*;
+    use clap::Parser;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn cache_dir_permissions_are_hardened() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_cache_dir(&cache).unwrap();
+
+        let mode = std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    #[test]
+    fn cache_dir_rejects_symlink_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("cache-link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = ensure_private_cache_dir(&link).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn fuse_owner_only_is_default_with_allow_other_opt_in() {
+        let default_args = Args::parse_from(["hf-mount-fuse", "repo", "openai/gpt", "/tmp/hf-mount-test"]);
+        assert!(effective_fuse_owner_only(&default_args.options));
+
+        let allow_args = Args::parse_from([
+            "hf-mount-fuse",
+            "--fuse-allow-other",
+            "repo",
+            "openai/gpt",
+            "/tmp/hf-mount-test",
+        ]);
+        assert!(!effective_fuse_owner_only(&allow_args.options));
     }
 }

@@ -1,12 +1,42 @@
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// State directory for daemon files (~/.hf-mount/).
-fn state_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".hf-mount")
+fn state_dir() -> std::io::Result<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME is not set; refusing to use an untrusted daemon state directory",
+        )
+    })?;
+    trusted_state_dir_from_home(&home)
+}
+
+fn trusted_state_dir_from_home(home: &Path) -> std::io::Result<PathBuf> {
+    let meta = std::fs::symlink_metadata(home)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("HOME {} must be a trusted directory, not a symlink or file", home.display()),
+        ));
+    }
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("HOME {} is owned by uid {}, expected {}", home.display(), meta.uid(), uid),
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("HOME {} must not be group/world writable", home.display()),
+        ));
+    }
+    Ok(home.join(".hf-mount"))
 }
 
 /// Canonicalize a mount point path, falling back to a normalized absolute path
@@ -58,14 +88,93 @@ fn encode_path(path: &Path) -> String {
         .replace('/', "%2F")
 }
 
-fn pid_path(mount_point: &Path) -> PathBuf {
+fn pid_path(mount_point: &Path) -> std::io::Result<PathBuf> {
     let key = encode_path(&canonical_mount_point(mount_point));
-    state_dir().join("pids").join(format!("{key}.pid"))
+    Ok(state_dir()?.join("pids").join(format!("{key}.pid")))
 }
 
-fn log_path(mount_point: &Path) -> PathBuf {
+fn log_path(mount_point: &Path) -> std::io::Result<PathBuf> {
     let key = encode_path(&canonical_mount_point(mount_point));
-    state_dir().join("logs").join(format!("{key}.log"))
+    Ok(state_dir()?.join("logs").join(format!("{key}.log")))
+}
+
+fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("state directory {} must not be a symlink", path.display()),
+        ));
+    }
+
+    std::fs::create_dir_all(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("state path {} must be a directory", path.display()),
+        ));
+    }
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("state directory {} is owned by uid {}, expected {}", path.display(), meta.uid(), uid),
+        ));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(mode & !0o077);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+fn prepare_state_dir(path: &Path) -> std::io::Result<()> {
+    ensure_private_dir(path)?;
+    ensure_private_dir(&path.join("pids"))?;
+    ensure_private_dir(&path.join("logs"))
+}
+
+fn open_no_follow_read(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn read_to_string_no_follow(path: &Path) -> std::io::Result<String> {
+    let mut content = String::new();
+    open_no_follow_read(path)?.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+fn open_log_file(path: &Path) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o600);
+        file.set_permissions(perms)?;
+    }
+    Ok(file)
+}
+
+fn write_pid_file(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(content.as_bytes())
 }
 
 /// Check if a PID belongs to a live hf-mount daemon process.
@@ -106,7 +215,7 @@ struct PidFileContents {
 /// Read a PID file.
 /// Format: line 1 = PID, line 2 = canonical mount path, line 3 = source label.
 fn read_pid_file(pid_file: &Path) -> Option<PidFileContents> {
-    let content = std::fs::read_to_string(pid_file).ok()?;
+    let content = read_to_string_no_follow(pid_file).ok()?;
     let mut lines = content.lines();
     let pid: i32 = lines.next()?.trim().parse().ok()?;
     let mount = lines.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -205,7 +314,7 @@ fn try_unmount(mount_point: &Path) -> bool {
 
 /// Stop a running daemon by unmounting and waiting for the process to exit.
 pub fn stop_daemon(mount_point: &Path) -> std::io::Result<()> {
-    let pid_file = pid_path(mount_point);
+    let pid_file = pid_path(mount_point)?;
     let canonical = canonical_mount_point(mount_point);
     let pf = read_pid_file(&pid_file).ok_or_else(|| {
         std::io::Error::new(
@@ -301,7 +410,13 @@ pub struct DaemonInfo {
 
 /// List all running daemons by scanning PID files.
 pub fn list_daemons() -> Vec<DaemonInfo> {
-    let pids_dir = state_dir().join("pids");
+    let Ok(base_state_dir) = state_dir() else {
+        return vec![];
+    };
+    if prepare_state_dir(&base_state_dir).is_err() {
+        return vec![];
+    }
+    let pids_dir = base_state_dir.join("pids");
     let Ok(entries) = std::fs::read_dir(&pids_dir) else {
         return vec![];
     };
@@ -325,7 +440,7 @@ pub fn list_daemons() -> Vec<DaemonInfo> {
             decode_path(&stem)
         });
 
-        let log_file = state_dir().join("logs").join(format!(
+        let log_file = base_state_dir.join("logs").join(format!(
             "{}.log",
             path.file_stem().unwrap_or_default().to_string_lossy()
         ));
@@ -354,12 +469,11 @@ pub fn list_daemons() -> Vec<DaemonInfo> {
 /// # Safety
 /// Must be called before any threads are spawned (before tokio runtime).
 pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<DaemonGuard> {
-    let log_file = log_path(mount_point);
-    let pid_file = pid_path(mount_point);
+    let state = state_dir()?;
+    prepare_state_dir(&state)?;
+    let log_file = log_path(mount_point)?;
+    let pid_file = pid_path(mount_point)?;
     let canonical = canonical_mount_point(mount_point);
-
-    std::fs::create_dir_all(log_file.parent().expect("log_file has parent"))?;
-    std::fs::create_dir_all(pid_file.parent().expect("pid_file has parent"))?;
 
     // Refuse to start if a daemon is already running for this mount point.
     if let Some(existing) = read_pid_file(&pid_file) {
@@ -415,7 +529,7 @@ pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<Daem
             }
 
             // Redirect stdout + stderr to the log file.
-            let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_file)?;
+            let log = open_log_file(&log_file)?;
             let log_fd = log.as_raw_fd();
             unsafe {
                 libc::dup2(log_fd, libc::STDOUT_FILENO);
@@ -426,9 +540,9 @@ pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<Daem
             drop(log);
 
             // Write PID file: line 1 = PID, line 2 = mount path, line 3 = source.
-            std::fs::write(
+            write_pid_file(
                 &pid_file,
-                format!("{}\n{}\n{}\n", std::process::id(), canonical.display(), source_label),
+                &format!("{}\n{}\n{}\n", std::process::id(), canonical.display(), source_label),
             )?;
 
             Ok(DaemonGuard {
@@ -476,7 +590,7 @@ pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<Daem
                 std::process::exit(0);
             } else {
                 eprintln!(" failed");
-                if let Ok(log) = std::fs::read_to_string(&log_file) {
+                if let Ok(log) = read_to_string_no_follow(&log_file) {
                     let log = log.trim();
                     if !log.is_empty() {
                         eprintln!("\n{log}");
@@ -485,5 +599,54 @@ pub fn daemonize(mount_point: &Path, source_label: &str) -> std::io::Result<Daem
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn pid_file_read_does_not_follow_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.pid");
+        let link = temp.path().join("link.pid");
+        std::fs::write(&target, "1\n/tmp/mnt\nbucket x\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(read_pid_file(&link).is_none());
+    }
+
+    #[test]
+    fn pid_file_write_refuses_existing_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.pid");
+        let link = temp.path().join("link.pid");
+        std::fs::write(&target, "").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(write_pid_file(&link, "1\n/tmp/mnt\nbucket x\n").is_err());
+    }
+
+    #[test]
+    fn private_state_dir_rejects_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("state");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = ensure_private_dir(&link).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn daemon_state_rejects_unsafe_home_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = trusted_state_dir_from_home(temp.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

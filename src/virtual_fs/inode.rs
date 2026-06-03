@@ -7,10 +7,24 @@ pub const ROOT_INODE: u64 = 1;
 
 /// Build a child's full path given the parent's full_path and child name.
 pub fn child_path(parent_path: &str, name: &str) -> String {
+    debug_assert!(validate_child_name(name).is_ok());
     if parent_path.is_empty() {
         name.to_string()
     } else {
         format!("{}/{}", parent_path, name)
+    }
+}
+
+pub fn validate_child_name(name: &str) -> Result<(), i32> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.as_bytes().contains(&b'/')
+        || name.as_bytes().contains(&b'\0')
+    {
+        Err(libc::EINVAL)
+    } else {
+        Ok(())
     }
 }
 
@@ -958,6 +972,14 @@ impl InodeTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_name_validation_rejects_non_components() {
+        for name in ["", ".", "..", "a/b", "a\0b"] {
+            assert_eq!(validate_child_name(name), Err(libc::EINVAL));
+        }
+        assert_eq!(validate_child_name("model.bin"), Ok(()));
+    }
 
     #[test]
     fn test_insert_and_lookup() {

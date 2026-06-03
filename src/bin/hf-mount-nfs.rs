@@ -11,6 +11,7 @@ fn main() {
         &s.mount_point,
         s.metadata_ttl_ms,
         s.read_only,
+        s.nfs_security.clone(),
         daemon_guard.as_mut(),
     )) {
         error!("NFS mount failed: {}", e);

@@ -1,20 +1,24 @@
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_atime, set_gid3,
-    set_mode3, set_mtime, set_size3, set_uid3, specdata3,
+    cookieverf3, fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
+    set_atime, set_gid3, set_mode3, set_mtime, set_size3, set_uid3, specdata3,
 };
-use nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use nfsserve::tcp::{NFSTcp, NFSTcpListener, RpcAuthRequest, RpcAuthorizer};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tracing::info;
 
 use crate::daemon::DaemonGuard;
-use crate::virtual_fs::inode::InodeKind;
+use crate::setup::NfsSecurity;
+use crate::virtual_fs::inode::{self, InodeKind};
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
+
+const PORTMAP_PROGRAM: u32 = 100000;
 
 // ── NFS Adapter ────────────────────────────────────────────────────────
 
@@ -22,14 +26,16 @@ pub struct NFSAdapter {
     virtual_fs: Arc<VirtualFs>,
     handle_pool: Arc<Mutex<HandlePool>>,
     read_only: bool,
+    security: NfsSecurity,
 }
 
 impl NFSAdapter {
-    pub fn new(virtual_fs: Arc<VirtualFs>, read_only: bool) -> Self {
+    pub fn new(virtual_fs: Arc<VirtualFs>, read_only: bool, security: NfsSecurity) -> Self {
         Self {
             virtual_fs,
             handle_pool: Arc::new(Mutex::new(HandlePool::new())),
             read_only,
+            security,
         }
     }
 
@@ -133,6 +139,45 @@ impl NFSAdapter {
     }
 }
 
+#[derive(Clone)]
+struct NfsLocalAuthorizer {
+    owner_uid: u32,
+}
+
+impl NfsLocalAuthorizer {
+    fn new(owner_uid: u32) -> Self {
+        Self { owner_uid }
+    }
+
+    fn is_allowed(&self, request: &RpcAuthRequest) -> bool {
+        let Ok(addr) = request.client_addr.parse::<SocketAddr>() else {
+            return false;
+        };
+        if !addr.ip().is_loopback() {
+            return false;
+        }
+
+        if request.program == PORTMAP_PROGRAM {
+            return true;
+        }
+
+        if request.auth_flavor != nfsserve::tcp::auth_flavor::AUTH_UNIX {
+            return false;
+        }
+
+        let uid = request.auth.uid();
+        let uid_allowed = uid == 0 || uid == self.owner_uid;
+        let reserved_source_port = addr.port() < 1024;
+        uid_allowed && reserved_source_port
+    }
+}
+
+impl RpcAuthorizer for NfsLocalAuthorizer {
+    fn authorize(&self, request: &RpcAuthRequest) -> bool {
+        self.is_allowed(request)
+    }
+}
+
 #[async_trait]
 impl NFSFileSystem for NFSAdapter {
     fn root_dir(&self) -> fileid3 {
@@ -147,8 +192,30 @@ impl NFSFileSystem for NFSAdapter {
         }
     }
 
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&self.security.filehandle_secret);
+        data.extend_from_slice(&id.to_le_bytes());
+        nfs_fh3 { data }
+    }
+
+    fn fh_to_id(&self, id: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        if id.data.len() != 24 || id.data[..16] != self.security.filehandle_secret[..] {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        Ok(u64::from_le_bytes(
+            id.data[16..24].try_into().map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+        ))
+    }
+
+    fn serverid(&self) -> cookieverf3 {
+        self.security.filehandle_secret[0..8]
+            .try_into()
+            .expect("fixed-size slice")
+    }
+
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let name = nfs_name(filename).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
+        let name = nfs_name(filename)?;
         self.virtual_fs
             .lookup(dirid, name)
             .await
@@ -496,6 +563,7 @@ pub async fn mount_nfs(
     mount_point: &Path,
     metadata_ttl_ms: u64,
     read_only: bool,
+    security: NfsSecurity,
     daemon_guard: Option<&mut DaemonGuard>,
 ) -> std::io::Result<()> {
     mount_nfs_with_callback(
@@ -503,6 +571,7 @@ pub async fn mount_nfs(
         mount_point,
         metadata_ttl_ms,
         read_only,
+        security,
         daemon_guard,
         |_| {},
     )
@@ -522,6 +591,7 @@ pub async fn mount_nfs_with_callback<F>(
     mount_point: &Path,
     metadata_ttl_ms: u64,
     read_only: bool,
+    security: NfsSecurity,
     daemon_guard: Option<&mut DaemonGuard>,
     mut on_event: F,
 ) -> std::io::Result<()>
@@ -529,7 +599,7 @@ where
     F: FnMut(NfsMountEvent) + Send,
 {
     let vfs_for_shutdown = virtual_fs.clone();
-    let adapter = NFSAdapter::new(virtual_fs, read_only);
+    let adapter = NFSAdapter::new(virtual_fs, read_only, security.clone());
     let pool_for_shutdown = adapter.handle_pool.clone();
 
     // When the poll loop detects a remote change on `ino`, drop the pooled
@@ -553,6 +623,11 @@ where
     }));
 
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
+    listener.with_export_name(&security.export_name);
+    #[cfg(unix)]
+    if !security.allow_unsafe_loopback {
+        listener.with_authorizer(Arc::new(NfsLocalAuthorizer::new(security.owner_uid)));
+    }
     let port = listener.get_listen_port();
     info!("NFS server listening on 127.0.0.1:{}", port);
     on_event(NfsMountEvent::ServerListening { port });
@@ -564,6 +639,8 @@ where
     let mount_point_str = mount_point
         .to_str()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid mount path"))?;
+    #[cfg(unix)]
+    let nfs_export = format!("127.0.0.1:/{}", security.export_name);
 
     // Start serving NFS requests *before* the mount command, otherwise
     // mount.nfs has nobody to talk to and fails with EIO.
@@ -593,10 +670,10 @@ where
         }
         let mount_cmd = mount_nfs_command_path();
         on_event(NfsMountEvent::MountCommand {
-            command: format!("{} -o {} 127.0.0.1:/ {}", mount_cmd.display(), opts, mount_point_str),
+            command: format!("{} -o {} {} {}", mount_cmd.display(), opts, nfs_export, mount_point_str),
         });
         let status = std::process::Command::new(mount_cmd)
-            .args(["-o", &opts, "127.0.0.1:/", mount_point_str])
+            .args(["-o", &opts, &nfs_export, mount_point_str])
             .status()?;
         if !status.success() {
             server_handle.abort();
@@ -611,15 +688,15 @@ where
             mount_opts = format!("{mount_opts},wsize=1048576");
         }
         on_event(NfsMountEvent::MountCommand {
-            command: format!("mount.nfs -o {mount_opts} 127.0.0.1:/ {mount_point_str}"),
+            command: format!("mount.nfs -o {mount_opts} {nfs_export} {mount_point_str}"),
         });
         let output = if unsafe { libc::getuid() } == 0 {
             std::process::Command::new("mount.nfs")
-                .args(["-o", &mount_opts, "127.0.0.1:/", mount_point_str])
+                .args(["-o", &mount_opts, &nfs_export, mount_point_str])
                 .output()?
         } else {
             std::process::Command::new("sudo")
-                .args(["-n", "mount.nfs", "-o", &mount_opts, "127.0.0.1:/", mount_point_str])
+                .args(["-n", "mount.nfs", "-o", &mount_opts, &nfs_export, mount_point_str])
                 .output()?
         };
         if !output.status.success() {
@@ -651,7 +728,7 @@ where
     {
         let _ = actimeo; // mount.exe has no actimeo equivalent.
         let opts = String::from("nolock,anon,mtype=hard,rsize=32,wsize=32,timeout=60");
-        let share = windows_nfs_share();
+        let share = windows_nfs_share(&security.export_name);
         let mount_target = windows_nfs_mount_target(mount_point_str);
         let mount_cmd = mount_nfs_command_path();
         let cmd = format!("{} -o {opts} {share} {mount_target}", mount_cmd.display());
@@ -663,7 +740,7 @@ where
             );
         } else {
             info!("Running: {cmd}");
-            let output = mount_windows_nfs_with_retry(&mount_cmd, &opts, share, &mount_target).await?;
+            let output = mount_windows_nfs_with_retry(&mount_cmd, &opts, &share, &mount_target).await?;
             if !output.status.success() {
                 server_handle.abort();
                 portmapper_handle.abort();
@@ -920,7 +997,9 @@ impl HandlePool {
 // ── Conversions ────────────────────────────────────────────────────────
 
 fn nfs_name(filename: &filename3) -> Result<&str, nfsstat3> {
-    std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)
+    let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+    inode::validate_child_name(name).map_err(errno_to_nfs)?;
+    Ok(name)
 }
 
 fn errno_to_nfs(e: i32) -> nfsstat3 {
@@ -1100,15 +1179,15 @@ fn windows_text_contains_code_53(text: &str) -> bool {
 #[cfg(windows)]
 fn windows_mount_failure_hint(output: &std::process::Output) -> &'static str {
     if windows_mount_output_is_network_error_53(output) {
-        "Windows reported Network Error 53 while mounting the local NFS export. hf-mount uses the root export `\\\\127.0.0.1\\\\`; confirm the process is elevated, Client for NFS is enabled, port 111 is available, and localhost NFS/RPC traffic is not blocked."
+        "Windows reported Network Error 53 while mounting the local NFS export. Confirm the process is elevated, Client for NFS is enabled, port 111 is available, and localhost NFS/RPC traffic is not blocked."
     } else {
         "Client for NFS may be disabled, the process may not be elevated, or the mount target may be invalid."
     }
 }
 
 #[cfg(windows)]
-fn windows_nfs_share() -> &'static str {
-    r"\\127.0.0.1\\"
+fn windows_nfs_share(export_name: &str) -> String {
+    format!(r"\\127.0.0.1\{}", export_name)
 }
 
 #[cfg(windows)]
@@ -1170,8 +1249,8 @@ mod windows_nfs_path_tests {
     }
 
     #[test]
-    fn windows_mount_uses_unc_root_nfs_export_syntax() {
-        assert_eq!(windows_nfs_share(), r"\\127.0.0.1\\");
+    fn windows_mount_uses_unc_named_nfs_export_syntax() {
+        assert_eq!(windows_nfs_share("hf-mount-test"), r"\\127.0.0.1\hf-mount-test");
     }
 
     #[test]
@@ -1234,6 +1313,71 @@ mod tests {
     use super::*;
     use crate::test_mocks::{MockHub, MockXet, TestOpts, make_test_vfs};
 
+    fn test_nfs_security() -> NfsSecurity {
+        NfsSecurity {
+            owner_uid: 1000,
+            allow_unsafe_loopback: false,
+            export_name: "hf-mount-test".to_string(),
+            filehandle_secret: [7; 16],
+        }
+    }
+
+    #[test]
+    fn nfs_name_rejects_path_components() {
+        for bytes in [b"".as_slice(), b".", b"..", b"a/b", b"a\0b"] {
+            let name = nfsstring(bytes.to_vec());
+            assert_eq!(nfs_name(&name), Err(nfsstat3::NFS3ERR_INVAL));
+        }
+        let ok = nfsstring(b"model.bin".to_vec());
+        assert_eq!(nfs_name(&ok), Ok("model.bin"));
+    }
+
+    #[test]
+    fn nfs_authorizer_requires_loopback_authsys_owner_and_reserved_port() {
+        let auth = NfsLocalAuthorizer::new(1000);
+        let mut request = RpcAuthRequest {
+            client_addr: "127.0.0.1:900".to_string(),
+            auth_flavor: nfsserve::tcp::auth_flavor::AUTH_UNIX,
+            auth: nfsserve::tcp::auth_unix::new(1000, 1000, vec![]),
+            program: nfsserve::nfs::PROGRAM,
+            procedure: 1,
+        };
+        assert!(auth.authorize(&request));
+
+        request.client_addr = "127.0.0.1:9000".to_string();
+        assert!(!auth.authorize(&request));
+
+        request.client_addr = "192.0.2.1:900".to_string();
+        assert!(!auth.authorize(&request));
+
+        request.client_addr = "127.0.0.1:900".to_string();
+        request.auth = nfsserve::tcp::auth_unix::new(2000, 2000, vec![]);
+        assert!(!auth.authorize(&request));
+
+        request.auth = nfsserve::tcp::auth_unix::new(0, 0, vec![]);
+        assert!(auth.authorize(&request));
+
+        request.auth_flavor = nfsserve::tcp::auth_flavor::AUTH_NULL;
+        assert!(!auth.authorize(&request));
+    }
+
+    #[test]
+    fn nfs_filehandles_include_secret_material() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let vfs = make_test_vfs(MockHub::new(), MockXet::new(), TestOpts::default(), &rt);
+        let adapter = NFSAdapter::new(vfs, false, test_nfs_security());
+
+        let fh = adapter.id_to_fh(42);
+        assert_eq!(adapter.fh_to_id(&fh), Ok(42));
+
+        let mut forged = fh.clone();
+        forged.data[0] ^= 1;
+        assert_eq!(adapter.fh_to_id(&forged), Err(nfsstat3::NFS3ERR_BADHANDLE));
+    }
+
     /// Regression: a WRITE that arrives after a prior READ has populated the
     /// pool with a Lazy/read-only handle must NOT surface as `NFS3ERR_STALE`.
     /// Pre-fix, `nfs.rs::write()` peeked the read-only handle, called
@@ -1265,7 +1409,7 @@ mod tests {
         );
 
         // NFS adapter under test (read-write, like a real bucket mount).
-        let adapter = NFSAdapter::new(vfs.clone(), false);
+        let adapter = NFSAdapter::new(vfs.clone(), false, test_nfs_security());
 
         rt.block_on(async {
             // Resolve the ino so we don't hard-code it.
@@ -1330,7 +1474,7 @@ mod tests {
             },
             &rt,
         );
-        let adapter = NFSAdapter::new(vfs.clone(), false);
+        let adapter = NFSAdapter::new(vfs.clone(), false, test_nfs_security());
 
         rt.block_on(async {
             let name = nfsstring(b"file.txt".to_vec());
@@ -1385,7 +1529,7 @@ mod tests {
             },
             &rt,
         );
-        let adapter = NFSAdapter::new(vfs.clone(), false);
+        let adapter = NFSAdapter::new(vfs.clone(), false, test_nfs_security());
 
         rt.block_on(async {
             let name = nfsstring(b"file.txt".to_vec());

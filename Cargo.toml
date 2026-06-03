@@ -82,7 +82,7 @@ tempfile = "3"
 # (sidecar with externally pre-cloned fds — see #94).
 [patch.crates-io]
 fuser = { git = "https://github.com/huggingface/fuser.git", branch = "sidecar-multi-fd" }
-nfsserve = { git = "https://github.com/huggingface/nfsserve.git", branch = "feat/portmap-listener" }
+nfsserve = { path = "vendor/nfsserve" }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

@@ -136,7 +136,7 @@ Download the GUI binary from [GitHub Releases](https://github.com/huggingface/hf
 
 Windows users must enable Client for NFS and run the GUI from an Administrator session. The GUI includes a **Check setup** action that validates elevation, the Windows NFS client tools, port `111`, and the mount target before starting. If it was launched without elevation, use **Restart as admin** in the GUI and approve the Windows UAC prompt. Fill in the repo or bucket ID, mount point, optional token, then press **Start mount**. Press **Stop mount** to unmount.
 
-Enable **Background** before starting if the mount should keep running after the GUI window is closed. Enable **Start at login** to register the saved GUI mount profile for autostart. On Windows this creates a user logon Scheduled Task with highest privileges; on macOS it writes a user LaunchAgent; on Linux desktops it writes an XDG autostart entry. The GUI saves the mount profile under the user config directory and writes background status/log files there as well.
+Enable **Background** before starting if the mount should keep running after the GUI window is closed. Enable **Start at login** to register the saved GUI mount profile for autostart. On Windows this creates a user logon Scheduled Task with highest privileges; on macOS it writes a user LaunchAgent; on Linux desktops it writes an XDG autostart entry. The GUI saves the mount profile under the user config directory and writes background status/log files there as well. Inline HF tokens are not saved in the profile; background and autostart mounts use `HF_TOKEN` from the worker environment or a saved token-file path.
 
 If the GUI is opened while a background worker is already running, it reconnects to the saved worker status so you can stop or open the active mount from the new window.
 
@@ -172,11 +172,11 @@ Download `hf-mount-windows-x64.exe` from [GitHub Releases](https://github.com/hu
 $env:HF_TOKEN = "hf_..."
 
 # Mount to a drive letter
-.\hf-mount-windows-x64.exe repo openai/gpt-oss-20b Z:
+.\hf-mount-windows-x64.exe --nfs-allow-unsafe-loopback repo openai/gpt-oss-20b Z:
 
 # Directory targets may work on some Windows NFS setups, but a drive letter is recommended.
 New-Item -ItemType Directory -Force C:\hf-mounts\gpt-oss | Out-Null
-.\hf-mount-windows-x64.exe repo openai/gpt-oss-20b C:\hf-mounts\gpt-oss
+.\hf-mount-windows-x64.exe --nfs-allow-unsafe-loopback repo openai/gpt-oss-20b C:\hf-mounts\gpt-oss
 ```
 
 Stop the mount with Ctrl+C in the foreground process, or unmount it from another Administrator shell:
@@ -190,6 +190,7 @@ Windows differences and limitations:
 - `hf-mount-windows-x64.exe` stays in the foreground and owns the local NFS server until stopped.
 - The GUI can run its NFS backend in a detached background worker and can register that worker for login autostart.
 - Administrator privileges are required because the Windows NFS client uses the local portmapper on port `111`.
+- Windows does not expose enough local NFS caller identity for hf-mount to enforce per-user loopback authorization. Use `--nfs-allow-unsafe-loopback` only for credential-backed mounts you trust all same-host administrators/processes to access.
 - Use a drive letter such as `Z:` for the most reliable Windows mount target. Empty NTFS directory targets depend on the Windows NFS client and may fail on some systems.
 - Drive-letter targets such as `Z:` are mapped by Windows `mount.exe`; hf-mount does not try to create them as directories first.
 - Overlay mode (`--overlay`) is not supported on Windows.
@@ -245,6 +246,10 @@ By default, `hf-mount` uses NFS. Pass `--fuse` for tighter kernel integration (p
 ```bash
 hf-mount start --fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
 ```
+
+FUSE mounts are owner-only by default. Pass `--fuse-allow-other` only when other local users on the same machine should be able to access the mounted contents.
+
+The NFS backend uses a random local export name, secret filehandles, and Unix local-client authorization checks where the platform exposes enough caller identity. On platforms without enforceable local NFS caller authorization, credential-backed NFS mounts require the explicit `--nfs-allow-unsafe-loopback` opt-in.
 
 ### Foreground mode
 
@@ -309,7 +314,7 @@ hf-mount stop /tmp/data          # daemon mounts
 | --- | --- | --- |
 | `--hf-token` | `$HF_TOKEN` | HF API token (required for private repos/buckets) |
 | `--hub-endpoint` | `https://huggingface.co` | Hub API endpoint |
-| `--cache-dir` | system temp dir + `hf-mount-cache` | Local cache directory |
+| `--cache-dir` | user cache dir + `hf-mount` | Local cache directory, created owner-private |
 | `--cache-size` | `10000000000` (~10 GB) | Max on-disk chunk cache size in bytes |
 | `--read-only` | `false` | Mount read-only (always on for repos) |
 | `--advanced-writes` | `false` | Enable staging files + async flush (random writes, seek, overwrite) |
@@ -322,7 +327,8 @@ hf-mount stop /tmp/data          # daemon mounts
 | `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
 | `--no-filter-os-files` | `false` | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
-| `--fuse-owner-only` | `false` | Restrict mount access to the mounting user only (FUSE only; by default all users can access, which requires `user_allow_other` in /etc/fuse.conf) |
+| `--fuse-allow-other` | `false` | Allow other local users to access a FUSE mount; by default FUSE mounts are owner-only |
+| `--nfs-allow-unsafe-loopback` | `false` | Permit NFS without enforceable local caller authorization on platforms that cannot validate local NFS clients |
 | `--token-file` | | Path to a token file (re-read on each request for credential rotation) |
 | `--inode-soft-limit` | `0` | Soft cap on the in-memory inode table (0 disables). See "Bounding inode memory" below. |
 | `--lru-sweep-interval-ms` | `5000` | Background LRU sweep interval in milliseconds. Only meaningful when `--inode-soft-limit > 0`. |

@@ -1185,6 +1185,7 @@ impl VirtualFs {
     // ── VFS operations ─────────────────────────────────────────────────
 
     pub async fn lookup(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
+        inode::validate_child_name(name)?;
         debug!("lookup: parent={}, name={}", parent, name);
 
         // Fast path: children already loaded → lookup directly, no allocation needed.
@@ -2625,6 +2626,7 @@ impl VirtualFs {
         caller_gid: u32,
         pid: Option<u32>,
     ) -> VirtualFsResult<(VirtualFsAttr, u64)> {
+        inode::validate_child_name(name)?;
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -2747,6 +2749,7 @@ impl VirtualFs {
         caller_uid: u32,
         caller_gid: u32,
     ) -> VirtualFsResult<VirtualFsAttr> {
+        inode::validate_child_name(name)?;
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -2821,6 +2824,7 @@ impl VirtualFs {
     }
 
     pub async fn unlink(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
+        inode::validate_child_name(name)?;
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -2930,6 +2934,7 @@ impl VirtualFs {
         caller_uid: u32,
         caller_gid: u32,
     ) -> VirtualFsResult<VirtualFsAttr> {
+        inode::validate_child_name(name)?;
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -2983,13 +2988,15 @@ impl VirtualFs {
         }
     }
 
-    pub async fn link(&self, _ino: u64, _new_parent: u64, _new_name: &str) -> VirtualFsResult<VirtualFsAttr> {
+    pub async fn link(&self, _ino: u64, _new_parent: u64, new_name: &str) -> VirtualFsResult<VirtualFsAttr> {
+        inode::validate_child_name(new_name)?;
         // Hard links are not supported — they are ephemeral (in-memory only) and never
         // persisted to the hub, which makes them a source of subtle bugs with no benefit.
         Err(libc::ENOTSUP)
     }
 
     pub async fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
+        inode::validate_child_name(name)?;
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -3059,6 +3066,8 @@ impl VirtualFs {
         newname: &str,
         no_replace: bool,
     ) -> VirtualFsResult<()> {
+        inode::validate_child_name(name)?;
+        inode::validate_child_name(newname)?;
         if self.read_only {
             return Err(libc::EROFS);
         }

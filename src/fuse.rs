@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
 use crate::setup::MountSetup;
-use crate::virtual_fs::inode::InodeKind;
+use crate::virtual_fs::inode::{self, InodeKind};
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 
 /// Always 0: we never recycle inode numbers, so generation is unnecessary.
@@ -114,7 +114,13 @@ fn vfs_attr_to_fuse(attr: &VirtualFsAttr) -> FileAttr {
 macro_rules! os_to_str {
     ($name:expr, $reply:expr) => {
         match $name.to_str() {
-            Some(n) => n,
+            Some(n) => {
+                if inode::validate_child_name(n).is_err() {
+                    $reply.error(Errno::EINVAL);
+                    return;
+                }
+                n
+            }
             None => {
                 $reply.error(Errno::EINVAL);
                 return;

@@ -12,13 +12,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::net::{TcpListener, UdpSocket};
 #[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 use eframe::egui::{self, RichText, TextEdit};
 use hf_mount::nfs::NfsMountEvent;
-use hf_mount::setup::{CacheMode, MountOptions, Source};
+use hf_mount::setup::{default_cache_dir, CacheMode, MountOptions, Source};
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
@@ -298,11 +300,14 @@ struct MountProfile {
     source_id: String,
     revision: String,
     mount_point: String,
-    hf_token: String,
+    #[serde(default)]
+    token_file: String,
     hub_endpoint: String,
     cache_dir: String,
     read_only: bool,
     run_in_background: bool,
+    #[serde(default)]
+    nfs_allow_unsafe_loopback: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,10 +350,12 @@ struct MountGuiApp {
     revision: String,
     mount_point: String,
     hf_token: String,
+    token_file: String,
     hub_endpoint: String,
     cache_dir: String,
     read_only: bool,
     run_in_background: bool,
+    nfs_allow_unsafe_loopback: bool,
     autostart_enabled: bool,
     show_advanced: bool,
     checks: Vec<CheckItem>,
@@ -369,13 +376,12 @@ impl Default for MountGuiApp {
             revision: "main".to_string(),
             mount_point,
             hf_token: std::env::var("HF_TOKEN").unwrap_or_default(),
+            token_file: String::new(),
             hub_endpoint: "https://huggingface.co".to_string(),
-            cache_dir: std::env::temp_dir()
-                .join("hf-mount-cache")
-                .to_string_lossy()
-                .into_owned(),
+            cache_dir: default_cache_dir().to_string_lossy().into_owned(),
             read_only: true,
             run_in_background: false,
+            nfs_allow_unsafe_loopback: false,
             autostart_enabled: autostart_is_enabled(),
             show_advanced: false,
             checks,
@@ -446,11 +452,12 @@ impl MountGuiApp {
         self.source_id = profile.source_id;
         self.revision = profile.revision;
         self.mount_point = profile.mount_point;
-        self.hf_token = profile.hf_token;
+        self.token_file = profile.token_file;
         self.hub_endpoint = profile.hub_endpoint;
         self.cache_dir = profile.cache_dir;
         self.read_only = profile.read_only || self.source == GuiSource::Repo;
         self.run_in_background = profile.run_in_background;
+        self.nfs_allow_unsafe_loopback = profile.nfs_allow_unsafe_loopback;
     }
 
     fn profile(&self) -> MountProfile {
@@ -459,11 +466,12 @@ impl MountGuiApp {
             source_id: self.source_id.clone(),
             revision: self.revision.clone(),
             mount_point: self.mount_point.clone(),
-            hf_token: self.hf_token.clone(),
+            token_file: self.token_file.clone(),
             hub_endpoint: self.hub_endpoint.clone(),
             cache_dir: self.cache_dir.clone(),
             read_only: self.source == GuiSource::Repo || self.read_only,
             run_in_background: self.run_in_background,
+            nfs_allow_unsafe_loopback: self.nfs_allow_unsafe_loopback,
         }
     }
 
@@ -801,7 +809,7 @@ impl MountGuiApp {
             text_field(ui, &mut self.hf_token, "Optional access token", true);
             ui.add_space(3.0);
             ui.label(
-                RichText::new("Uses HF_TOKEN automatically when set.")
+                RichText::new("Uses HF_TOKEN automatically when set. Inline tokens are not saved.")
                     .small()
                     .color(muted_text()),
             );
@@ -824,6 +832,12 @@ impl MountGuiApp {
             });
             field_row(ui, "Cache dir", |ui| {
                 text_field(ui, &mut self.cache_dir, "Cache directory", false);
+            });
+            field_row(ui, "Token file", |ui| {
+                text_field(ui, &mut self.token_file, "Path to token file", false);
+            });
+            field_row(ui, "NFS access", |ui| {
+                ui.checkbox(&mut self.nfs_allow_unsafe_loopback, "Allow unsafe loopback fallback");
             });
         }
     }
@@ -951,6 +965,21 @@ impl MountGuiApp {
         let mount_point = source.mount_point().to_path_buf();
         let mount_label = mount_point.display().to_string();
         let shared_status = self.status.clone();
+
+        let inline_token = optional_text(&self.hf_token);
+        if self.run_in_background
+            && optional_text(&self.token_file).is_none()
+            && inline_token.is_some()
+            && inline_token != current_env_hf_token()
+        {
+            set_status(
+                &self.status,
+                MountState::Failed,
+                "Token not available to background worker",
+                "Set HF_TOKEN before launching the GUI or provide a token file.",
+            );
+            return;
+        }
 
         if let Err(e) = self.save_profile() {
             set_status(&self.status, MountState::Failed, "Could not save settings", e);
@@ -1096,7 +1125,11 @@ impl MountGuiApp {
     }
 
     fn mount_options(&self) -> Result<MountOptions, String> {
-        profile_mount_options(&self.profile())
+        let mut options = profile_mount_options(&self.profile())?;
+        if let Some(token) = optional_text(&self.hf_token) {
+            options.hf_token = Some(token);
+        }
+        Ok(options)
     }
 }
 
@@ -1279,12 +1312,14 @@ fn run_mount(source: Source, options: MountOptions, shared_status: SharedMountSt
         let mount_point = setup.mount_point.clone();
         let metadata_ttl_ms = setup.metadata_ttl_ms;
         let read_only = setup.read_only;
+        let nfs_security = setup.nfs_security.clone();
         let status_for_events = shared_status.clone();
         setup.runtime.block_on(hf_mount::nfs::mount_nfs_with_callback(
             virtual_fs,
             &mount_point,
             metadata_ttl_ms,
             read_only,
+            nfs_security,
             None,
             move |event| handle_mount_event(&status_for_events, event),
         ))
@@ -1721,12 +1756,14 @@ fn run_background_worker() -> Result<(), String> {
         let mount_point = setup.mount_point.clone();
         let metadata_ttl_ms = setup.metadata_ttl_ms;
         let read_only = setup.read_only;
+        let nfs_security = setup.nfs_security.clone();
         let event_mount_point = mount_point.clone();
         setup.runtime.block_on(hf_mount::nfs::mount_nfs_with_callback(
             virtual_fs,
             &mount_point,
             metadata_ttl_ms,
             read_only,
+            nfs_security,
             None,
             move |event| handle_background_mount_event(&event_mount_point, event),
         ))
@@ -1910,11 +1947,35 @@ fn worker_log_file() -> Result<std::fs::File, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
         .open(&path)
-        .map_err(|e| format!("Failed to open {}: {e}", path.display()))
+        .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let mode = file
+            .metadata()
+            .map_err(|e| format!("Failed to inspect {}: {e}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            let mut perms = file
+                .metadata()
+                .map_err(|e| format!("Failed to inspect {}: {e}", path.display()))?
+                .permissions();
+            perms.set_mode(0o600);
+            file.set_permissions(perms)
+                .map_err(|e| format!("Failed to chmod {}: {e}", path.display()))?;
+        }
+    }
+    Ok(file)
 }
 
 fn profile_mount_source(profile: &MountProfile) -> Result<Source, String> {
@@ -1938,8 +1999,8 @@ fn profile_mount_source(profile: &MountProfile) -> Result<Source, String> {
 
 fn profile_mount_options(profile: &MountProfile) -> Result<MountOptions, String> {
     Ok(MountOptions {
-        hf_token: optional_text(&profile.hf_token),
-        token_file: None,
+        hf_token: current_env_hf_token(),
+        token_file: optional_text(&profile.token_file).map(PathBuf::from),
         hub_endpoint: non_empty_or_default(&profile.hub_endpoint, "https://huggingface.co"),
         cache_dir: parse_path(&profile.cache_dir, "Cache directory")?,
         uid: None,
@@ -1960,6 +2021,8 @@ fn profile_mount_options(profile: &MountProfile) -> Result<MountOptions, String>
         flush_max_batch_window_ms: 30_000,
         no_filter_os_files: false,
         fuse_owner_only: false,
+        fuse_allow_other: false,
+        nfs_allow_unsafe_loopback: profile.nfs_allow_unsafe_loopback,
         inode_soft_limit: 0,
         lru_sweep_interval_ms: 5_000,
         overlay: false,
@@ -1989,7 +2052,7 @@ fn write_file_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 
     let temp_path = temp_sibling_path(path);
-    std::fs::write(&temp_path, bytes).map_err(|e| format!("Failed to write {}: {e}", temp_path.display()))?;
+    write_private_file(&temp_path, bytes).map_err(|e| format!("Failed to write {}: {e}", temp_path.display()))?;
 
     #[cfg(windows)]
     if path.exists() {
@@ -2000,6 +2063,22 @@ fn write_file_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = std::fs::remove_file(&temp_path);
         format!("Failed to replace {} with {}: {e}", path.display(), temp_path.display())
     })
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
 }
 
 fn temp_sibling_path(path: &Path) -> PathBuf {
@@ -2301,6 +2380,10 @@ fn optional_text(text: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn current_env_hf_token() -> Option<String> {
+    std::env::var("HF_TOKEN").ok().and_then(|token| optional_text(&token))
+}
+
 fn non_empty_or_default(text: &str, default: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -2504,5 +2587,51 @@ fn windows_drive_letter(path: &str) -> Option<char> {
         (None, None) => Some(drive),
         (Some('\\' | '/'), None) => Some(drive),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_profile() -> MountProfile {
+        MountProfile {
+            source: GuiSource::Repo,
+            source_id: "openai-community/gpt2".to_string(),
+            revision: "main".to_string(),
+            mount_point: "/tmp/hf-mount".to_string(),
+            token_file: "/tmp/hf-token".to_string(),
+            hub_endpoint: "https://huggingface.co".to_string(),
+            cache_dir: "/tmp/hf-cache".to_string(),
+            read_only: true,
+            run_in_background: true,
+            nfs_allow_unsafe_loopback: false,
+        }
+    }
+
+    #[test]
+    fn mount_profile_serialization_excludes_inline_token() {
+        let json = serde_json::to_string(&sample_profile()).unwrap();
+        assert!(!json.contains("hf_token"));
+        assert!(json.contains("token_file"));
+    }
+
+    #[test]
+    fn old_profile_token_field_is_ignored_on_load() {
+        let json = r#"{
+            "source":"Repo",
+            "source_id":"openai-community/gpt2",
+            "revision":"main",
+            "mount_point":"/tmp/hf-mount",
+            "hf_token":"hf_secret",
+            "hub_endpoint":"https://huggingface.co",
+            "cache_dir":"/tmp/hf-cache",
+            "read_only":true,
+            "run_in_background":false
+        }"#;
+        let profile: MountProfile = serde_json::from_str(json).unwrap();
+        let rewritten = serde_json::to_string(&profile).unwrap();
+        assert!(!rewritten.contains("hf_secret"));
+        assert!(!rewritten.contains("hf_token"));
     }
 }
