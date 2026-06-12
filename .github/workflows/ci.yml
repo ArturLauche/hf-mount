@@ -20,12 +20,15 @@ env:
 jobs:
   lint-test:
     name: Lint & Unit Tests
-    runs-on:
-      group: hf-mount-ci-pub
+    # GitHub-hosted so the job also runs on forks without access to the
+    # huggingface runner groups; the heavy integration jobs below stay on
+    # internal runners and skip on forks.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Configure internal registries
+        if: github.repository == 'huggingface/hf-mount'
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
 
       # Pin nightly so rustfmt rules don't drift between CI and contributor machines.
@@ -74,6 +77,8 @@ jobs:
 
   smoke-test:
     name: Smoke Tests (FUSE + NFS)
+    # Internal runner group + HF_TOKEN: upstream only, skipped on forks.
+    if: github.repository == 'huggingface/hf-mount'
     runs-on:
       group: hf-mount-ci-pub
     needs: lint-test
@@ -107,6 +112,7 @@ jobs:
 
   fsx:
     name: fsx (data integrity)
+    if: github.repository == 'huggingface/hf-mount'
     runs-on:
       group: hf-mount-ci-pub
     needs: lint-test
@@ -131,6 +137,7 @@ jobs:
 
   xfstests:
     name: xfstests (filesystem exerciser)
+    if: github.repository == 'huggingface/hf-mount'
     runs-on:
       group: hf-mount-ci-pub-m5dn-24xlarge
     needs: lint-test
@@ -155,6 +162,7 @@ jobs:
 
   pjdfstest:
     name: POSIX Compliance (pjdfstest)
+    if: github.repository == 'huggingface/hf-mount'
     runs-on:
       group: hf-mount-ci-pub
     needs: lint-test
@@ -224,6 +232,7 @@ jobs:
 
   bench:
     name: Benchmarks
+    if: github.repository == 'huggingface/hf-mount'
     runs-on:
       group: hf-mount-ci-pub
     needs: lint-test
