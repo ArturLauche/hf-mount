@@ -594,7 +594,7 @@ pub fn make_test_vfs(
     // even when advanced_writes is disabled (mirrors setup.rs logic).
     let staging_dir = if effective_advanced_writes || hub.is_repo() {
         let path = fresh_test_dir("hf_mount_test");
-        Some(StagingDir::new(&path, opts.max_staging_size))
+        Some(StagingDir::new(&path, opts.max_staging_size).expect("failed to create test staging dir"))
     } else {
         None
     };
@@ -638,7 +638,7 @@ pub fn make_overlay_test_vfs_with_root(
         .build()
         .unwrap();
     let cache_dir = fresh_test_dir("hf_mount_test");
-    let staging_dir = Some(StagingDir::new(&cache_dir, 0));
+    let staging_dir = Some(StagingDir::new(&cache_dir, 0).expect("failed to create test staging dir"));
     let overlay_backing = Some(OverlayBacking::open_dir(&overlay_root).expect("failed to open overlay root dir"));
 
     let vfs = crate::virtual_fs::VirtualFs::new(

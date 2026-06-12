@@ -566,16 +566,13 @@ pub async fn mount_nfs(
     security: NfsSecurity,
     daemon_guard: Option<&mut DaemonGuard>,
 ) -> std::io::Result<()> {
-    mount_nfs_with_callback(
-        virtual_fs,
-        mount_point,
+    let params = NfsMountParams {
         metadata_ttl_ms,
         read_only,
         security,
-        daemon_guard,
-        |_| {},
-    )
-    .await
+        shutdown: None,
+    };
+    mount_nfs_with_callback(virtual_fs, mount_point, params, daemon_guard, |_| {}).await
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -586,18 +583,86 @@ pub enum NfsMountEvent {
     ShuttingDown { reason: String },
 }
 
+/// Cooperative shutdown handle for an NFS mount started with
+/// [`mount_nfs_with_callback`]. Cloneable; `request()` may be called from any
+/// thread at any point of the mount lifecycle — including while the mount
+/// command is still being retried — and makes the mount unmount and return.
+#[derive(Clone, Default)]
+pub struct MountShutdown {
+    inner: Arc<MountShutdownInner>,
+}
+
+#[derive(Default)]
+struct MountShutdownInner {
+    requested: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl MountShutdown {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the mount to stop. Idempotent and thread-safe.
+    pub fn request(&self) {
+        self.inner.requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.inner.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolve once shutdown has been requested. Race-free against `request`
+    /// calls that happen before or while the future is being created.
+    async fn wait(&self) {
+        loop {
+            if self.is_requested() {
+                return;
+            }
+            let mut notified = std::pin::pin!(self.inner.notify.notified());
+            notified.as_mut().enable();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Resolve when `shutdown` fires; pend forever when no handle was provided.
+async fn wait_for_shutdown(shutdown: &Option<MountShutdown>) {
+    match shutdown {
+        Some(shutdown) => shutdown.wait().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Mount parameters for [`mount_nfs_with_callback`].
+pub struct NfsMountParams {
+    pub metadata_ttl_ms: u64,
+    pub read_only: bool,
+    pub security: NfsSecurity,
+    /// Optional cooperative stop handle; see [`MountShutdown`].
+    pub shutdown: Option<MountShutdown>,
+}
+
 pub async fn mount_nfs_with_callback<F>(
     virtual_fs: Arc<VirtualFs>,
     mount_point: &Path,
-    metadata_ttl_ms: u64,
-    read_only: bool,
-    security: NfsSecurity,
+    params: NfsMountParams,
     daemon_guard: Option<&mut DaemonGuard>,
     mut on_event: F,
 ) -> std::io::Result<()>
 where
     F: FnMut(NfsMountEvent) + Send,
 {
+    let NfsMountParams {
+        metadata_ttl_ms,
+        read_only,
+        security,
+        shutdown,
+    } = params;
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs, read_only, security.clone());
     let pool_for_shutdown = adapter.handle_pool.clone();
@@ -653,6 +718,17 @@ where
     // Convert ms to seconds (rounding up so 100ms → 1s, not 0s which disables caching entirely)
     let actimeo = metadata_ttl_ms.div_ceil(1000);
 
+    // A stop request that lands before the mount command runs aborts cleanly
+    // instead of mounting and immediately tearing down.
+    if shutdown.as_ref().is_some_and(MountShutdown::is_requested) {
+        server_handle.abort();
+        on_event(NfsMountEvent::ShuttingDown {
+            reason: "stop requested".to_string(),
+        });
+        vfs_for_shutdown.shutdown();
+        return Ok(());
+    }
+
     // Platform-specific mount command
     #[cfg(target_os = "macos")]
     {
@@ -672,9 +748,10 @@ where
         on_event(NfsMountEvent::MountCommand {
             command: format!("{} -o {} {} {}", mount_cmd.display(), opts, nfs_export, mount_point_str),
         });
-        let status = std::process::Command::new(mount_cmd)
+        let status = tokio::process::Command::new(mount_cmd)
             .args(["-o", &opts, &nfs_export, mount_point_str])
-            .status()?;
+            .status()
+            .await?;
         if !status.success() {
             server_handle.abort();
             return Err(std::io::Error::other(format!("mount command failed with {status}")));
@@ -691,13 +768,15 @@ where
             command: format!("mount.nfs -o {mount_opts} {nfs_export} {mount_point_str}"),
         });
         let output = if unsafe { libc::getuid() } == 0 {
-            std::process::Command::new("mount.nfs")
+            tokio::process::Command::new("mount.nfs")
                 .args(["-o", &mount_opts, &nfs_export, mount_point_str])
-                .output()?
+                .output()
+                .await?
         } else {
-            std::process::Command::new("sudo")
+            tokio::process::Command::new("sudo")
                 .args(["-n", "mount.nfs", "-o", &mount_opts, &nfs_export, mount_point_str])
-                .output()?
+                .output()
+                .await?
         };
         if !output.status.success() {
             server_handle.abort();
@@ -740,7 +819,8 @@ where
             );
         } else {
             info!("Running: {cmd}");
-            let output = mount_windows_nfs_with_retry(&mount_cmd, &opts, &share, &mount_target).await?;
+            let output =
+                mount_windows_nfs_with_retry(&mount_cmd, &opts, &share, &mount_target, shutdown.as_ref()).await?;
             if !output.status.success() {
                 server_handle.abort();
                 portmapper_handle.abort();
@@ -820,8 +900,22 @@ where
                 unmount_nfs(mount_point_str);
                 break;
             }
+            _ = wait_for_shutdown(&shutdown) => {
+                info!("Shutdown requested, unmounting...");
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "stop requested".to_string(),
+                });
+                unmount_nfs(mount_point_str);
+                break;
+            }
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                if !skip_auto_mount && !is_mounted(mount_point_str) {
+                // The probe touches the (possibly wedged) mount, so keep it
+                // off the async workers.
+                let probe_path = mount_point_str.to_string();
+                let mounted = tokio::task::spawn_blocking(move || is_mounted(&probe_path))
+                    .await
+                    .unwrap_or(false);
+                if !skip_auto_mount && !mounted {
                     info!("NFS mount disappeared, shutting down");
                     on_event(NfsMountEvent::ShuttingDown {
                         reason: "mount disappeared".to_string(),
@@ -1138,8 +1232,17 @@ async fn mount_windows_nfs_with_retry(
     opts: &str,
     share: &str,
     mount_target: &str,
+    shutdown: Option<&MountShutdown>,
 ) -> std::io::Result<std::process::Output> {
-    for attempt in 1..=WINDOWS_ERROR_53_RETRY_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
+        if shutdown.is_some_and(MountShutdown::is_requested) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "mount cancelled by stop request",
+            ));
+        }
+
         let output = tokio::process::Command::new(mount_cmd)
             .args(["-o", opts, share, mount_target])
             .output()
@@ -1152,10 +1255,9 @@ async fn mount_windows_nfs_with_retry(
             return Ok(output);
         }
 
+        attempt += 1;
         tokio::time::sleep(std::time::Duration::from_millis(WINDOWS_ERROR_53_RETRY_DELAY_MS)).await;
     }
-
-    unreachable!("mount retry loop always returns on the final attempt")
 }
 
 #[cfg(windows)]
@@ -1191,13 +1293,7 @@ fn windows_nfs_share(export_name: &str) -> String {
 }
 
 #[cfg(windows)]
-fn windows_system32_exe(name: &str) -> std::path::PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
-        .join("System32")
-        .join(name)
-}
+use crate::windows::{drive_letter as windows_drive_letter, system32_exe as windows_system32_exe};
 
 #[cfg(windows)]
 fn windows_nfs_mount_target(path: &str) -> String {
@@ -1212,20 +1308,6 @@ fn windows_nfs_probe_path(path: &str) -> String {
     match windows_drive_letter(path) {
         Some(drive) => format!("{drive}:\\"),
         None => path.to_string(),
-    }
-}
-
-#[cfg(windows)]
-fn windows_drive_letter(path: &str) -> Option<char> {
-    let mut chars = path.chars();
-    let drive = chars.next()?;
-    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
-        return None;
-    }
-    match (chars.next(), chars.next()) {
-        (None, None) => Some(drive),
-        (Some('\\' | '/'), None) => Some(drive),
-        _ => None,
     }
 }
 

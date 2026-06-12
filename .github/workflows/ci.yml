@@ -61,8 +61,16 @@ jobs:
       - name: Clippy (all)
         run: cargo clippy --features fuse,nfs -- -D warnings
 
+      # The GUI only ships for Windows/macOS, but compile-checking it here
+      # catches breakage on every PR without waiting for the platform builders.
+      - name: Clippy (NFS + GUI)
+        run: cargo clippy --no-default-features --features nfs,gui --bins --tests -- -D warnings
+
       - name: Unit tests
         run: cargo test --lib --features fuse,nfs
+
+      - name: GUI unit tests
+        run: cargo test --no-default-features --features nfs,gui --bin hf-mount-gui
 
   smoke-test:
     name: Smoke Tests (FUSE + NFS)

@@ -2,11 +2,17 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum Error {
-    Hub { message: String, status: Option<u16> },
+    Hub {
+        message: String,
+        status: Option<u16>,
+    },
     Xet(String),
     Io(std::io::Error),
     Json(serde_json::Error),
     Http(reqwest::Error),
+    /// Mount configuration or initialization failure (bad CLI/GUI input,
+    /// cache-dir preparation, storage client bootstrap, ...).
+    Setup(String),
 }
 
 impl Error {
@@ -37,6 +43,7 @@ impl fmt::Display for Error {
             Self::Io(err) => write!(f, "IO error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::Http(err) => write!(f, "HTTP error: {err}"),
+            Self::Setup(msg) => write!(f, "Setup error: {msg}"),
         }
     }
 }

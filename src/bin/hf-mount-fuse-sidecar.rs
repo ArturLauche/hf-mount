@@ -388,22 +388,12 @@ fn run_mount(
 ) {
     let label = mount_args.source.label();
 
-    // build_with_runtime() panics on auth/config errors (e.g. invalid token,
-    // CAS 401). Catch the panic so we can write the error to the error file
-    // for the CSI driver to report as FailedMount.
-    let setup = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build_with_runtime(mount_args.source, mount_args.options, false, runtime)
-    })) {
+    // Auth/config errors (e.g. invalid token, CAS 401) are written to the
+    // error file for the CSI driver to report as FailedMount.
+    let setup = match build_with_runtime(mount_args.source, mount_args.options, false, runtime) {
         Ok(s) => s,
-        Err(panic) => {
-            let msg = match panic.downcast_ref::<String>() {
-                Some(s) => s.clone(),
-                None => match panic.downcast_ref::<&str>() {
-                    Some(s) => s.to_string(),
-                    None => "unknown panic".to_string(),
-                },
-            };
-            write_error(&error_path, &format!("Setup failed for {}: {}", label, msg));
+        Err(e) => {
+            write_error(&error_path, &format!("Setup failed for {}: {}", label, e));
             return;
         }
     };

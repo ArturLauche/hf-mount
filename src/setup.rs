@@ -10,11 +10,16 @@ use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_clien
 use xet_runtime::core::XetContext;
 
 use crate::cached_xet_client::CachedXetClient;
+use crate::error::{Error, Result};
 use crate::file_cache::FileCache;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::overlay::OverlayBacking;
 use crate::virtual_fs::{VfsConfig, VirtualFs};
 use crate::xet::{StagingDir, XetSessions};
+
+fn setup_err(message: impl Into<String>) -> Error {
+    Error::Setup(message.into())
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum CacheMode {
@@ -331,11 +336,11 @@ pub fn build_runtime() -> tokio::runtime::Runtime {
 ///
 /// Owns the runtime it creates. Use `build_with_runtime` to share one runtime
 /// across multiple volumes (sidecar mode).
-pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup {
+pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> Result<MountSetup> {
     let runtime = build_runtime();
-    let mut setup = build_with_runtime(source, options, is_nfs, runtime.handle().clone());
+    let mut setup = build_with_runtime(source, options, is_nfs, runtime.handle().clone())?;
     setup._owned_runtime = Some(runtime);
-    setup
+    Ok(setup)
 }
 
 /// Like `build`, but reuses an externally-owned runtime. The caller must keep
@@ -346,10 +351,11 @@ pub fn build_with_runtime(
     options: MountOptions,
     is_nfs: bool,
     runtime: tokio::runtime::Handle,
-) -> MountSetup {
+) -> Result<MountSetup> {
     let (mount_point, source_kind, path_prefix) = match source {
         Source::Bucket { bucket_id, mount_point } => {
-            let (id, prefix) = split_path_prefix(&bucket_id).unwrap_or_else(|e| panic!("invalid bucket path: {e}"));
+            let (id, prefix) =
+                split_path_prefix(&bucket_id).map_err(|e| setup_err(format!("invalid bucket path: {e}")))?;
             (
                 mount_point,
                 SourceKind::Bucket {
@@ -364,7 +370,7 @@ pub fn build_with_runtime(
             revision,
         } => {
             let (repo_type, rest) = parse_repo_id(&repo_id);
-            let (id, prefix) = split_path_prefix(&rest).unwrap_or_else(|e| panic!("invalid repo path: {e}"));
+            let (id, prefix) = split_path_prefix(&rest).map_err(|e| setup_err(format!("invalid repo path: {e}")))?;
             (
                 mount_point,
                 SourceKind::Repo {
@@ -378,48 +384,48 @@ pub fn build_with_runtime(
     };
 
     if options.overlay && options.read_only {
-        panic!(
-            "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead."
-        );
+        return Err(setup_err(
+            "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead.",
+        ));
     }
     #[cfg(windows)]
     if options.overlay {
-        panic!("--overlay is not supported on Windows. Use a regular NFS mount without --overlay.");
+        return Err(setup_err(
+            "--overlay is not supported on Windows. Use a regular NFS mount without --overlay.",
+        ));
     }
 
     #[cfg(not(unix))]
     let private_nfs_credentials = is_nfs && (options.hf_token.is_some() || options.token_file.is_some());
     #[cfg(not(unix))]
     if private_nfs_credentials && !options.nfs_allow_unsafe_loopback {
-        panic!(
-            "credential-backed NFS mounts require --nfs-allow-unsafe-loopback on this platform because local NFS caller authorization cannot be enforced"
-        );
+        return Err(setup_err(
+            "credential-backed NFS mounts require --nfs-allow-unsafe-loopback on this platform because local NFS caller authorization cannot be enforced",
+        ));
     }
 
-    ensure_private_cache_dir(&options.cache_dir)
-        .unwrap_or_else(|e| panic!("Failed to prepare private cache dir {:?}: {e}", options.cache_dir));
+    ensure_private_cache_dir(&options.cache_dir).map_err(|e| {
+        setup_err(format!(
+            "failed to prepare private cache dir {:?}: {e}",
+            options.cache_dir
+        ))
+    })?;
 
     let backend = if is_nfs { "nfs" } else { "fuse" };
-    let hub_client = runtime.block_on(async {
-        HubApiClient::from_source(
+    let hub_client = runtime
+        .block_on(HubApiClient::from_source(
             &options.hub_endpoint,
             options.hf_token.as_deref(),
             options.token_file.clone(),
             source_kind,
             path_prefix,
             backend,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
-    });
+        ))
+        .map_err(|e| setup_err(format!("failed to initialize Hub client: {e}")))?;
 
     // Validate that the subfolder exists on the remote.
     if !hub_client.path_prefix().is_empty() {
-        runtime.block_on(async {
-            hub_client.validate_path_prefix().await.unwrap_or_else(|e| {
-                panic!("{e}");
-            });
-        });
+        runtime.block_on(hub_client.validate_path_prefix())?;
     }
 
     let read_only = (options.read_only || hub_client.is_repo()) && !options.overlay;
@@ -430,8 +436,8 @@ pub fn build_with_runtime(
     // Overlay: local writes allowed, but no remote write token/upload.
     let remote_read_only = read_only || options.overlay;
     let refresher = hub_client.token_refresher(remote_read_only);
-    let xet_ctx = XetContext::default().expect("Failed to create XetContext");
-    let cas_config = build_cas_config(&xet_ctx, &runtime, &refresher);
+    let xet_ctx = XetContext::default().map_err(|e| setup_err(format!("failed to create XetContext: {e}")))?;
+    let cas_config = build_cas_config(&xet_ctx, &runtime, &refresher)?;
 
     // The chunk cache and the whole-file cache are mutually exclusive: when
     // `cache_mode=file` we explicitly disable xet-core's chunk_cache so we
@@ -443,7 +449,10 @@ pub fn build_with_runtime(
         );
     }
     let file_cache = if options.cache_mode == CacheMode::File && !options.no_disk_cache {
-        Some(FileCache::new(&options.cache_dir, options.cache_size).expect("Failed to create file cache"))
+        Some(
+            FileCache::new(&options.cache_dir, options.cache_size)
+                .map_err(|e| setup_err(format!("failed to create file cache: {e}")))?,
+        )
     } else {
         None
     };
@@ -453,12 +462,12 @@ pub fn build_with_runtime(
     } else {
         let xorbs_dir = options.cache_dir.join("xorbs");
         std::fs::create_dir_all(&xorbs_dir)
-            .unwrap_or_else(|e| panic!("Failed to create xorbs dir {:?}: {e}", xorbs_dir));
+            .map_err(|e| setup_err(format!("failed to create xorbs dir {xorbs_dir:?}: {e}")))?;
         let config = CacheConfig {
             cache_directory: xorbs_dir,
             cache_size: options.cache_size,
         };
-        Some(get_cache(&xet_ctx.config, &config).expect("Failed to create chunk cache"))
+        Some(get_cache(&xet_ctx.config, &config).map_err(|e| setup_err(format!("failed to create chunk cache: {e}")))?)
     };
 
     let raw_client = runtime
@@ -467,7 +476,7 @@ pub fn build_with_runtime(
             &uuid::Uuid::new_v4().to_string(),
             false,
         ))
-        .expect("Failed to create storage client");
+        .map_err(|e| setup_err(format!("failed to create storage client: {e}")))?;
     let cached_client = CachedXetClient::new(raw_client);
     let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if remote_read_only { None } else { Some(cas_config) };
@@ -480,10 +489,10 @@ pub fn build_with_runtime(
     // rooted at the covered directory after mount.
     let overlay_backing = if options.overlay {
         std::fs::create_dir_all(&mount_point)
-            .unwrap_or_else(|e| panic!("Failed to create mount point {:?} for overlay: {e}", mount_point));
+            .map_err(|e| setup_err(format!("failed to create mount point {mount_point:?} for overlay: {e}")))?;
         Some(
             OverlayBacking::open_dir(&mount_point)
-                .unwrap_or_else(|e| panic!("Failed to open mount point {:?} for overlay: {e}", mount_point)),
+                .map_err(|e| setup_err(format!("failed to open mount point {mount_point:?} for overlay: {e}")))?,
         )
     } else {
         None
@@ -492,7 +501,7 @@ pub fn build_with_runtime(
     // Repos need a staging dir for HTTP download cache (open_readonly),
     // even when advanced_writes is disabled.
     let staging_dir = if advanced_writes || hub_client.is_repo() {
-        Some(StagingDir::new(&options.cache_dir, options.max_staging_size))
+        Some(StagingDir::new(&options.cache_dir, options.max_staging_size)?)
     } else {
         None
     };
@@ -510,7 +519,7 @@ pub fn build_with_runtime(
         && let Err(e) = std::fs::create_dir_all(&mount_point)
         && e.kind() != std::io::ErrorKind::AlreadyExists
     {
-        panic!("Failed to create mount point {:?}: {e}", mount_point);
+        return Err(setup_err(format!("failed to create mount point {mount_point:?}: {e}")));
     }
 
     if is_nfs && options.direct_io {
@@ -594,7 +603,7 @@ pub fn build_with_runtime(
         },
     );
 
-    MountSetup {
+    Ok(MountSetup {
         runtime,
         _owned_runtime: None,
         virtual_fs,
@@ -607,7 +616,7 @@ pub fn build_with_runtime(
         metadata_ttl_ms: options.metadata_ttl_ms,
         fuse_owner_only: effective_fuse_owner_only(&options),
         nfs_security: NfsSecurity::new(uid, options.nfs_allow_unsafe_loopback),
-    }
+    })
 }
 
 fn effective_fuse_owner_only(options: &MountOptions) -> bool {
@@ -618,11 +627,15 @@ fn effective_fuse_owner_only(options: &MountOptions) -> bool {
 
 /// Parse CLI args, build VFS and all dependencies.
 /// `is_nfs` controls whether advanced writes are forced (NFS has no open/close).
+/// Exits the process with an error message when setup fails.
 pub fn setup(is_nfs: bool) -> MountSetup {
     raise_fd_limit();
     let args = Args::parse();
     init_tracing(false);
-    build(args.source, args.options, is_nfs)
+    build(args.source, args.options, is_nfs).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    })
 }
 
 /// Try to raise the soft file descriptor limit to avoid "Too many open files"
@@ -656,10 +669,7 @@ pub fn default_cache_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Caches")
-                .join("hf-mount");
+            return PathBuf::from(home).join("Library").join("Caches").join("hf-mount");
         }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -683,13 +693,13 @@ fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "path must not be a symlink",
-                ));
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path must not be a symlink",
+            ));
         }
 
         std::fs::create_dir_all(path)?;
@@ -737,19 +747,7 @@ fn should_create_mount_point(mount_point: &Path, is_nfs: bool) -> bool {
 
 #[cfg(windows)]
 fn is_windows_drive_mount_point(path: &Path) -> bool {
-    let text = path.as_os_str().to_string_lossy();
-    let mut chars = text.chars();
-    let Some(drive) = chars.next() else {
-        return false;
-    };
-    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
-        return false;
-    }
-    match (chars.next(), chars.next()) {
-        (None, None) => true,
-        (Some('\\' | '/'), None) => true,
-        _ => false,
-    }
+    crate::windows::drive_letter(&path.as_os_str().to_string_lossy()).is_some()
 }
 
 #[cfg(unix)]
@@ -778,21 +776,20 @@ fn build_cas_config(
     ctx: &XetContext,
     runtime: &tokio::runtime::Handle,
     refresher: &Arc<HubTokenRefresher>,
-) -> Arc<TranslatorConfig> {
+) -> Result<Arc<TranslatorConfig>> {
     let jwt = runtime
         .block_on(refresher.fetch_initial())
-        .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));
+        .map_err(|e| setup_err(format!("failed to get storage token: {e}")))?;
     info!("Got storage token for endpoint: {}", jwt.cas_url);
-    Arc::new(
-        default_config(
-            ctx,
-            jwt.cas_url,
-            Some((jwt.access_token, jwt.exp)),
-            Some(refresher.clone()),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("Failed to build TranslatorConfig: {e}")),
+    let config = default_config(
+        ctx,
+        jwt.cas_url,
+        Some((jwt.access_token, jwt.exp)),
+        Some(refresher.clone()),
+        None,
     )
+    .map_err(|e| setup_err(format!("failed to build TranslatorConfig: {e}")))?;
+    Ok(Arc::new(config))
 }
 
 #[cfg(all(test, windows))]

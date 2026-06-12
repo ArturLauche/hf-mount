@@ -206,17 +206,18 @@ impl Drop for StagingRoot {
 }
 
 impl StagingDir {
-    pub fn new(cache_dir: &Path, max_bytes: u64) -> Self {
+    pub fn new(cache_dir: &Path, max_bytes: u64) -> crate::error::Result<Self> {
         // Random per-mount subdir so two mounts sharing cache_dir, or a mount
         // started after a crashed previous one, never see each other's files.
         let dir = cache_dir.join(format!("staging-{:016x}", rand_u64()));
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| crate::error::Error::Setup(format!("failed to create staging dir {dir:?}: {e}")))?;
 
-        Self {
+        Ok(Self {
             root: Arc::new(StagingRoot { dir }),
             bytes_used: Arc::new(AtomicU64::new(0)),
             max_bytes,
-        }
+        })
     }
 
     /// Root directory of the staging area.
