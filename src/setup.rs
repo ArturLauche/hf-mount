@@ -233,13 +233,29 @@ pub struct Args {
     pub options: MountOptions,
 }
 
+/// Owns a runtime and bounds its teardown. Runtime::drop waits for
+/// blocking-pool tasks; a probe wedged in a stat on a dead NFS mount would
+/// stall teardown forever, so detach stragglers after a grace period.
+/// Implementing Drop here (not on MountSetup) keeps MountSetup's fields
+/// movable.
+#[derive(Default)]
+struct OwnedRuntime(Option<tokio::runtime::Runtime>);
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        }
+    }
+}
+
 /// Everything needed to run a mount backend (FUSE or NFS).
 pub struct MountSetup {
     pub runtime: tokio::runtime::Handle,
-    /// Owned runtime, kept alive for the lifetime of this MountSetup. `None`
+    /// Owned runtime, kept alive for the lifetime of this MountSetup. Empty
     /// when the runtime is owned externally (sidecar mode shares one runtime
     /// across all volumes — see `build_with_runtime`).
-    _owned_runtime: Option<tokio::runtime::Runtime>,
+    _owned_runtime: OwnedRuntime,
     pub virtual_fs: Arc<VirtualFs>,
     pub mount_point: PathBuf,
     pub read_only: bool,
@@ -339,7 +355,7 @@ pub fn build_runtime() -> tokio::runtime::Runtime {
 pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> Result<MountSetup> {
     let runtime = build_runtime();
     let mut setup = build_with_runtime(source, options, is_nfs, runtime.handle().clone())?;
-    setup._owned_runtime = Some(runtime);
+    setup._owned_runtime = OwnedRuntime(Some(runtime));
     Ok(setup)
 }
 
@@ -605,7 +621,7 @@ pub fn build_with_runtime(
 
     Ok(MountSetup {
         runtime,
-        _owned_runtime: None,
+        _owned_runtime: OwnedRuntime::default(),
         virtual_fs,
         mount_point,
         read_only,

@@ -182,10 +182,40 @@ fn open_command(target: &str) -> Command {
 
 // ── Process management ────────────────────────────────────────────────
 
-/// Whether a process with `pid` is currently running. Blocking on Windows
-/// (spawns `tasklist.exe`) — call from the worker poller thread only.
+/// Whether `pid` is alive *and* still looks like our detached background
+/// worker — its command line carries `marker` (`--background-worker`), or on
+/// Windows, where command lines aren't exposed, its image name matches this
+/// executable. Guards against a recycled PID handing us an unrelated process
+/// to track or terminate. Blocking — poller thread or explicit user action.
+#[cfg(target_os = "linux")]
+pub fn worker_process_alive(pid: u32, marker: &str) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes)
+            .split('\0')
+            .any(|argument| argument == marker),
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn worker_process_alive(pid: u32, marker: &str) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).contains(marker)
+}
+
 #[cfg(windows)]
-pub fn process_is_running(pid: u32) -> bool {
+pub fn worker_process_alive(pid: u32, _marker: &str) -> bool {
     if pid == 0 {
         return false;
     }
@@ -201,23 +231,24 @@ pub fn process_is_running(pid: u32) -> bool {
         return false;
     }
 
+    let exe_name = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "hf-mount-gui.exe".to_string());
+    let pid_field = format!(",\"{pid}\",");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.contains(&format!(",\"{pid}\","))
+    stdout.lines().any(|line| {
+        line.contains(&pid_field)
+            && line
+                .trim_start()
+                .strip_prefix('"')
+                .and_then(|rest| rest.split('"').next())
+                .is_some_and(|image| image.eq_ignore_ascii_case(&exe_name))
+    })
 }
 
-#[cfg(unix)]
-pub fn process_is_running(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-
-    // SAFETY: kill with signal 0 only probes for existence/permission.
-    let result = unsafe { libc::kill(pid as i32, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(any(windows, unix)))]
-pub fn process_is_running(_pid: u32) -> bool {
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn worker_process_alive(_pid: u32, _marker: &str) -> bool {
     false
 }
 
@@ -277,17 +308,12 @@ pub fn terminate_process(_pid: u32) -> Result<(), String> {
     Err("process termination is not supported on this platform".to_string())
 }
 
-/// Whether the path looks like a live mount target. Blocking on a wedged NFS
+/// Whether the path currently has an active mount. Uses the platform mount
+/// table / filesystem type via the backend's check — a leftover empty
+/// directory from a crashed worker does not count. Blocking on a wedged NFS
 /// mount — poller thread only.
 pub fn mount_point_appears_active(mount_point: &Path) -> bool {
-    #[cfg(windows)]
-    if let Some(text) = mount_point.to_str()
-        && let Some(drive) = drive_letter(text)
-    {
-        return Path::new(&format!("{drive}:\\")).exists();
-    }
-
-    mount_point.exists()
+    mount_point.to_str().is_some_and(hf_mount::nfs::is_mounted)
 }
 
 /// Detach a child process from the GUI so it survives window close.

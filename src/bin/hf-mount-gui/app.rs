@@ -484,20 +484,42 @@ impl MountGuiApp {
     }
 
     fn stop_unmounted_background_worker(&mut self) {
-        let pid = self
-            .background_child
+        // A pid from our own spawned child is trustworthy. One read back from
+        // the status file may have been recycled by another process — verify
+        // it still identifies as our worker before signaling anything.
+        let child_pid = self.background_child.as_ref().map(Child::id).filter(|pid| *pid != 0);
+        let status_pid = self
+            .last_worker_status
             .as_ref()
-            .map(Child::id)
-            .or_else(|| self.last_worker_status.as_ref().and_then(|status| status.pid))
+            .and_then(|status| status.pid)
             .filter(|pid| *pid != 0);
-        let Some(pid) = pid else {
-            set_status(
-                &self.status,
-                MountState::Failed,
-                "Could not stop background worker",
-                "The worker process id is not known yet; try again in a moment.",
-            );
-            return;
+
+        let pid = match (child_pid, status_pid) {
+            (Some(pid), _) => pid,
+            (None, Some(pid)) if crate::worker::worker_process_matches(pid) => pid,
+            (None, Some(_)) => {
+                // The recorded pid no longer belongs to a worker: it is dead.
+                // Clear the stale record instead of killing a stranger.
+                crate::worker::mark_worker_stopped(self.active_mount_point.as_deref());
+                self.active_background = false;
+                self.active_mount_point = None;
+                set_status(
+                    &self.status,
+                    MountState::Stopped,
+                    "Background mount stopped",
+                    "No live worker process was found; cleared the stale record.",
+                );
+                return;
+            }
+            (None, None) => {
+                set_status(
+                    &self.status,
+                    MountState::Failed,
+                    "Could not stop background worker",
+                    "The worker process id is not known yet; try again in a moment.",
+                );
+                return;
+            }
         };
 
         if let Err(e) = platform::terminate_process(pid) {

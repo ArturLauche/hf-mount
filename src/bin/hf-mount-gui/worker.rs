@@ -125,11 +125,18 @@ pub fn mark_worker_stopped(mount_point: Option<&Path>) {
     );
 }
 
+/// Whether `pid` is alive and still identifies as an hf-mount background
+/// worker (guards against PID reuse after a crash or reboot).
+pub fn worker_process_matches(pid: u32) -> bool {
+    platform::worker_process_alive(pid, BACKGROUND_WORKER_ARG)
+}
+
 /// Whether a reported worker status corresponds to something actually alive:
-/// its process exists, its mount answers, or the heartbeat is recent.
-/// Blocking (process probes, filesystem stat) — poller thread only.
+/// its process exists and identifies as our worker, its mount answers, or the
+/// heartbeat is recent. Blocking (process probes, filesystem stat) — poller
+/// thread only.
 pub fn worker_status_is_live(status: &WorkerStatus, mount_point: Option<&Path>) -> bool {
-    if status.pid.is_some_and(platform::process_is_running) {
+    if status.pid.is_some_and(worker_process_matches) {
         return true;
     }
 

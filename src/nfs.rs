@@ -1226,7 +1226,11 @@ fn unmount_nfs(mount_point: &str) -> bool {
     }
 }
 
-fn is_mounted(path: &str) -> bool {
+/// Whether `path` currently has an active mount: checked against the mount
+/// table on Linux, the statfs filesystem type on macOS, and a drive/directory
+/// probe on Windows. A bare existing directory does not count. Blocking on a
+/// wedged mount — keep it off latency-sensitive threads.
+pub fn is_mounted(path: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_to_string("/proc/mounts")
