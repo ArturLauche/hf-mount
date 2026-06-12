@@ -144,6 +144,12 @@ pub struct MountGuiApp {
     mounted_since: Option<Instant>,
     worker_poller: Option<WorkerPoller>,
     last_worker_generation: u64,
+    /// Last worker status applied from the poller, used to tell genuinely new
+    /// worker reports from a stale file being re-read every poll.
+    last_worker_status: Option<WorkerStatus>,
+    /// Set when the user intentionally terminated the background worker, so
+    /// the reaper doesn't report the kill as a failure.
+    background_stop_requested: bool,
 }
 
 impl MountGuiApp {
@@ -178,6 +184,8 @@ impl MountGuiApp {
             mounted_since: None,
             worker_poller: None,
             last_worker_generation: 0,
+            last_worker_status: None,
+            background_stop_requested: false,
         };
 
         match load_mount_profile() {
@@ -363,6 +371,7 @@ impl MountGuiApp {
         );
 
         if self.run_in_background {
+            self.background_stop_requested = false;
             match spawn_background_worker(&mount_point) {
                 Ok(child) => {
                     self.background_child = Some(child);
@@ -428,7 +437,15 @@ impl MountGuiApp {
             return;
         }
 
-        // Background mounts are stopped by unmounting; the worker notices the
+        // A background worker that has not mounted yet cannot be stopped by
+        // unmounting — there is nothing mounted, and the worker would carry
+        // on and mount anyway. Terminate the worker process instead.
+        if self.active_background && !self.worker_reported_mounted() {
+            self.stop_unmounted_background_worker();
+            return;
+        }
+
+        // Mounted targets are stopped by unmounting; the worker notices the
         // mount disappearing and exits. The unmount command can block on a
         // wedged NFS mount, so it runs on its own thread.
         let Some(mount_point) = self.active_mount_point.clone() else {
@@ -458,6 +475,55 @@ impl MountGuiApp {
                 set_status(&status, MountState::Failed, "Unmount failed", e);
             }
         }));
+    }
+
+    fn worker_reported_mounted(&self) -> bool {
+        self.last_worker_status
+            .as_ref()
+            .is_some_and(|status| status.state == crate::worker::WorkerState::Mounted)
+    }
+
+    fn stop_unmounted_background_worker(&mut self) {
+        let pid = self
+            .background_child
+            .as_ref()
+            .map(Child::id)
+            .or_else(|| self.last_worker_status.as_ref().and_then(|status| status.pid))
+            .filter(|pid| *pid != 0);
+        let Some(pid) = pid else {
+            set_status(
+                &self.status,
+                MountState::Failed,
+                "Could not stop background worker",
+                "The worker process id is not known yet; try again in a moment.",
+            );
+            return;
+        };
+
+        if let Err(e) = platform::terminate_process(pid) {
+            set_status(&self.status, MountState::Failed, "Could not stop background worker", e);
+            return;
+        }
+
+        self.background_stop_requested = true;
+        crate::worker::mark_worker_stopped(self.active_mount_point.as_deref());
+
+        // The worker may have mounted in the window between the last status
+        // poll and the kill — clean up any mount it managed to create.
+        if let Some(mount_point) = self.active_mount_point.clone() {
+            thread::spawn(move || {
+                let _ = platform::unmount_path(&mount_point);
+            });
+        }
+
+        self.active_background = false;
+        self.active_mount_point = None;
+        set_status(
+            &self.status,
+            MountState::Stopped,
+            "Background mount stopped",
+            "The worker was stopped before the mount completed.",
+        );
     }
 
     pub fn open_active_mount(&mut self) {
@@ -496,6 +562,7 @@ impl MountGuiApp {
         }
 
         let Some(status) = snapshot.status else {
+            self.last_worker_status = None;
             if self.active_background {
                 self.active_background = false;
                 self.active_mount_point = None;
@@ -508,6 +575,11 @@ impl MountGuiApp {
             }
             return;
         };
+
+        // The poller re-reads the file every interval; only treat the report
+        // as news when its content actually changed since the last apply.
+        let status_changed = self.last_worker_status.as_ref() != Some(&status);
+        self.last_worker_status = Some(status.clone());
 
         let active_state = status.state.is_active();
         if active_state && snapshot.live {
@@ -537,10 +609,13 @@ impl MountGuiApp {
             }
         }
 
-        // Mirror the worker's reported status — but never clobber a live
-        // foreground mount's status with a stale worker file.
+        // Mirror the worker's reported status. Never clobber a live
+        // foreground mount, and only mirror terminal states when the report
+        // is new (or at startup) — otherwise a stale Stopped/Failed file
+        // would keep overwriting newer local status every poll interval.
         let foreground_active = self.mount_thread.as_ref().is_some_and(|handle| !handle.is_finished());
-        if !foreground_active && (self.active_background || !active_state) {
+        let terminal_report = !active_state && (status_changed || first);
+        if !foreground_active && (self.active_background || terminal_report) {
             set_status_if_changed(
                 &self.status,
                 worker_mount_state(&status),
@@ -569,6 +644,8 @@ impl MountGuiApp {
                             "The background worker exited cleanly.",
                         );
                     }
+                } else if self.background_stop_requested {
+                    // The user terminated the worker; the kill is not a failure.
                 } else if current != MountState::Failed {
                     set_status(
                         &self.status,
@@ -577,6 +654,7 @@ impl MountGuiApp {
                         format!("Worker exited with {exit_status}."),
                     );
                 }
+                self.background_stop_requested = false;
             }
             Ok(Some(None)) | Ok(None) => {}
             Err(e) => {
@@ -795,6 +873,7 @@ fn worker_mount_state(status: &WorkerStatus) -> MountState {
 /// state change through `shared_status`. Runs on a dedicated thread.
 fn run_mount(source: Source, options: MountOptions, shared_status: SharedMountStatus, shutdown: MountShutdown) {
     let status_for_events = shared_status.clone();
+    let shutdown_probe = shutdown.clone();
     // catch_unwind is a last resort for panics deep inside the backend; setup
     // and mount errors arrive as plain Results.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -825,6 +904,14 @@ fn run_mount(source: Source, options: MountOptions, shared_status: SharedMountSt
             MountState::Stopped,
             "Unmounted",
             "The mount stopped cleanly.",
+        ),
+        // An error after the user asked to stop is a consequence of the
+        // teardown, not a failure worth alarming about.
+        Ok(Err(message)) if shutdown_probe.is_requested() => set_status(
+            &shared_status,
+            MountState::Stopped,
+            "Stopped",
+            format!("Mount cancelled during startup ({message})."),
         ),
         Ok(Err(message)) => set_status(&shared_status, MountState::Failed, "Mount failed", message),
         Err(payload) => set_status(

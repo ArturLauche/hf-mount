@@ -113,6 +113,18 @@ pub fn clear_worker_status() {
     }
 }
 
+/// Overwrite the status file after the GUI terminates a worker that never
+/// reached `Mounted`, so later launches don't see a stale `Mounting` claim.
+pub fn mark_worker_stopped(mount_point: Option<&Path>) {
+    let _ = write_worker_status(
+        WorkerState::Stopped,
+        "Background mount stopped",
+        "The worker was stopped before the mount completed.",
+        mount_point,
+        None,
+    );
+}
+
 /// Whether a reported worker status corresponds to something actually alive:
 /// its process exists, its mount answers, or the heartbeat is recent.
 /// Blocking (process probes, filesystem stat) — poller thread only.
@@ -435,8 +447,18 @@ impl Drop for WorkerPoller {
             let _guard = self.wake_lock.lock().expect("poller wake lock poisoned");
             self.wake.notify_all();
         }
+        // The poller may be blocked inside a liveness probe on a wedged NFS
+        // mount; joining unconditionally would hang window close. Reap it if
+        // it winds down promptly, otherwise detach — the process is exiting
+        // and the thread holds only Arcs.
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            let deadline = std::time::Instant::now() + Duration::from_millis(250);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }

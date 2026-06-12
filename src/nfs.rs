@@ -631,7 +631,7 @@ impl MountShutdown {
 }
 
 /// Resolve when `shutdown` fires; pend forever when no handle was provided.
-async fn wait_for_shutdown(shutdown: &Option<MountShutdown>) {
+async fn wait_for_shutdown(shutdown: Option<&MountShutdown>) {
     match shutdown {
         Some(shutdown) => shutdown.wait().await,
         None => std::future::pending().await,
@@ -748,10 +748,23 @@ where
         on_event(NfsMountEvent::MountCommand {
             command: format!("{} -o {} {} {}", mount_cmd.display(), opts, nfs_export, mount_point_str),
         });
-        let status = tokio::process::Command::new(mount_cmd)
+        let mut command = tokio::process::Command::new(mount_cmd);
+        command
             .args(["-o", &opts, &nfs_export, mount_point_str])
-            .status()
-            .await?;
+            .kill_on_drop(true);
+        // Race the mount command against a stop request so a hung mount_nfs
+        // cannot pin the shutdown; kill_on_drop reaps the child on cancel.
+        let status = tokio::select! {
+            status = command.status() => status?,
+            _ = wait_for_shutdown(shutdown.as_ref()) => {
+                server_handle.abort();
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "stop requested".to_string(),
+                });
+                vfs_for_shutdown.shutdown();
+                return Ok(());
+            }
+        };
         if !status.success() {
             server_handle.abort();
             return Err(std::io::Error::other(format!("mount command failed with {status}")));
@@ -767,16 +780,28 @@ where
         on_event(NfsMountEvent::MountCommand {
             command: format!("mount.nfs -o {mount_opts} {nfs_export} {mount_point_str}"),
         });
-        let output = if unsafe { libc::getuid() } == 0 {
-            tokio::process::Command::new("mount.nfs")
-                .args(["-o", &mount_opts, &nfs_export, mount_point_str])
-                .output()
-                .await?
+        let mut command = if unsafe { libc::getuid() } == 0 {
+            let mut command = tokio::process::Command::new("mount.nfs");
+            command.args(["-o", &mount_opts, &nfs_export, mount_point_str]);
+            command
         } else {
-            tokio::process::Command::new("sudo")
-                .args(["-n", "mount.nfs", "-o", &mount_opts, &nfs_export, mount_point_str])
-                .output()
-                .await?
+            let mut command = tokio::process::Command::new("sudo");
+            command.args(["-n", "mount.nfs", "-o", &mount_opts, &nfs_export, mount_point_str]);
+            command
+        };
+        command.kill_on_drop(true);
+        // Race the mount command against a stop request so a hung mount.nfs
+        // cannot pin the shutdown; kill_on_drop reaps the child on cancel.
+        let output = tokio::select! {
+            output = command.output() => output?,
+            _ = wait_for_shutdown(shutdown.as_ref()) => {
+                server_handle.abort();
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "stop requested".to_string(),
+                });
+                vfs_for_shutdown.shutdown();
+                return Ok(());
+            }
         };
         if !output.status.success() {
             server_handle.abort();
@@ -819,8 +844,19 @@ where
             );
         } else {
             info!("Running: {cmd}");
-            let output =
-                mount_windows_nfs_with_retry(&mount_cmd, &opts, &share, &mount_target, shutdown.as_ref()).await?;
+            // `None` means a stop request cancelled the mount — a clean stop,
+            // not a failure.
+            let Some(output) =
+                mount_windows_nfs_with_retry(&mount_cmd, &opts, &share, &mount_target, shutdown.as_ref()).await?
+            else {
+                server_handle.abort();
+                portmapper_handle.abort();
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "stop requested".to_string(),
+                });
+                vfs_for_shutdown.shutdown();
+                return Ok(());
+            };
             if !output.status.success() {
                 server_handle.abort();
                 portmapper_handle.abort();
@@ -900,7 +936,7 @@ where
                 unmount_nfs(mount_point_str);
                 break;
             }
-            _ = wait_for_shutdown(&shutdown) => {
+            _ = wait_for_shutdown(shutdown.as_ref()) => {
                 info!("Shutdown requested, unmounting...");
                 on_event(NfsMountEvent::ShuttingDown {
                     reason: "stop requested".to_string(),
@@ -1226,6 +1262,9 @@ const WINDOWS_ERROR_53_RETRY_ATTEMPTS: usize = 6;
 #[cfg(windows)]
 const WINDOWS_ERROR_53_RETRY_DELAY_MS: u64 = 300;
 
+/// Run `mount.exe`, retrying transient Network Error 53. Returns `Ok(None)`
+/// when a stop request cancelled the mount (a clean stop, not a failure);
+/// both the command itself and the backoff sleeps are interruptible.
 #[cfg(windows)]
 async fn mount_windows_nfs_with_retry(
     mount_cmd: &Path,
@@ -1233,30 +1272,32 @@ async fn mount_windows_nfs_with_retry(
     share: &str,
     mount_target: &str,
     shutdown: Option<&MountShutdown>,
-) -> std::io::Result<std::process::Output> {
+) -> std::io::Result<Option<std::process::Output>> {
     let mut attempt = 1;
     loop {
         if shutdown.is_some_and(MountShutdown::is_requested) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "mount cancelled by stop request",
-            ));
+            return Ok(None);
         }
 
-        let output = tokio::process::Command::new(mount_cmd)
-            .args(["-o", opts, share, mount_target])
-            .output()
-            .await?;
+        let mut command = tokio::process::Command::new(mount_cmd);
+        command.args(["-o", opts, share, mount_target]).kill_on_drop(true);
+        let output = tokio::select! {
+            output = command.output() => output?,
+            _ = wait_for_shutdown(shutdown) => return Ok(None),
+        };
 
         if output.status.success()
             || !windows_mount_output_is_network_error_53(&output)
             || attempt == WINDOWS_ERROR_53_RETRY_ATTEMPTS
         {
-            return Ok(output);
+            return Ok(Some(output));
         }
 
         attempt += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(WINDOWS_ERROR_53_RETRY_DELAY_MS)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(WINDOWS_ERROR_53_RETRY_DELAY_MS)) => {}
+            _ = wait_for_shutdown(shutdown) => return Ok(None),
+        }
     }
 }
 

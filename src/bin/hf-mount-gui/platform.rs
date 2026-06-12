@@ -221,6 +221,53 @@ pub fn process_is_running(_pid: u32) -> bool {
     false
 }
 
+/// Terminate a process by id. Used to stop a background worker that has not
+/// mounted yet (unmounting cannot reach it). SIGTERM on Unix lets a mounted
+/// worker unmount gracefully; on Windows `taskkill /T /F` also takes down any
+/// helper children.
+#[cfg(windows)]
+pub fn terminate_process(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("invalid process id".to_string());
+    }
+    let mut command = Command::new(system32_exe("taskkill.exe"));
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()
+        .map_err(|e| format!("Failed to run taskkill: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "taskkill failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(unix)]
+pub fn terminate_process(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("invalid process id".to_string());
+    }
+    // SAFETY: kill with SIGTERM has no preconditions beyond a valid pid value.
+    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to signal process {pid}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn terminate_process(_pid: u32) -> Result<(), String> {
+    Err("process termination is not supported on this platform".to_string())
+}
+
 /// Whether the path looks like a live mount target. Blocking on a wedged NFS
 /// mount — poller thread only.
 pub fn mount_point_appears_active(mount_point: &Path) -> bool {
