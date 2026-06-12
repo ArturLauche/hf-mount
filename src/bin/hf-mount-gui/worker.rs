@@ -201,20 +201,28 @@ pub fn spawn_background_worker(mount_point: &Path) -> Result<Child, String> {
         Some(mount_point),
         None,
     )?;
-    let log = worker_log_file()?;
-    let log_for_stderr = log
-        .try_clone()
-        .map_err(|e| format!("Failed to duplicate background log handle: {e}"))?;
-    let mut command = Command::new(exe);
-    command
-        .arg(BACKGROUND_WORKER_ARG)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_for_stderr));
-    platform::detach_command(&mut command);
-    command
-        .spawn()
-        .map_err(|e| format!("Failed to launch background worker: {e}"))
+    let result = (|| {
+        let log = worker_log_file()?;
+        let log_for_stderr = log
+            .try_clone()
+            .map_err(|e| format!("Failed to duplicate background log handle: {e}"))?;
+        let mut command = Command::new(exe);
+        command
+            .arg(BACKGROUND_WORKER_ARG)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_for_stderr));
+        platform::detach_command(&mut command);
+        command
+            .spawn()
+            .map_err(|e| format!("Failed to launch background worker: {e}"))
+    })();
+    if result.is_err() {
+        // Remove the provisional "launching" status so the poller doesn't
+        // treat a worker that never existed as live for the staleness window.
+        clear_worker_status();
+    }
+    result
 }
 
 // ── Worker process entry point ────────────────────────────────────────

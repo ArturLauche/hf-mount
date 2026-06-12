@@ -28,7 +28,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Configure internal registries
-        if: github.repository == 'huggingface/hf-mount'
+        # Head-repo check: on fork PRs github.repository is the *base* repo,
+        # which must not grant fork code the internal registry setup.
+        if: >-
+          (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == 'huggingface/hf-mount') ||
+          (github.event_name != 'pull_request' && github.repository == 'huggingface/hf-mount')
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
 
       # Pin nightly so rustfmt rules don't drift between CI and contributor machines.
@@ -77,8 +81,11 @@ jobs:
 
   smoke-test:
     name: Smoke Tests (FUSE + NFS)
-    # Internal runner group + HF_TOKEN: upstream only, skipped on forks.
-    if: github.repository == 'huggingface/hf-mount'
+    # Internal runner group + HF_TOKEN: only for code from the upstream repo
+    # itself. The head-repo check keeps fork-PR code off internal runners.
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == 'huggingface/hf-mount') ||
+      (github.event_name != 'pull_request' && github.repository == 'huggingface/hf-mount')
     runs-on:
       group: hf-mount-ci-pub
     needs: lint-test
@@ -112,7 +119,9 @@ jobs:
 
   fsx:
     name: fsx (data integrity)
-    if: github.repository == 'huggingface/hf-mount'
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == 'huggingface/hf-mount') ||
+      (github.event_name != 'pull_request' && github.repository == 'huggingface/hf-mount')
     runs-on:
       group: hf-mount-ci-pub
     needs: lint-test
@@ -137,7 +146,9 @@ jobs:
 
   xfstests:
     name: xfstests (filesystem exerciser)
-    if: github.repository == 'huggingface/hf-mount'
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == 'huggingface/hf-mount') ||
+      (github.event_name != 'pull_request' && github.repository == 'huggingface/hf-mount')
     runs-on:
       group: hf-mount-ci-pub-m5dn-24xlarge
     needs: lint-test
@@ -162,7 +173,9 @@ jobs:
 
   pjdfstest:
     name: POSIX Compliance (pjdfstest)
-    if: github.repository == 'huggingface/hf-mount'
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == 'huggingface/hf-mount') ||
+      (github.event_name != 'pull_request' && github.repository == 'huggingface/hf-mount')
     runs-on:
       group: hf-mount-ci-pub
     needs: lint-test
@@ -232,7 +245,9 @@ jobs:
 
   bench:
     name: Benchmarks
-    if: github.repository == 'huggingface/hf-mount'
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == 'huggingface/hf-mount') ||
+      (github.event_name != 'pull_request' && github.repository == 'huggingface/hf-mount')
     runs-on:
       group: hf-mount-ci-pub
     needs: lint-test

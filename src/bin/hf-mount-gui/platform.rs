@@ -252,7 +252,16 @@ pub fn terminate_process(pid: u32) -> Result<(), String> {
     if pid == 0 {
         return Err("invalid process id".to_string());
     }
+    // The worker is spawned as a process-group leader (`detach_command`), and
+    // during startup it may be blocked on a mount_nfs/mount.nfs child with no
+    // signal handler installed yet. Signal the whole group so the helper dies
+    // with the worker; fall back to the single pid when it isn't a leader
+    // (e.g. launched by an init system that grouped it differently).
     // SAFETY: kill with SIGTERM has no preconditions beyond a valid pid value.
+    let group_result = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+    if group_result == 0 {
+        return Ok(());
+    }
     if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0 {
         Ok(())
     } else {

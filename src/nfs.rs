@@ -898,6 +898,9 @@ where
     let mut server_handle = server_handle;
     tokio::pin!(sigterm_fut);
     let mut server_exited = false;
+    // The liveness probe runs as its own select arm: a probe that wedges on a
+    // dead mount must not keep the shutdown/signal/UMNT branches from running.
+    let mut probe_handle: Option<tokio::task::JoinHandle<bool>> = None;
     loop {
         tokio::select! {
             msg = mount_rx.recv() => {
@@ -922,36 +925,25 @@ where
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C, unmounting...");
-                on_event(NfsMountEvent::ShuttingDown {
-                    reason: "Ctrl+C received".to_string(),
-                });
-                unmount_nfs(mount_point_str);
+                let reason = unmount_for_shutdown(mount_point_str, "Ctrl+C received");
+                on_event(NfsMountEvent::ShuttingDown { reason });
                 break;
             }
             _ = &mut sigterm_fut => {
                 info!("Received SIGTERM, unmounting...");
-                on_event(NfsMountEvent::ShuttingDown {
-                    reason: "termination signal received".to_string(),
-                });
-                unmount_nfs(mount_point_str);
+                let reason = unmount_for_shutdown(mount_point_str, "termination signal received");
+                on_event(NfsMountEvent::ShuttingDown { reason });
                 break;
             }
             _ = wait_for_shutdown(shutdown.as_ref()) => {
                 info!("Shutdown requested, unmounting...");
-                on_event(NfsMountEvent::ShuttingDown {
-                    reason: "stop requested".to_string(),
-                });
-                unmount_nfs(mount_point_str);
+                let reason = unmount_for_shutdown(mount_point_str, "stop requested");
+                on_event(NfsMountEvent::ShuttingDown { reason });
                 break;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                // The probe touches the (possibly wedged) mount, so keep it
-                // off the async workers.
-                let probe_path = mount_point_str.to_string();
-                let mounted = tokio::task::spawn_blocking(move || is_mounted(&probe_path))
-                    .await
-                    .unwrap_or(false);
-                if !skip_auto_mount && !mounted {
+            mounted = async { probe_handle.as_mut().expect("probe arm is guarded").await }, if probe_handle.is_some() => {
+                probe_handle = None;
+                if !skip_auto_mount && !mounted.unwrap_or(false) {
                     info!("NFS mount disappeared, shutting down");
                     on_event(NfsMountEvent::ShuttingDown {
                         reason: "mount disappeared".to_string(),
@@ -959,8 +951,17 @@ where
                     break;
                 }
             }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if probe_handle.is_none() => {
+                // The probe touches the (possibly wedged) mount, so it runs on
+                // the blocking pool and is awaited by the arm above.
+                let probe_path = mount_point_str.to_string();
+                probe_handle = Some(tokio::task::spawn_blocking(move || is_mounted(&probe_path)));
+            }
         }
     }
+    // An in-flight probe is abandoned here; its blocking thread finishes (or
+    // unwedges) on its own and only returns a bool nobody reads.
+    drop(probe_handle);
 
     // Stop the NFS server task explicitly; dropping the JoinHandle does not
     // cancel a tokio task.
@@ -1158,7 +1159,24 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
 }
 
 /// Check if a path is still an active mount point.
-fn unmount_nfs(mount_point: &str) {
+/// Best-effort unmount during shutdown. Returns the `ShuttingDown` reason,
+/// flagging a failed unmount so users know the target may need manual cleanup
+/// — the server is torn down either way, so a leftover mount goes stale.
+fn unmount_for_shutdown(mount_point: &str, cause: &str) -> String {
+    if unmount_nfs(mount_point) {
+        cause.to_string()
+    } else {
+        tracing::warn!(
+            "unmount of {} failed during shutdown; manual cleanup (umount -f) may be required",
+            mount_point
+        );
+        format!("{cause}; unmount failed — {mount_point} may need manual cleanup (umount -f)")
+    }
+}
+
+/// Unmount `mount_point`, trying the platform syscall first and an external
+/// command as fallback. Returns `true` when one of them reported success.
+fn unmount_nfs(mount_point: &str) -> bool {
     #[cfg(unix)]
     use std::ffi::CString;
 
@@ -1168,41 +1186,43 @@ fn unmount_nfs(mount_point: &str) {
         #[cfg(target_os = "linux")]
         {
             if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
-                return;
+                return true;
             }
         }
         #[cfg(target_os = "macos")]
         {
             if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
-                return;
+                return true;
             }
         }
     }
 
     // Fallback: external command.
     #[cfg(target_os = "macos")]
-    if let Err(e) = std::process::Command::new("/sbin/umount").arg(mount_point).status() {
-        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
-    }
+    let result = std::process::Command::new("/sbin/umount").arg(mount_point).status();
     #[cfg(target_os = "linux")]
-    {
-        let result = if unsafe { libc::getuid() } == 0 {
-            std::process::Command::new("umount").arg(mount_point).status()
-        } else {
-            std::process::Command::new("sudo")
-                .args(["-n", "umount", mount_point])
-                .status()
-        };
-        if let Err(e) = result {
-            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
-        }
-    }
+    let result = if unsafe { libc::getuid() } == 0 {
+        std::process::Command::new("umount").arg(mount_point).status()
+    } else {
+        std::process::Command::new("sudo")
+            .args(["-n", "umount", mount_point])
+            .status()
+    };
     #[cfg(windows)]
-    if let Err(e) = std::process::Command::new(umount_command_path())
+    let result = std::process::Command::new(umount_command_path())
         .args(["-f", &windows_nfs_mount_target(mount_point)])
-        .status()
-    {
-        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+        .status();
+
+    match result {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            tracing::warn!("NFS unmount fallback for {} exited with {}", mount_point, status);
+            false
+        }
+        Err(e) => {
+            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+            false
+        }
     }
 }
 
