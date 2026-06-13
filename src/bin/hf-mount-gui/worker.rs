@@ -151,11 +151,25 @@ pub fn worker_process_matches(pid: u32) -> bool {
 /// heartbeat is recent. Blocking (process probes, filesystem stat) — poller
 /// thread only.
 pub fn worker_status_is_live(status: &WorkerStatus, mount_point: Option<&Path>) -> bool {
-    // A mount visible in the platform mount table is authoritative and does not
-    // depend on the (reuse-prone) recorded PID.
+    // Terminal states (written by `mark_worker_stopped` and the early-startup
+    // failure path, both with `pid: None`) are dead regardless of how fresh the
+    // heartbeat is — never let them keep stale UI state alive.
+    if !status.state.is_active() {
+        return false;
+    }
+
+    // A mount visible in the OS mount table is authoritative regardless of the
+    // (reuse-prone) recorded PID — but only where the check truly inspects the
+    // mount table. On Windows `mount_point_appears_active` is a best-effort
+    // directory probe that a leftover directory from a crashed worker still
+    // passes, so there we fall through to the PID/heartbeat check instead of
+    // trusting it.
+    #[cfg(not(windows))]
     if status.state == WorkerState::Mounted && mount_point.is_some_and(platform::mount_point_appears_active) {
         return true;
     }
+    #[cfg(windows)]
+    let _ = mount_point;
 
     match status.pid {
         // Once a worker has recorded its own PID, trust only that process: a
@@ -165,11 +179,19 @@ pub fn worker_status_is_live(status: &WorkerStatus, mount_point: Option<&Path>) 
         Some(pid) => worker_process_matches(pid),
         // Provisional pid-less launch status (written by the GUI before the
         // detached worker has published its own): trust the recent heartbeat.
-        None => {
-            status.updated_at_secs != 0
-                && current_unix_secs().saturating_sub(status.updated_at_secs) <= WORKER_STATUS_STALE_AFTER_SECS
-        }
+        None => worker_status_heartbeat_fresh(status),
     }
+}
+
+/// Cheap, non-blocking liveness heuristic: heartbeat freshness only. Used by
+/// the GUI's synchronous startup reconcile, which must not run the full
+/// (mount-stat / process-probe) check before the first frame — either can wedge
+/// on a dead NFS mount and keep the window from ever opening. The poller
+/// re-confirms with [`worker_status_is_live`] on its own thread within one
+/// interval and corrects the UI if the worker is actually gone.
+pub fn worker_status_heartbeat_fresh(status: &WorkerStatus) -> bool {
+    status.updated_at_secs != 0
+        && current_unix_secs().saturating_sub(status.updated_at_secs) <= WORKER_STATUS_STALE_AFTER_SECS
 }
 
 // ── Worker log ────────────────────────────────────────────────────────

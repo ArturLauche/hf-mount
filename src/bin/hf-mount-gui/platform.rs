@@ -323,6 +323,14 @@ pub fn mount_point_appears_active(mount_point: &Path) -> bool {
     mount_point.to_str().is_some_and(hf_mount::nfs::is_mounted)
 }
 
+/// Whether `mount_point` is currently mounted by *our* loopback NFS export, as
+/// opposed to an unrelated filesystem the user may already have mounted there.
+/// Confirms ownership before a speculative cleanup unmount so we never detach a
+/// pre-existing mount. Blocking on a wedged mount — worker thread only.
+pub fn mount_point_is_ours(mount_point: &Path) -> bool {
+    mount_point.to_str().is_some_and(hf_mount::nfs::is_loopback_nfs_mount)
+}
+
 /// Detach a child process from the GUI so it survives window close.
 pub fn detach_command(command: &mut Command) {
     #[cfg(windows)]

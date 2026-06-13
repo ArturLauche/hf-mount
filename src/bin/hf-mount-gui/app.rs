@@ -500,10 +500,15 @@ impl MountGuiApp {
         if !status.state.is_active() {
             return;
         }
-        let mount_point = worker_mount_point(&status);
-        if crate::worker::worker_status_is_live(&status, mount_point.as_deref()) {
+        // Non-blocking heuristic only. The full liveness check stats the mount
+        // (and probes the process table), either of which can wedge on a dead
+        // NFS mount — that must never run before the first frame or the window
+        // never opens. Optimistically adopt a fresh-heartbeat worker so Start is
+        // gated immediately; the poller re-confirms on its own thread within one
+        // interval and clears this if the worker is actually gone.
+        if crate::worker::worker_status_heartbeat_fresh(&status) {
             self.active_background = true;
-            self.active_mount_point = mount_point;
+            self.active_mount_point = worker_mount_point(&status);
             set_status_if_changed(
                 &self.status,
                 worker_mount_state(&status),
@@ -571,7 +576,13 @@ impl MountGuiApp {
         {
             let status = self.status.clone();
             self.stop_thread = Some(thread::spawn(move || {
-                if let Err(e) = platform::unmount_path(&mount_point) {
+                // Only clean up a mount we actually own. The worker may have
+                // mounted in the race window before the kill, but the configured
+                // path could equally be an unrelated pre-existing mount that we
+                // must not detach — confirm it is our loopback NFS export first.
+                if platform::mount_point_is_ours(&mount_point)
+                    && let Err(e) = platform::unmount_path(&mount_point)
+                {
                     push_log(&status, format!("Post-stop cleanup unmount failed: {e}"));
                 }
             }));
@@ -914,11 +925,20 @@ impl eframe::App for MountGuiApp {
                 thread::sleep(Duration::from_millis(50));
             }
             if !handle.is_finished()
-                && let Some(mount_point) = &self.active_mount_point
+                && let Some(mount_point) = self.active_mount_point.clone()
             {
                 // The backend did not wind down in time — force the unmount so
-                // no dead mount point is left behind.
-                let _ = platform::unmount_path(mount_point);
+                // no dead mount point is left behind. Run it on a detached thread
+                // with a bounded wait: `unmount_path` can block on a wedged NFS
+                // mount, and window close must stay bounded. If it doesn't finish
+                // in time we drop the handle and let the exiting process reap it.
+                let unmount = thread::spawn(move || {
+                    let _ = platform::unmount_path(&mount_point);
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !unmount.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
         }
     }

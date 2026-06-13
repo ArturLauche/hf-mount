@@ -169,8 +169,20 @@ fn main() {
         error_paths.push(error_path.clone());
         let vfs_registry = Arc::clone(&vfs_registry);
         let rt_handle = runtime.handle().clone();
+        let panic_error_path = error_path.clone();
+        let panic_label = label.clone();
         handles.push(std::thread::spawn(move || {
-            run_mount(fuse_fds, mount.mount_args, error_path, vfs_registry, rt_handle);
+            // The readiness wait loop below has no timeout, so a panic that
+            // unwound this thread before `run_mount` wrote its ready or error
+            // marker would hang pod readiness forever. Convert a last-resort
+            // panic (e.g. an `expect` deep in client construction) into an error
+            // marker so the wait loop sees the failure and reports it.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_mount(fuse_fds, mount.mount_args, error_path, vfs_registry, rt_handle);
+            }));
+            if outcome.is_err() {
+                write_error(&panic_error_path, &format!("Mount thread panicked for {}", panic_label));
+            }
         }));
     }
 

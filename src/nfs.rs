@@ -755,6 +755,11 @@ where
         // Race the mount command against a stop request so a hung mount_nfs
         // cannot pin the shutdown; kill_on_drop reaps the child on cancel.
         let status = tokio::select! {
+            // A mount command that completed in the same poll must win over a
+            // concurrent stop, otherwise we could tear the server down while the
+            // client mount it just established stays behind. When it wins here
+            // the still-pending stop is handled by the wait loop, which unmounts.
+            biased;
             status = command.status() => status?,
             _ = wait_for_shutdown(shutdown.as_ref()) => {
                 server_handle.abort();
@@ -793,6 +798,11 @@ where
         // Race the mount command against a stop request so a hung mount.nfs
         // cannot pin the shutdown; kill_on_drop reaps the child on cancel.
         let output = tokio::select! {
+            // A mount command that completed in the same poll must win over a
+            // concurrent stop, otherwise we could tear the server down while the
+            // client mount it just established stays behind. When it wins here
+            // the still-pending stop is handled by the wait loop, which unmounts.
+            biased;
             output = command.output() => output?,
             _ = wait_for_shutdown(shutdown.as_ref()) => {
                 server_handle.abort();
@@ -873,14 +883,21 @@ where
         }
     }
 
-    info!("NFS mount active at {}", mount_point_str);
-    on_event(NfsMountEvent::Mounted {
-        mount_point: mount_point_str.to_string(),
-    });
+    if skip_auto_mount {
+        // The server and portmapper are up but no client mount exists yet (the
+        // user mounts manually), so we must not claim Mounted or signal
+        // readiness — both would advertise a live mount that isn't there.
+        info!("NFS server is ready; waiting for a manual mount of {}", mount_point_str);
+    } else {
+        info!("NFS mount active at {}", mount_point_str);
+        on_event(NfsMountEvent::Mounted {
+            mount_point: mount_point_str.to_string(),
+        });
 
-    // Signal the parent process that the mount is live (daemon mode).
-    if let Some(guard) = daemon_guard {
-        guard.notify_ready();
+        // Signal the parent process that the mount is live (daemon mode).
+        if let Some(guard) = daemon_guard {
+            guard.notify_ready();
+        }
     }
 
     // Wait for unmount signal, server exit, or Ctrl+C.
@@ -1312,6 +1329,66 @@ pub fn is_mounted(path: &str) -> bool {
     }
 }
 
+/// Whether `path` is mounted by *our* local loopback NFS export (device
+/// `127.0.0.1:`), as opposed to an unrelated filesystem mounted at the same
+/// location. Used to confirm ownership before a speculative cleanup unmount so
+/// a stop never detaches a pre-existing mount. Blocking on a wedged mount —
+/// keep it off latency-sensitive threads.
+pub fn is_loopback_nfs_mount(path: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let wanted = normalize_mount_path(path);
+        std::fs::read_to_string("/proc/mounts")
+            .map(|contents| {
+                contents.lines().any(|line| {
+                    let mut fields = line.split_whitespace();
+                    let device = fields.next();
+                    let mount = fields
+                        .next()
+                        .map(unescape_proc_mounts)
+                        .map(|mount| normalize_mount_path(&mount));
+                    mount.as_deref() == Some(wanted.as_str())
+                        && device.is_some_and(|device| device.starts_with("127.0.0.1:"))
+                })
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{CStr, CString};
+        use std::mem::MaybeUninit;
+        let c_path = match CString::new(path) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        unsafe {
+            let mut buf = MaybeUninit::<libc::statfs>::uninit();
+            if libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) != 0 {
+                return false;
+            }
+            let buf = buf.assume_init();
+            let fstype = CStr::from_ptr(buf.f_fstypename.as_ptr());
+            if fstype.to_bytes() != b"nfs" {
+                return false;
+            }
+            let from = CStr::from_ptr(buf.f_mntfromname.as_ptr());
+            from.to_bytes().starts_with(b"127.0.0.1:")
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows drive-letter mounts don't expose the NFS source cheaply; fall
+        // back to the best-effort mount probe. A drive letter the user assigned
+        // to our mount is unlikely to collide with an unrelated mount.
+        is_mounted(path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn mount_nfs_command_path() -> std::path::PathBuf {
     std::path::PathBuf::from("/sbin/mount_nfs")
@@ -1352,6 +1429,10 @@ async fn mount_windows_nfs_with_retry(
         let mut command = tokio::process::Command::new(mount_cmd);
         command.args(["-o", opts, share, mount_target]).kill_on_drop(true);
         let output = tokio::select! {
+            // A successful mount.exe in the same poll must win over a concurrent
+            // stop; the caller's wait loop then unmounts it. Otherwise the
+            // attempt could be reported as cancelled while the mount stayed live.
+            biased;
             output = command.output() => output?,
             _ = wait_for_shutdown(shutdown) => return Ok(None),
         };
@@ -1513,6 +1594,37 @@ mod tests {
             export_name: "hf-mount-test".to_string(),
             filehandle_secret: [7; 16],
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_mounts_unescape_handles_octal_escapes() {
+        // /proc/mounts octal-escapes space, tab, newline and backslash; the
+        // liveness probe must decode them or an active mount reads as gone.
+        assert_eq!(unescape_proc_mounts(r"/mnt/with\040space"), "/mnt/with space");
+        assert_eq!(unescape_proc_mounts(r"/mnt/tab\011here"), "/mnt/tab\there");
+        assert_eq!(unescape_proc_mounts(r"/mnt/nl\012here"), "/mnt/nl\nhere");
+        assert_eq!(unescape_proc_mounts(r"/mnt/back\134slash"), r"/mnt/back\slash");
+        assert_eq!(unescape_proc_mounts(r"/a\040b\011c\134d"), "/a b\tc\\d");
+        // Unescaped paths pass through unchanged.
+        assert_eq!(unescape_proc_mounts("/plain/path"), "/plain/path");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_mounts_normalize_trims_trailing_slashes() {
+        assert_eq!(normalize_mount_path("/foo/"), "/foo");
+        assert_eq!(normalize_mount_path("/foo///"), "/foo");
+        assert_eq!(normalize_mount_path("/foo"), "/foo");
+        // Root must survive rather than collapse to an empty string.
+        assert_eq!(normalize_mount_path("/"), "/");
+        assert_eq!(normalize_mount_path("///"), "/");
+        // A path differing from the table only by a trailing slash compares
+        // equal after normalization — the false-disappearance regression.
+        assert_eq!(
+            normalize_mount_path("/tmp/hf-mount/"),
+            normalize_mount_path("/tmp/hf-mount")
+        );
     }
 
     #[test]
