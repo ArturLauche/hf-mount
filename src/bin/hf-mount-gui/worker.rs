@@ -151,16 +151,25 @@ pub fn worker_process_matches(pid: u32) -> bool {
 /// heartbeat is recent. Blocking (process probes, filesystem stat) — poller
 /// thread only.
 pub fn worker_status_is_live(status: &WorkerStatus, mount_point: Option<&Path>) -> bool {
-    if status.pid.is_some_and(worker_process_matches) {
-        return true;
-    }
-
+    // A mount visible in the platform mount table is authoritative and does not
+    // depend on the (reuse-prone) recorded PID.
     if status.state == WorkerState::Mounted && mount_point.is_some_and(platform::mount_point_appears_active) {
         return true;
     }
 
-    status.updated_at_secs != 0
-        && current_unix_secs().saturating_sub(status.updated_at_secs) <= WORKER_STATUS_STALE_AFTER_SECS
+    match status.pid {
+        // Once a worker has recorded its own PID, trust only that process: a
+        // dead or recycled PID means it is gone. Falling back to the heartbeat
+        // here would keep a crashed worker "live" for the staleness window and
+        // wrongly block starting a replacement.
+        Some(pid) => worker_process_matches(pid),
+        // Provisional pid-less launch status (written by the GUI before the
+        // detached worker has published its own): trust the recent heartbeat.
+        None => {
+            status.updated_at_secs != 0
+                && current_unix_secs().saturating_sub(status.updated_at_secs) <= WORKER_STATUS_STALE_AFTER_SECS
+        }
+    }
 }
 
 // ── Worker log ────────────────────────────────────────────────────────

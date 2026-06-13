@@ -106,11 +106,14 @@ pub fn source_id_problem(source: GuiSource, source_id: &str) -> Option<&'static 
         return Some("Remove the leading/trailing slash.");
     }
     if source == GuiSource::Bucket {
-        // Buckets are exactly namespace/bucket — reject zero, one, or 3+ segments.
-        let mut parts = trimmed.split('/');
-        match (parts.next(), parts.next(), parts.next()) {
-            (Some(namespace), Some(bucket), None) if !namespace.is_empty() && !bucket.is_empty() => {}
-            _ => return Some("Buckets are namespace/bucket, e.g. myuser/my-bucket."),
+        // Buckets are namespace/bucket, optionally with a subfolder
+        // (namespace/bucket/path/to/dir) — require at least two non-empty
+        // segments and reject empty segments like `a//b`.
+        let mut segments = trimmed.split('/');
+        let namespace = segments.next().filter(|seg| !seg.is_empty());
+        let bucket = segments.next().filter(|seg| !seg.is_empty());
+        if namespace.is_none() || bucket.is_none() || segments.any(str::is_empty) {
+            return Some("Buckets are namespace/bucket, e.g. myuser/my-bucket.");
         }
     }
     None
@@ -245,10 +248,10 @@ mod tests {
         assert!(source_id_problem(GuiSource::Repo, "has space/model").is_some());
         assert!(source_id_problem(GuiSource::Repo, "/leading").is_some());
         assert!(source_id_problem(GuiSource::Bucket, "no-namespace").is_some());
-        // Buckets must be exactly namespace/bucket — reject extra segments and
-        // empty segments rather than deferring the failure to mount setup.
-        assert!(source_id_problem(GuiSource::Bucket, "namespace/bucket/extra").is_some());
+        // Empty interior segments are rejected, but subfolder paths are valid:
+        // Source::Bucket supports namespace/bucket/path/to/dir.
         assert!(source_id_problem(GuiSource::Bucket, "a//b").is_some());
+        assert!(source_id_problem(GuiSource::Bucket, "namespace/bucket/checkpoints").is_none());
         assert!(source_id_problem(GuiSource::Repo, "gpt2").is_none());
         assert!(source_id_problem(GuiSource::Repo, "openai-community/gpt2").is_none());
         assert!(source_id_problem(GuiSource::Bucket, "myuser/my-bucket").is_none());

@@ -197,6 +197,12 @@ impl MountGuiApp {
             Err(e) => push_log(&app.status, format!("Could not load saved settings: {e}")),
         }
 
+        // Reconcile any existing background worker synchronously before the
+        // first frame, so opening a second GUI while a mount is already running
+        // gates Start immediately instead of racing the async poller and
+        // spawning a duplicate worker on the same status file.
+        app.reconcile_existing_worker();
+
         // One always-on poller watches the background worker status file from
         // its own thread; the UI thread only ever reads its snapshot.
         let repaint_ctx = cc.egui_ctx.clone();
@@ -483,6 +489,32 @@ impl MountGuiApp {
             .is_some_and(|status| status.state == crate::worker::WorkerState::Mounted)
     }
 
+    /// One-shot synchronous reconcile of an already-running background worker
+    /// at startup, before the async poller's first snapshot. Seeds the tracking
+    /// state so the first frame correctly reflects (and gates Start on) a live
+    /// worker. Blocking — only called once during construction.
+    fn reconcile_existing_worker(&mut self) {
+        let Ok(Some(status)) = crate::worker::read_worker_status() else {
+            return;
+        };
+        if !status.state.is_active() {
+            return;
+        }
+        let mount_point = worker_mount_point(&status);
+        if crate::worker::worker_status_is_live(&status, mount_point.as_deref()) {
+            self.active_background = true;
+            self.active_mount_point = mount_point;
+            set_status_if_changed(
+                &self.status,
+                worker_mount_state(&status),
+                status.headline.clone(),
+                status.detail.clone(),
+            );
+            self.last_worker_status = Some(status);
+            push_log(&self.status, "Reconnected to existing background worker");
+        }
+    }
+
     fn stop_unmounted_background_worker(&mut self) {
         // A pid from our own spawned child is trustworthy. One read back from
         // the status file may have been recycled by another process — verify
@@ -531,11 +563,18 @@ impl MountGuiApp {
         crate::worker::mark_worker_stopped(self.active_mount_point.as_deref());
 
         // The worker may have mounted in the window between the last status
-        // poll and the kill — clean up any mount it managed to create.
-        if let Some(mount_point) = self.active_mount_point.clone() {
-            thread::spawn(move || {
-                let _ = platform::unmount_path(&mount_point);
-            });
+        // poll and the kill — clean up any mount it managed to create. Track
+        // the cleanup in `stop_thread` (not detached) so window close waits for
+        // it (bounded) rather than killing it mid-unmount and orphaning a mount.
+        if let Some(mount_point) = self.active_mount_point.clone()
+            && self.stop_thread.is_none()
+        {
+            let status = self.status.clone();
+            self.stop_thread = Some(thread::spawn(move || {
+                if let Err(e) = platform::unmount_path(&mount_point) {
+                    push_log(&status, format!("Post-stop cleanup unmount failed: {e}"));
+                }
+            }));
         }
 
         self.active_background = false;
@@ -848,18 +887,22 @@ impl eframe::App for MountGuiApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.save_profile();
 
-        // Background mounts survive the window by design — but if the user
-        // just pressed Stop, `stop_mount` offloaded the unmount to a worker
-        // thread; let it finish (bounded) so closing the window doesn't abort
-        // the stop and leave a live mount behind.
-        if self.active_background {
-            if let Some(handle) = self.stop_thread.take() {
-                let deadline = Instant::now() + Duration::from_secs(8);
-                while !handle.is_finished() && Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(50));
-                }
+        // If the user just pressed Stop, `stop_mount` offloaded the unmount (or
+        // post-termination cleanup) to a worker thread; let it finish (bounded)
+        // so closing the window doesn't abort it and leave a mount behind. Only
+        // reap if it actually finished — a wedged unmount must not hang close.
+        if let Some(handle) = self.stop_thread.take() {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if handle.is_finished() {
                 let _ = handle.join();
             }
+        }
+
+        // Background mounts survive the window by design.
+        if self.active_background {
             return;
         }
         if let Some(shutdown) = &self.mount_shutdown {

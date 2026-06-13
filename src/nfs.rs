@@ -1244,11 +1244,43 @@ fn unmount_nfs(mount_point: &str) -> bool {
 /// table on Linux, the statfs filesystem type on macOS, and a drive/directory
 /// probe on Windows. A bare existing directory does not count. Blocking on a
 /// wedged mount — keep it off latency-sensitive threads.
+#[cfg(target_os = "linux")]
+fn unescape_proc_mounts(raw: &str) -> String {
+    raw.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_mount_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn is_mounted(path: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
+        // /proc/mounts octal-escapes spaces/tabs in the mount point and may
+        // differ from `path` only by a trailing slash. Normalize both before
+        // comparing so an active mount isn't misread as "disappeared" (which
+        // would fire the shutdown path). String-only — no canonicalize, which
+        // could block on a wedged mount.
+        let wanted = normalize_mount_path(path);
         std::fs::read_to_string("/proc/mounts")
-            .map(|s| s.lines().any(|line| line.split_whitespace().nth(1) == Some(path)))
+            .map(|contents| {
+                contents.lines().any(|line| {
+                    line.split_whitespace()
+                        .nth(1)
+                        .map(unescape_proc_mounts)
+                        .map(|mount| normalize_mount_path(&mount))
+                        .is_some_and(|mount| mount == wanted)
+                })
+            })
             .unwrap_or(false)
     }
     #[cfg(target_os = "macos")]

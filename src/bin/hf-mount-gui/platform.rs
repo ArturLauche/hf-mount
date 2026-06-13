@@ -211,49 +211,47 @@ pub fn worker_process_alive(pid: u32, marker: &str) -> bool {
     let Ok(output) = output else {
         return false;
     };
-    output.status.success() && String::from_utf8_lossy(&output.stdout).contains(marker)
+    // Match the marker as a whole argument, not a substring, so an unrelated
+    // command like `--background-worker-helper` can't pass the identity check.
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .any(|argument| argument == marker)
 }
 
 #[cfg(windows)]
-pub fn worker_process_alive(pid: u32, _marker: &str) -> bool {
+pub fn worker_process_alive(pid: u32, marker: &str) -> bool {
     if pid == 0 {
         return false;
     }
-
-    let filter = format!("PID eq {pid}");
-    let mut command = Command::new(system32_exe("tasklist.exe"));
-    command.creation_flags(CREATE_NO_WINDOW);
-    let output = command.args(["/FI", &filter, "/FO", "CSV", "/NH"]).output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
+    // tasklist exposes only the image name, not the command line, so it cannot
+    // tell a detached `--background-worker` process from a foreground GUI window
+    // that happens to have inherited a recycled PID. Query the actual command
+    // line and require the marker as a whole argument. Failing closed here is
+    // deliberate: a `Mounted` worker's liveness is confirmed via the mount table
+    // (see worker::worker_status_is_live), so this strict check only gates the
+    // brief Mounting/Stopping window and the explicit Stop/terminate path.
+    match windows_process_command_line(pid) {
+        Some(command_line) => command_line.split_whitespace().any(|argument| argument == marker),
+        None => false,
     }
-
-    let exe_name = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.file_name().map(|name| name.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "hf-mount-gui.exe".to_string());
-    let pid_text = pid.to_string();
-    // tasklist CSV rows are "image","pid","session","sessnum","memusage".
-    // Parse columns 0 (image) and 1 (pid) explicitly rather than substring-
-    // matching the whole row, which could match the pid value in another field.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines().any(|line| {
-        let mut fields = tasklist_csv_fields(line);
-        let image = fields.next();
-        let row_pid = fields.next();
-        image.is_some_and(|image| image.eq_ignore_ascii_case(&exe_name)) && row_pid == Some(pid_text.as_str())
-    })
 }
 
-/// Yield the quoted, comma-separated fields of a single tasklist CSV row,
-/// stripping the surrounding double quotes. tasklist does not emit embedded
-/// quotes in these columns, so a simple `","` split is sufficient.
+/// Command line of `pid` via PowerShell CIM, or `None` if it can't be obtained
+/// (process gone, query failed). Blocking — poller thread / explicit action.
 #[cfg(windows)]
-fn tasklist_csv_fields(line: &str) -> std::str::Split<'_, &'static str> {
-    line.trim().trim_start_matches('"').trim_end_matches('"').split("\",\"")
+fn windows_process_command_line(pid: u32) -> Option<String> {
+    let script = format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine");
+    let output = Command::new(powershell_exe())
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command_line.is_empty()).then_some(command_line)
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
