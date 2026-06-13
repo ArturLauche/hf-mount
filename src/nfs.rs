@@ -566,16 +566,13 @@ pub async fn mount_nfs(
     security: NfsSecurity,
     daemon_guard: Option<&mut DaemonGuard>,
 ) -> std::io::Result<()> {
-    mount_nfs_with_callback(
-        virtual_fs,
-        mount_point,
+    let params = NfsMountParams {
         metadata_ttl_ms,
         read_only,
         security,
-        daemon_guard,
-        |_| {},
-    )
-    .await
+        shutdown: None,
+    };
+    mount_nfs_with_callback(virtual_fs, mount_point, params, daemon_guard, |_| {}).await
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -586,18 +583,86 @@ pub enum NfsMountEvent {
     ShuttingDown { reason: String },
 }
 
+/// Cooperative shutdown handle for an NFS mount started with
+/// [`mount_nfs_with_callback`]. Cloneable; `request()` may be called from any
+/// thread at any point of the mount lifecycle — including while the mount
+/// command is still being retried — and makes the mount unmount and return.
+#[derive(Clone, Default)]
+pub struct MountShutdown {
+    inner: Arc<MountShutdownInner>,
+}
+
+#[derive(Default)]
+struct MountShutdownInner {
+    requested: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl MountShutdown {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the mount to stop. Idempotent and thread-safe.
+    pub fn request(&self) {
+        self.inner.requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.inner.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolve once shutdown has been requested. Race-free against `request`
+    /// calls that happen before or while the future is being created.
+    async fn wait(&self) {
+        loop {
+            if self.is_requested() {
+                return;
+            }
+            let mut notified = std::pin::pin!(self.inner.notify.notified());
+            notified.as_mut().enable();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Resolve when `shutdown` fires; pend forever when no handle was provided.
+async fn wait_for_shutdown(shutdown: Option<&MountShutdown>) {
+    match shutdown {
+        Some(shutdown) => shutdown.wait().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Mount parameters for [`mount_nfs_with_callback`].
+pub struct NfsMountParams {
+    pub metadata_ttl_ms: u64,
+    pub read_only: bool,
+    pub security: NfsSecurity,
+    /// Optional cooperative stop handle; see [`MountShutdown`].
+    pub shutdown: Option<MountShutdown>,
+}
+
 pub async fn mount_nfs_with_callback<F>(
     virtual_fs: Arc<VirtualFs>,
     mount_point: &Path,
-    metadata_ttl_ms: u64,
-    read_only: bool,
-    security: NfsSecurity,
+    params: NfsMountParams,
     daemon_guard: Option<&mut DaemonGuard>,
     mut on_event: F,
 ) -> std::io::Result<()>
 where
     F: FnMut(NfsMountEvent) + Send,
 {
+    let NfsMountParams {
+        metadata_ttl_ms,
+        read_only,
+        security,
+        shutdown,
+    } = params;
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs, read_only, security.clone());
     let pool_for_shutdown = adapter.handle_pool.clone();
@@ -653,6 +718,17 @@ where
     // Convert ms to seconds (rounding up so 100ms → 1s, not 0s which disables caching entirely)
     let actimeo = metadata_ttl_ms.div_ceil(1000);
 
+    // A stop request that lands before the mount command runs aborts cleanly
+    // instead of mounting and immediately tearing down.
+    if shutdown.as_ref().is_some_and(MountShutdown::is_requested) {
+        server_handle.abort();
+        on_event(NfsMountEvent::ShuttingDown {
+            reason: "stop requested".to_string(),
+        });
+        vfs_for_shutdown.shutdown();
+        return Ok(());
+    }
+
     // Platform-specific mount command
     #[cfg(target_os = "macos")]
     {
@@ -672,9 +748,28 @@ where
         on_event(NfsMountEvent::MountCommand {
             command: format!("{} -o {} {} {}", mount_cmd.display(), opts, nfs_export, mount_point_str),
         });
-        let status = std::process::Command::new(mount_cmd)
+        let mut command = tokio::process::Command::new(mount_cmd);
+        command
             .args(["-o", &opts, &nfs_export, mount_point_str])
-            .status()?;
+            .kill_on_drop(true);
+        // Race the mount command against a stop request so a hung mount_nfs
+        // cannot pin the shutdown; kill_on_drop reaps the child on cancel.
+        let status = tokio::select! {
+            // A mount command that completed in the same poll must win over a
+            // concurrent stop, otherwise we could tear the server down while the
+            // client mount it just established stays behind. When it wins here
+            // the still-pending stop is handled by the wait loop, which unmounts.
+            biased;
+            status = command.status() => status?,
+            _ = wait_for_shutdown(shutdown.as_ref()) => {
+                server_handle.abort();
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "stop requested".to_string(),
+                });
+                vfs_for_shutdown.shutdown();
+                return Ok(());
+            }
+        };
         if !status.success() {
             server_handle.abort();
             return Err(std::io::Error::other(format!("mount command failed with {status}")));
@@ -690,14 +785,33 @@ where
         on_event(NfsMountEvent::MountCommand {
             command: format!("mount.nfs -o {mount_opts} {nfs_export} {mount_point_str}"),
         });
-        let output = if unsafe { libc::getuid() } == 0 {
-            std::process::Command::new("mount.nfs")
-                .args(["-o", &mount_opts, &nfs_export, mount_point_str])
-                .output()?
+        let mut command = if unsafe { libc::getuid() } == 0 {
+            let mut command = tokio::process::Command::new("mount.nfs");
+            command.args(["-o", &mount_opts, &nfs_export, mount_point_str]);
+            command
         } else {
-            std::process::Command::new("sudo")
-                .args(["-n", "mount.nfs", "-o", &mount_opts, &nfs_export, mount_point_str])
-                .output()?
+            let mut command = tokio::process::Command::new("sudo");
+            command.args(["-n", "mount.nfs", "-o", &mount_opts, &nfs_export, mount_point_str]);
+            command
+        };
+        command.kill_on_drop(true);
+        // Race the mount command against a stop request so a hung mount.nfs
+        // cannot pin the shutdown; kill_on_drop reaps the child on cancel.
+        let output = tokio::select! {
+            // A mount command that completed in the same poll must win over a
+            // concurrent stop, otherwise we could tear the server down while the
+            // client mount it just established stays behind. When it wins here
+            // the still-pending stop is handled by the wait loop, which unmounts.
+            biased;
+            output = command.output() => output?,
+            _ = wait_for_shutdown(shutdown.as_ref()) => {
+                server_handle.abort();
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "stop requested".to_string(),
+                });
+                vfs_for_shutdown.shutdown();
+                return Ok(());
+            }
         };
         if !output.status.success() {
             server_handle.abort();
@@ -740,7 +854,19 @@ where
             );
         } else {
             info!("Running: {cmd}");
-            let output = mount_windows_nfs_with_retry(&mount_cmd, &opts, &share, &mount_target).await?;
+            // `None` means a stop request cancelled the mount — a clean stop,
+            // not a failure.
+            let Some(output) =
+                mount_windows_nfs_with_retry(&mount_cmd, &opts, &share, &mount_target, shutdown.as_ref()).await?
+            else {
+                server_handle.abort();
+                portmapper_handle.abort();
+                on_event(NfsMountEvent::ShuttingDown {
+                    reason: "stop requested".to_string(),
+                });
+                vfs_for_shutdown.shutdown();
+                return Ok(());
+            };
             if !output.status.success() {
                 server_handle.abort();
                 portmapper_handle.abort();
@@ -757,14 +883,21 @@ where
         }
     }
 
-    info!("NFS mount active at {}", mount_point_str);
-    on_event(NfsMountEvent::Mounted {
-        mount_point: mount_point_str.to_string(),
-    });
+    if skip_auto_mount {
+        // The server and portmapper are up but no client mount exists yet (the
+        // user mounts manually), so we must not claim Mounted or signal
+        // readiness — both would advertise a live mount that isn't there.
+        info!("NFS server is ready; waiting for a manual mount of {}", mount_point_str);
+    } else {
+        info!("NFS mount active at {}", mount_point_str);
+        on_event(NfsMountEvent::Mounted {
+            mount_point: mount_point_str.to_string(),
+        });
 
-    // Signal the parent process that the mount is live (daemon mode).
-    if let Some(guard) = daemon_guard {
-        guard.notify_ready();
+        // Signal the parent process that the mount is live (daemon mode).
+        if let Some(guard) = daemon_guard {
+            guard.notify_ready();
+        }
     }
 
     // Wait for unmount signal, server exit, or Ctrl+C.
@@ -782,6 +915,13 @@ where
     let mut server_handle = server_handle;
     tokio::pin!(sigterm_fut);
     let mut server_exited = false;
+    // The liveness probe runs as its own select arm: a probe that wedges on a
+    // dead mount must not keep the shutdown/signal/UMNT branches from running.
+    let mut probe_handle: Option<tokio::task::JoinHandle<bool>> = None;
+    // Shutdown-time unmounts are offloaded to a blocking task and awaited
+    // (bounded) after the loop, so a wedged umount can't delay the break and
+    // the subsequent server/portmapper/VFS teardown.
+    let mut unmount_task: Option<tokio::task::JoinHandle<bool>> = None;
     loop {
         tokio::select! {
             msg = mount_rx.recv() => {
@@ -806,22 +946,25 @@ where
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C, unmounting...");
-                on_event(NfsMountEvent::ShuttingDown {
-                    reason: "Ctrl+C received".to_string(),
-                });
-                unmount_nfs(mount_point_str);
+                on_event(NfsMountEvent::ShuttingDown { reason: "Ctrl+C received".to_string() });
+                unmount_task = Some(spawn_unmount(mount_point_str));
                 break;
             }
             _ = &mut sigterm_fut => {
                 info!("Received SIGTERM, unmounting...");
-                on_event(NfsMountEvent::ShuttingDown {
-                    reason: "termination signal received".to_string(),
-                });
-                unmount_nfs(mount_point_str);
+                on_event(NfsMountEvent::ShuttingDown { reason: "termination signal received".to_string() });
+                unmount_task = Some(spawn_unmount(mount_point_str));
                 break;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                if !skip_auto_mount && !is_mounted(mount_point_str) {
+            _ = wait_for_shutdown(shutdown.as_ref()) => {
+                info!("Shutdown requested, unmounting...");
+                on_event(NfsMountEvent::ShuttingDown { reason: "stop requested".to_string() });
+                unmount_task = Some(spawn_unmount(mount_point_str));
+                break;
+            }
+            mounted = async { probe_handle.as_mut().expect("probe arm is guarded").await }, if probe_handle.is_some() => {
+                probe_handle = None;
+                if !skip_auto_mount && !mounted.unwrap_or(false) {
                     info!("NFS mount disappeared, shutting down");
                     on_event(NfsMountEvent::ShuttingDown {
                         reason: "mount disappeared".to_string(),
@@ -829,6 +972,33 @@ where
                     break;
                 }
             }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if probe_handle.is_none() => {
+                // The probe touches the (possibly wedged) mount, so it runs on
+                // the blocking pool and is awaited by the arm above.
+                let probe_path = mount_point_str.to_string();
+                probe_handle = Some(tokio::task::spawn_blocking(move || is_mounted(&probe_path)));
+            }
+        }
+    }
+    // An in-flight probe is abandoned here; its blocking thread finishes (or
+    // unwedges) on its own and only returns a bool nobody reads.
+    drop(probe_handle);
+
+    // Await the shutdown-time unmount (if any) before tearing the server down,
+    // so the server can still service the UMNT RPC — but bound the wait so a
+    // wedged umount can't pin teardown indefinitely.
+    if let Some(task) = unmount_task {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), task).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => tracing::warn!(
+                "unmount of {} failed during shutdown; manual cleanup (umount -f) may be required",
+                mount_point_str
+            ),
+            Ok(Err(e)) => tracing::warn!("unmount task for {} failed: {}", mount_point_str, e),
+            Err(_) => tracing::warn!(
+                "unmount of {} timed out during shutdown; proceeding with teardown",
+                mount_point_str
+            ),
         }
     }
 
@@ -1027,8 +1197,17 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
     }
 }
 
-/// Check if a path is still an active mount point.
-fn unmount_nfs(mount_point: &str) {
+/// Run the (blocking) unmount on the blocking pool so a wedged external
+/// `umount` can't stall the async shutdown path. Returns a handle the caller
+/// awaits with a bounded timeout.
+fn spawn_unmount(mount_point: &str) -> tokio::task::JoinHandle<bool> {
+    let mount_point = mount_point.to_string();
+    tokio::task::spawn_blocking(move || unmount_nfs(&mount_point))
+}
+
+/// Unmount `mount_point`, trying the platform syscall first and an external
+/// command as fallback. Returns `true` when one of them reported success.
+fn unmount_nfs(mount_point: &str) -> bool {
     #[cfg(unix)]
     use std::ffi::CString;
 
@@ -1038,49 +1217,87 @@ fn unmount_nfs(mount_point: &str) {
         #[cfg(target_os = "linux")]
         {
             if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
-                return;
+                return true;
             }
         }
         #[cfg(target_os = "macos")]
         {
             if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
-                return;
+                return true;
             }
         }
     }
 
     // Fallback: external command.
     #[cfg(target_os = "macos")]
-    if let Err(e) = std::process::Command::new("/sbin/umount").arg(mount_point).status() {
-        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
-    }
+    let result = std::process::Command::new("/sbin/umount").arg(mount_point).status();
     #[cfg(target_os = "linux")]
-    {
-        let result = if unsafe { libc::getuid() } == 0 {
-            std::process::Command::new("umount").arg(mount_point).status()
-        } else {
-            std::process::Command::new("sudo")
-                .args(["-n", "umount", mount_point])
-                .status()
-        };
-        if let Err(e) = result {
-            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
-        }
-    }
+    let result = if unsafe { libc::getuid() } == 0 {
+        std::process::Command::new("umount").arg(mount_point).status()
+    } else {
+        std::process::Command::new("sudo")
+            .args(["-n", "umount", mount_point])
+            .status()
+    };
     #[cfg(windows)]
-    if let Err(e) = std::process::Command::new(umount_command_path())
+    let result = std::process::Command::new(umount_command_path())
         .args(["-f", &windows_nfs_mount_target(mount_point)])
-        .status()
-    {
-        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+        .status();
+
+    match result {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            tracing::warn!("NFS unmount fallback for {} exited with {}", mount_point, status);
+            false
+        }
+        Err(e) => {
+            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+            false
+        }
     }
 }
 
-fn is_mounted(path: &str) -> bool {
+/// Whether `path` currently has an active mount: checked against the mount
+/// table on Linux, the statfs filesystem type on macOS, and a drive/directory
+/// probe on Windows. A bare existing directory does not count. Blocking on a
+/// wedged mount — keep it off latency-sensitive threads.
+#[cfg(target_os = "linux")]
+fn unescape_proc_mounts(raw: &str) -> String {
+    raw.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_mount_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn is_mounted(path: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
+        // /proc/mounts octal-escapes spaces/tabs in the mount point and may
+        // differ from `path` only by a trailing slash. Normalize both before
+        // comparing so an active mount isn't misread as "disappeared" (which
+        // would fire the shutdown path). String-only — no canonicalize, which
+        // could block on a wedged mount.
+        let wanted = normalize_mount_path(path);
         std::fs::read_to_string("/proc/mounts")
-            .map(|s| s.lines().any(|line| line.split_whitespace().nth(1) == Some(path)))
+            .map(|contents| {
+                contents.lines().any(|line| {
+                    line.split_whitespace()
+                        .nth(1)
+                        .map(unescape_proc_mounts)
+                        .map(|mount| normalize_mount_path(&mount))
+                        .is_some_and(|mount| mount == wanted)
+                })
+            })
             .unwrap_or(false)
     }
     #[cfg(target_os = "macos")]
@@ -1112,6 +1329,66 @@ fn is_mounted(path: &str) -> bool {
     }
 }
 
+/// Whether `path` is mounted by *our* local loopback NFS export (device
+/// `127.0.0.1:`), as opposed to an unrelated filesystem mounted at the same
+/// location. Used to confirm ownership before a speculative cleanup unmount so
+/// a stop never detaches a pre-existing mount. Blocking on a wedged mount —
+/// keep it off latency-sensitive threads.
+pub fn is_loopback_nfs_mount(path: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let wanted = normalize_mount_path(path);
+        std::fs::read_to_string("/proc/mounts")
+            .map(|contents| {
+                contents.lines().any(|line| {
+                    let mut fields = line.split_whitespace();
+                    let device = fields.next();
+                    let mount = fields
+                        .next()
+                        .map(unescape_proc_mounts)
+                        .map(|mount| normalize_mount_path(&mount));
+                    mount.as_deref() == Some(wanted.as_str())
+                        && device.is_some_and(|device| device.starts_with("127.0.0.1:"))
+                })
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{CStr, CString};
+        use std::mem::MaybeUninit;
+        let c_path = match CString::new(path) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        unsafe {
+            let mut buf = MaybeUninit::<libc::statfs>::uninit();
+            if libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) != 0 {
+                return false;
+            }
+            let buf = buf.assume_init();
+            let fstype = CStr::from_ptr(buf.f_fstypename.as_ptr());
+            if fstype.to_bytes() != b"nfs" {
+                return false;
+            }
+            let from = CStr::from_ptr(buf.f_mntfromname.as_ptr());
+            from.to_bytes().starts_with(b"127.0.0.1:")
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows drive-letter mounts don't expose the NFS source cheaply; fall
+        // back to the best-effort mount probe. A drive letter the user assigned
+        // to our mount is unlikely to collide with an unrelated mount.
+        is_mounted(path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn mount_nfs_command_path() -> std::path::PathBuf {
     std::path::PathBuf::from("/sbin/mount_nfs")
@@ -1132,30 +1409,47 @@ const WINDOWS_ERROR_53_RETRY_ATTEMPTS: usize = 6;
 #[cfg(windows)]
 const WINDOWS_ERROR_53_RETRY_DELAY_MS: u64 = 300;
 
+/// Run `mount.exe`, retrying transient Network Error 53. Returns `Ok(None)`
+/// when a stop request cancelled the mount (a clean stop, not a failure);
+/// both the command itself and the backoff sleeps are interruptible.
 #[cfg(windows)]
 async fn mount_windows_nfs_with_retry(
     mount_cmd: &Path,
     opts: &str,
     share: &str,
     mount_target: &str,
-) -> std::io::Result<std::process::Output> {
-    for attempt in 1..=WINDOWS_ERROR_53_RETRY_ATTEMPTS {
-        let output = tokio::process::Command::new(mount_cmd)
-            .args(["-o", opts, share, mount_target])
-            .output()
-            .await?;
+    shutdown: Option<&MountShutdown>,
+) -> std::io::Result<Option<std::process::Output>> {
+    let mut attempt = 1;
+    loop {
+        if shutdown.is_some_and(MountShutdown::is_requested) {
+            return Ok(None);
+        }
+
+        let mut command = tokio::process::Command::new(mount_cmd);
+        command.args(["-o", opts, share, mount_target]).kill_on_drop(true);
+        let output = tokio::select! {
+            // A successful mount.exe in the same poll must win over a concurrent
+            // stop; the caller's wait loop then unmounts it. Otherwise the
+            // attempt could be reported as cancelled while the mount stayed live.
+            biased;
+            output = command.output() => output?,
+            _ = wait_for_shutdown(shutdown) => return Ok(None),
+        };
 
         if output.status.success()
             || !windows_mount_output_is_network_error_53(&output)
             || attempt == WINDOWS_ERROR_53_RETRY_ATTEMPTS
         {
-            return Ok(output);
+            return Ok(Some(output));
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(WINDOWS_ERROR_53_RETRY_DELAY_MS)).await;
+        attempt += 1;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(WINDOWS_ERROR_53_RETRY_DELAY_MS)) => {}
+            _ = wait_for_shutdown(shutdown) => return Ok(None),
+        }
     }
-
-    unreachable!("mount retry loop always returns on the final attempt")
 }
 
 #[cfg(windows)]
@@ -1191,13 +1485,7 @@ fn windows_nfs_share(export_name: &str) -> String {
 }
 
 #[cfg(windows)]
-fn windows_system32_exe(name: &str) -> std::path::PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
-        .join("System32")
-        .join(name)
-}
+use crate::windows::{drive_letter as windows_drive_letter, system32_exe as windows_system32_exe};
 
 #[cfg(windows)]
 fn windows_nfs_mount_target(path: &str) -> String {
@@ -1212,20 +1500,6 @@ fn windows_nfs_probe_path(path: &str) -> String {
     match windows_drive_letter(path) {
         Some(drive) => format!("{drive}:\\"),
         None => path.to_string(),
-    }
-}
-
-#[cfg(windows)]
-fn windows_drive_letter(path: &str) -> Option<char> {
-    let mut chars = path.chars();
-    let drive = chars.next()?;
-    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
-        return None;
-    }
-    match (chars.next(), chars.next()) {
-        (None, None) => Some(drive),
-        (Some('\\' | '/'), None) => Some(drive),
-        _ => None,
     }
 }
 
@@ -1320,6 +1594,37 @@ mod tests {
             export_name: "hf-mount-test".to_string(),
             filehandle_secret: [7; 16],
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_mounts_unescape_handles_octal_escapes() {
+        // /proc/mounts octal-escapes space, tab, newline and backslash; the
+        // liveness probe must decode them or an active mount reads as gone.
+        assert_eq!(unescape_proc_mounts(r"/mnt/with\040space"), "/mnt/with space");
+        assert_eq!(unescape_proc_mounts(r"/mnt/tab\011here"), "/mnt/tab\there");
+        assert_eq!(unescape_proc_mounts(r"/mnt/nl\012here"), "/mnt/nl\nhere");
+        assert_eq!(unescape_proc_mounts(r"/mnt/back\134slash"), r"/mnt/back\slash");
+        assert_eq!(unescape_proc_mounts(r"/a\040b\011c\134d"), "/a b\tc\\d");
+        // Unescaped paths pass through unchanged.
+        assert_eq!(unescape_proc_mounts("/plain/path"), "/plain/path");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_mounts_normalize_trims_trailing_slashes() {
+        assert_eq!(normalize_mount_path("/foo/"), "/foo");
+        assert_eq!(normalize_mount_path("/foo///"), "/foo");
+        assert_eq!(normalize_mount_path("/foo"), "/foo");
+        // Root must survive rather than collapse to an empty string.
+        assert_eq!(normalize_mount_path("/"), "/");
+        assert_eq!(normalize_mount_path("///"), "/");
+        // A path differing from the table only by a trailing slash compares
+        // equal after normalization — the false-disappearance regression.
+        assert_eq!(
+            normalize_mount_path("/tmp/hf-mount/"),
+            normalize_mount_path("/tmp/hf-mount")
+        );
     }
 
     #[test]

@@ -206,17 +206,40 @@ impl Drop for StagingRoot {
 }
 
 impl StagingDir {
-    pub fn new(cache_dir: &Path, max_bytes: u64) -> Self {
+    pub fn new(cache_dir: &Path, max_bytes: u64) -> crate::error::Result<Self> {
+        std::fs::create_dir_all(cache_dir)
+            .map_err(|e| crate::error::Error::Setup(format!("failed to create cache dir {cache_dir:?}: {e}")))?;
+
         // Random per-mount subdir so two mounts sharing cache_dir, or a mount
         // started after a crashed previous one, never see each other's files.
-        let dir = cache_dir.join(format!("staging-{:016x}", rand_u64()));
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
+        // Create it exclusively (not create_dir_all) so a name collision never
+        // silently shares one staging root between mounts — StagingRoot::drop
+        // would otherwise delete another mount's live files.
+        let mut dir = None;
+        for _ in 0..16 {
+            let candidate = cache_dir.join(format!("staging-{:016x}", rand_u64()));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => {
+                    dir = Some(candidate);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(crate::error::Error::Setup(format!(
+                        "failed to create staging dir {candidate:?}: {e}"
+                    )));
+                }
+            }
+        }
+        let dir = dir.ok_or_else(|| {
+            crate::error::Error::Setup("failed to create a unique staging dir after 16 attempts".to_string())
+        })?;
 
-        Self {
+        Ok(Self {
             root: Arc::new(StagingRoot { dir }),
             bytes_used: Arc::new(AtomicU64::new(0)),
             max_bytes,
-        }
+        })
     }
 
     /// Root directory of the staging area.

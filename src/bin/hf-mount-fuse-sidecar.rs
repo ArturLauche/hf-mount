@@ -126,7 +126,13 @@ fn main() {
     // One tokio runtime shared across all volumes. Each `build_with_runtime`
     // call below borrows its handle, avoiding N full multi-threaded runtimes
     // (~4 worker threads each) for N volumes. See #96.
-    let runtime = build_runtime();
+    let runtime = match build_runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            error!("Failed to create tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let pending = wait_for_configs(&args.tmp_dir, args.poll_secs, args.timeout_secs, args.expected_mounts);
     if pending.is_empty() {
@@ -163,8 +169,20 @@ fn main() {
         error_paths.push(error_path.clone());
         let vfs_registry = Arc::clone(&vfs_registry);
         let rt_handle = runtime.handle().clone();
+        let panic_error_path = error_path.clone();
+        let panic_label = label.clone();
         handles.push(std::thread::spawn(move || {
-            run_mount(fuse_fds, mount.mount_args, error_path, vfs_registry, rt_handle);
+            // The readiness wait loop below has no timeout, so a panic that
+            // unwound this thread before `run_mount` wrote its ready or error
+            // marker would hang pod readiness forever. Convert a last-resort
+            // panic (e.g. an `expect` deep in client construction) into an error
+            // marker so the wait loop sees the failure and reports it.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_mount(fuse_fds, mount.mount_args, error_path, vfs_registry, rt_handle);
+            }));
+            if outcome.is_err() {
+                write_error(&panic_error_path, &format!("Mount thread panicked for {}", panic_label));
+            }
         }));
     }
 
@@ -388,22 +406,12 @@ fn run_mount(
 ) {
     let label = mount_args.source.label();
 
-    // build_with_runtime() panics on auth/config errors (e.g. invalid token,
-    // CAS 401). Catch the panic so we can write the error to the error file
-    // for the CSI driver to report as FailedMount.
-    let setup = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build_with_runtime(mount_args.source, mount_args.options, false, runtime)
-    })) {
+    // Auth/config errors (e.g. invalid token, CAS 401) are written to the
+    // error file for the CSI driver to report as FailedMount.
+    let setup = match build_with_runtime(mount_args.source, mount_args.options, false, runtime) {
         Ok(s) => s,
-        Err(panic) => {
-            let msg = match panic.downcast_ref::<String>() {
-                Some(s) => s.clone(),
-                None => match panic.downcast_ref::<&str>() {
-                    Some(s) => s.to_string(),
-                    None => "unknown panic".to_string(),
-                },
-            };
-            write_error(&error_path, &format!("Setup failed for {}: {}", label, msg));
+        Err(e) => {
+            write_error(&error_path, &format!("Setup failed for {}: {}", label, e));
             return;
         }
     };

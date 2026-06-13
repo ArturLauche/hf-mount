@@ -20,14 +20,22 @@ fn trusted_state_dir_from_home(home: &Path) -> std::io::Result<PathBuf> {
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("HOME {} must be a trusted directory, not a symlink or file", home.display()),
+            format!(
+                "HOME {} must be a trusted directory, not a symlink or file",
+                home.display()
+            ),
         ));
     }
     let uid = unsafe { libc::getuid() };
     if meta.uid() != uid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("HOME {} is owned by uid {}, expected {}", home.display(), meta.uid(), uid),
+            format!(
+                "HOME {} is owned by uid {}, expected {}",
+                home.display(),
+                meta.uid(),
+                uid
+            ),
         ));
     }
     if meta.mode() & 0o022 != 0 {
@@ -120,7 +128,12 @@ fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
     if meta.uid() != uid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("state directory {} is owned by uid {}, expected {}", path.display(), meta.uid(), uid),
+            format!(
+                "state directory {} is owned by uid {}, expected {}",
+                path.display(),
+                meta.uid(),
+                uid
+            ),
         ));
     }
     let mode = meta.mode() & 0o777;
@@ -139,10 +152,7 @@ fn prepare_state_dir(path: &Path) -> std::io::Result<()> {
 }
 
 fn open_no_follow_read(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+    OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)
 }
 
 fn read_to_string_no_follow(path: &Path) -> std::io::Result<String> {

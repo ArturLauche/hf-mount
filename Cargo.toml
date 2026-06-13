@@ -63,7 +63,7 @@ required-features = ["nfs"]
 
 [[bin]]
 name = "hf-mount-gui"
-path = "src/bin/hf-mount-gui.rs"
+path = "src/bin/hf-mount-gui/main.rs"
 required-features = ["nfs", "gui"]
 
 [[bin]]
