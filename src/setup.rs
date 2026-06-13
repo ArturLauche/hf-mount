@@ -339,12 +339,11 @@ pub fn init_tracing(daemon: bool) {
 /// Async tasks live on the heap, so the per-thread stack only needs to fit
 /// the deepest sync call. 512 KB is ample and shrinks the per-worker virtual
 /// reservation from the 2 MB default.
-pub fn build_runtime() -> tokio::runtime::Runtime {
+pub fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(512 * 1024)
         .enable_all()
         .build()
-        .expect("Failed to create tokio runtime")
 }
 
 /// Build tokio runtime, storage client, Hub client, and VFS.
@@ -353,7 +352,7 @@ pub fn build_runtime() -> tokio::runtime::Runtime {
 /// Owns the runtime it creates. Use `build_with_runtime` to share one runtime
 /// across multiple volumes (sidecar mode).
 pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> Result<MountSetup> {
-    let runtime = build_runtime();
+    let runtime = build_runtime().map_err(|e| setup_err(format!("failed to create tokio runtime: {e}")))?;
     let mut setup = build_with_runtime(source, options, is_nfs, runtime.handle().clone())?;
     setup._owned_runtime = OwnedRuntime(Some(runtime));
     Ok(setup)

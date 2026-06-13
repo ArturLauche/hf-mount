@@ -235,16 +235,25 @@ pub fn worker_process_alive(pid: u32, _marker: &str) -> bool {
         .ok()
         .and_then(|exe| exe.file_name().map(|name| name.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "hf-mount-gui.exe".to_string());
-    let pid_field = format!(",\"{pid}\",");
+    let pid_text = pid.to_string();
+    // tasklist CSV rows are "image","pid","session","sessnum","memusage".
+    // Parse columns 0 (image) and 1 (pid) explicitly rather than substring-
+    // matching the whole row, which could match the pid value in another field.
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout.lines().any(|line| {
-        line.contains(&pid_field)
-            && line
-                .trim_start()
-                .strip_prefix('"')
-                .and_then(|rest| rest.split('"').next())
-                .is_some_and(|image| image.eq_ignore_ascii_case(&exe_name))
+        let mut fields = tasklist_csv_fields(line);
+        let image = fields.next();
+        let row_pid = fields.next();
+        image.is_some_and(|image| image.eq_ignore_ascii_case(&exe_name)) && row_pid == Some(pid_text.as_str())
     })
+}
+
+/// Yield the quoted, comma-separated fields of a single tasklist CSV row,
+/// stripping the surrounding double quotes. tasklist does not emit embedded
+/// quotes in these columns, so a simple `","` split is sufficient.
+#[cfg(windows)]
+fn tasklist_csv_fields(line: &str) -> std::str::Split<'_, &'static str> {
+    line.trim().trim_start_matches('"').trim_end_matches('"').split("\",\"")
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]

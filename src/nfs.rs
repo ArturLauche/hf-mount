@@ -901,6 +901,10 @@ where
     // The liveness probe runs as its own select arm: a probe that wedges on a
     // dead mount must not keep the shutdown/signal/UMNT branches from running.
     let mut probe_handle: Option<tokio::task::JoinHandle<bool>> = None;
+    // Shutdown-time unmounts are offloaded to a blocking task and awaited
+    // (bounded) after the loop, so a wedged umount can't delay the break and
+    // the subsequent server/portmapper/VFS teardown.
+    let mut unmount_task: Option<tokio::task::JoinHandle<bool>> = None;
     loop {
         tokio::select! {
             msg = mount_rx.recv() => {
@@ -925,20 +929,20 @@ where
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C, unmounting...");
-                let reason = unmount_for_shutdown(mount_point_str, "Ctrl+C received");
-                on_event(NfsMountEvent::ShuttingDown { reason });
+                on_event(NfsMountEvent::ShuttingDown { reason: "Ctrl+C received".to_string() });
+                unmount_task = Some(spawn_unmount(mount_point_str));
                 break;
             }
             _ = &mut sigterm_fut => {
                 info!("Received SIGTERM, unmounting...");
-                let reason = unmount_for_shutdown(mount_point_str, "termination signal received");
-                on_event(NfsMountEvent::ShuttingDown { reason });
+                on_event(NfsMountEvent::ShuttingDown { reason: "termination signal received".to_string() });
+                unmount_task = Some(spawn_unmount(mount_point_str));
                 break;
             }
             _ = wait_for_shutdown(shutdown.as_ref()) => {
                 info!("Shutdown requested, unmounting...");
-                let reason = unmount_for_shutdown(mount_point_str, "stop requested");
-                on_event(NfsMountEvent::ShuttingDown { reason });
+                on_event(NfsMountEvent::ShuttingDown { reason: "stop requested".to_string() });
+                unmount_task = Some(spawn_unmount(mount_point_str));
                 break;
             }
             mounted = async { probe_handle.as_mut().expect("probe arm is guarded").await }, if probe_handle.is_some() => {
@@ -962,6 +966,24 @@ where
     // An in-flight probe is abandoned here; its blocking thread finishes (or
     // unwedges) on its own and only returns a bool nobody reads.
     drop(probe_handle);
+
+    // Await the shutdown-time unmount (if any) before tearing the server down,
+    // so the server can still service the UMNT RPC — but bound the wait so a
+    // wedged umount can't pin teardown indefinitely.
+    if let Some(task) = unmount_task {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), task).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => tracing::warn!(
+                "unmount of {} failed during shutdown; manual cleanup (umount -f) may be required",
+                mount_point_str
+            ),
+            Ok(Err(e)) => tracing::warn!("unmount task for {} failed: {}", mount_point_str, e),
+            Err(_) => tracing::warn!(
+                "unmount of {} timed out during shutdown; proceeding with teardown",
+                mount_point_str
+            ),
+        }
+    }
 
     // Stop the NFS server task explicitly; dropping the JoinHandle does not
     // cancel a tokio task.
@@ -1158,20 +1180,12 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
     }
 }
 
-/// Check if a path is still an active mount point.
-/// Best-effort unmount during shutdown. Returns the `ShuttingDown` reason,
-/// flagging a failed unmount so users know the target may need manual cleanup
-/// — the server is torn down either way, so a leftover mount goes stale.
-fn unmount_for_shutdown(mount_point: &str, cause: &str) -> String {
-    if unmount_nfs(mount_point) {
-        cause.to_string()
-    } else {
-        tracing::warn!(
-            "unmount of {} failed during shutdown; manual cleanup (umount -f) may be required",
-            mount_point
-        );
-        format!("{cause}; unmount failed — {mount_point} may need manual cleanup (umount -f)")
-    }
+/// Run the (blocking) unmount on the blocking pool so a wedged external
+/// `umount` can't stall the async shutdown path. Returns a handle the caller
+/// awaits with a bounded timeout.
+fn spawn_unmount(mount_point: &str) -> tokio::task::JoinHandle<bool> {
+    let mount_point = mount_point.to_string();
+    tokio::task::spawn_blocking(move || unmount_nfs(&mount_point))
 }
 
 /// Unmount `mount_point`, trying the platform syscall first and an external

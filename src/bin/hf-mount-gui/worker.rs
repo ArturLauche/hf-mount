@@ -76,7 +76,22 @@ pub fn read_worker_status() -> Result<Option<WorkerStatus>, String> {
             return Ok(None);
         }
 
-        let bytes = std::fs::read(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            // NotFound/PermissionDenied can surface mid-replace on Windows even
+            // though path.exists() just succeeded — treat as a transient race.
+            Err(e)
+                if attempt < 2
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+        };
         match serde_json::from_slice(&bytes) {
             Ok(status) => return Ok(Some(status)),
             Err(_) if attempt < 2 => std::thread::sleep(Duration::from_millis(10)),
@@ -240,9 +255,30 @@ pub fn run_background_worker() -> Result<(), String> {
     crate::util::init_backend_once();
 
     append_worker_log("Background worker starting");
-    let profile = load_mount_profile()?.ok_or_else(|| "No saved mount settings were found.".to_string())?;
-    let source = profile_mount_source(&profile)?;
-    let options = profile_mount_options(&profile)?;
+
+    // These run before any worker-owned status exists, so a failure here would
+    // otherwise leave the GUI's provisional `Mounting` claim live for the whole
+    // staleness window. Overwrite it with a `Failed` record on any early error.
+    let early_setup = || -> Result<_, String> {
+        let profile = load_mount_profile()?.ok_or_else(|| "No saved mount settings were found.".to_string())?;
+        let source = profile_mount_source(&profile)?;
+        let options = profile_mount_options(&profile)?;
+        Ok((source, options))
+    };
+    let (source, options) = match early_setup() {
+        Ok(parts) => parts,
+        Err(e) => {
+            append_worker_log(format!("Background worker failed to start: {e}"));
+            let _ = write_worker_status(
+                WorkerState::Failed,
+                "Background worker failed to start",
+                &e,
+                None,
+                Some(std::process::id()),
+            );
+            return Err(e);
+        }
+    };
     let worker_mount_point = source.mount_point().to_path_buf();
     let mount_label = worker_mount_point.display().to_string();
     write_worker_status(

@@ -848,9 +848,18 @@ impl eframe::App for MountGuiApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.save_profile();
 
-        // Background mounts survive the window by design. Foreground mounts
-        // shut down cooperatively; give the backend a bounded grace period.
+        // Background mounts survive the window by design — but if the user
+        // just pressed Stop, `stop_mount` offloaded the unmount to a worker
+        // thread; let it finish (bounded) so closing the window doesn't abort
+        // the stop and leave a live mount behind.
         if self.active_background {
+            if let Some(handle) = self.stop_thread.take() {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                while !handle.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let _ = handle.join();
+            }
             return;
         }
         if let Some(shutdown) = &self.mount_shutdown {

@@ -26,6 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # This job runs on fork PRs; don't leave the workflow token in the
+          # local git config where later build/test steps could read it.
+          persist-credentials: false
 
       - name: Configure internal registries
         # Head-repo check: on fork PRs github.repository is the *base* repo,

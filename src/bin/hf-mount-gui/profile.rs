@@ -105,8 +105,13 @@ pub fn source_id_problem(source: GuiSource, source_id: &str) -> Option<&'static 
     if trimmed.starts_with('/') || trimmed.ends_with('/') {
         return Some("Remove the leading/trailing slash.");
     }
-    if source == GuiSource::Bucket && !trimmed.contains('/') {
-        return Some("Buckets are namespace/bucket, e.g. myuser/my-bucket.");
+    if source == GuiSource::Bucket {
+        // Buckets are exactly namespace/bucket — reject zero, one, or 3+ segments.
+        let mut parts = trimmed.split('/');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(namespace), Some(bucket), None) if !namespace.is_empty() && !bucket.is_empty() => {}
+            _ => return Some("Buckets are namespace/bucket, e.g. myuser/my-bucket."),
+        }
     }
     None
 }
@@ -240,6 +245,10 @@ mod tests {
         assert!(source_id_problem(GuiSource::Repo, "has space/model").is_some());
         assert!(source_id_problem(GuiSource::Repo, "/leading").is_some());
         assert!(source_id_problem(GuiSource::Bucket, "no-namespace").is_some());
+        // Buckets must be exactly namespace/bucket — reject extra segments and
+        // empty segments rather than deferring the failure to mount setup.
+        assert!(source_id_problem(GuiSource::Bucket, "namespace/bucket/extra").is_some());
+        assert!(source_id_problem(GuiSource::Bucket, "a//b").is_some());
         assert!(source_id_problem(GuiSource::Repo, "gpt2").is_none());
         assert!(source_id_problem(GuiSource::Repo, "openai-community/gpt2").is_none());
         assert!(source_id_problem(GuiSource::Bucket, "myuser/my-bucket").is_none());

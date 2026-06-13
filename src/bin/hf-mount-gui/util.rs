@@ -92,11 +92,9 @@ pub fn write_file_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp_path = temp_sibling_path(path);
     write_private_file(&temp_path, bytes).map_err(|e| format!("Failed to write {}: {e}", temp_path.display()))?;
 
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|e| format!("Failed to replace {}: {e}", path.display()))?;
-    }
-
+    // std::fs::rename replaces an existing destination atomically on Unix and
+    // via MoveFileExW(REPLACE_EXISTING) on Windows. Don't pre-delete the
+    // destination: a crash between delete and rename would lose the old file.
     std::fs::rename(&temp_path, path).map_err(|e| {
         let _ = std::fs::remove_file(&temp_path);
         format!("Failed to replace {} with {}: {e}", path.display(), temp_path.display())

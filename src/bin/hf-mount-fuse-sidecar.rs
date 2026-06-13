@@ -126,7 +126,13 @@ fn main() {
     // One tokio runtime shared across all volumes. Each `build_with_runtime`
     // call below borrows its handle, avoiding N full multi-threaded runtimes
     // (~4 worker threads each) for N volumes. See #96.
-    let runtime = build_runtime();
+    let runtime = match build_runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            error!("Failed to create tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let pending = wait_for_configs(&args.tmp_dir, args.poll_secs, args.timeout_secs, args.expected_mounts);
     if pending.is_empty() {
