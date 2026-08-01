@@ -25,7 +25,7 @@ jobs:
     # internal runners and skip on forks.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # This job runs on fork PRs; don't leave the workflow token in the
           # local git config where later build/test steps could read it.
@@ -97,7 +97,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_ENDPOINT: https://huggingface.co
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
@@ -132,7 +132,7 @@ jobs:
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -159,7 +159,7 @@ jobs:
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -187,7 +187,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_ENDPOINT: https://huggingface.co
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
@@ -228,19 +228,21 @@ jobs:
 
           PR="${{ github.event.pull_request.number }}"
           MARKER="<!-- pjdfstest-results -->"
-          BODY="${MARKER}
-          ## POSIX Compliance (pjdfstest)
 
-          \`\`\`
-          ${TABLES}
-          \`\`\`"
+          # Sanitize TABLES content by encoding it as JSON string
+          TABLES_JSON=$(jq -Rs . <<< "$TABLES")
+
+          BODY=$(jq -rn \
+            --arg marker "$MARKER" \
+            --argjson tables "$TABLES_JSON" \
+            '{marker: $marker, content: ("## POSIX Compliance (pjdfstest)\n\n```\n" + $tables + "\n```")} | .marker + "\n" + .content')
 
           COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
             --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
 
           if [ -n "$COMMENT_ID" ]; then
             gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
-              -X PATCH -f body="$BODY"
+              -X PATCH -F body="$BODY"
             echo "Updated existing comment $COMMENT_ID"
           else
             gh pr comment "$PR" --body "$BODY"
@@ -259,7 +261,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_ENDPOINT: https://huggingface.co
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Configure internal registries
         run: curl -sSL https://registries.huggingface.tech/setup.sh | bash
@@ -302,12 +304,14 @@ jobs:
 
           PR="${{ github.event.pull_request.number }}"
           MARKER="<!-- bench-results -->"
-          BODY="${MARKER}
-          ## Benchmark Results
 
-          \`\`\`
-          ${TABLES}
-          \`\`\`"
+          # Sanitize TABLES content by encoding it as JSON string
+          TABLES_JSON=$(jq -Rs . <<< "$TABLES")
+
+          BODY=$(jq -rn \
+            --arg marker "$MARKER" \
+            --argjson tables "$TABLES_JSON" \
+            '{marker: $marker, content: ("## Benchmark Results\n\n```\n" + $tables + "\n```")} | .marker + "\n" + .content')
 
           # Find existing comment with our marker
           COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
@@ -315,7 +319,7 @@ jobs:
 
           if [ -n "$COMMENT_ID" ]; then
             gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
-              -X PATCH -f body="$BODY"
+              -X PATCH -F body="$BODY"
             echo "Updated existing comment $COMMENT_ID"
           else
             gh pr comment "$PR" --body "$BODY"

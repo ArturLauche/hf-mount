@@ -310,6 +310,12 @@ fusermount -u /tmp/data          # FUSE (Linux)
 hf-mount stop /tmp/data          # daemon mounts
 ```
 
+### Graceful shutdown (SIGTERM / CSI sidecar)
+
+On `SIGTERM` the sidecar bounds the dirty-data flush (`--flush-shutdown-timeout-ms`) and **disarms the kernel-cache invalidators** before draining. This is deliberate: a `FUSE_NOTIFY_INVAL_INODE` writev issued during teardown can block uninterruptibly in the kernel (waiting on a folio under writeback the exiting daemon can no longer complete), leaving a `D`-state thread that even `exit_group` can't reap — an unkillable pod. Disarming the invalidator avoids creating that wedge; the CSI driver aborting the FUSE connection on `NodeUnpublishVolume` is the kernel-level backstop for any already-in-flight notify.
+
+The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not just on shutdown): when the poll loop detects a remote change to a file the app currently has open, a full page-cache invalidation blocks in-kernel on a folio lock held by the app's in-flight `read()`, which is itself waiting for the daemon — a deadlock. Two guards prevent this: invalidations targeting an inode with open handles drop **attributes only** (a negative-offset notify the kernel never lets touch pages), and the blocking writev runs on the runtime's blocking pool rather than a core worker, so it can never starve FUSE request servicing. The trade-off: a file with a long-lived open handle won't see remote content updates refreshed in its page cache until the handle closes. On close-and-reopen the kernel revalidates the (attr-only-invalidated) attributes and, via the negotiated `FUSE_AUTO_INVAL_DATA`, drops the stale pages itself when it sees the new mtime/size — so a stale read only persists if a remote content change preserves *both* mtime and size on a file that was open at the moment of the change.
+
 ### Options
 
 | Flag | Default | Description |
@@ -318,15 +324,20 @@ hf-mount stop /tmp/data          # daemon mounts
 | `--hub-endpoint` | `https://huggingface.co` | Hub API endpoint |
 | `--cache-dir` | user cache dir + `hf-mount` | Local cache directory, created owner-private |
 | `--cache-size` | `10000000000` (~10 GB) | Max on-disk chunk cache size in bytes |
+| `--cache-mode` | `chunk` | Disk cache layer: `chunk` (xet-core xorb-range cache) or `file` (whole-file cache keyed by xet hash, avoids chunk-range fragmentation on warm reloads). Mutually exclusive; `file` disables the chunk cache. |
+| `--max-staging-size` | `0` (unlimited) | Max bytes for advanced-writes staging files before flushed files are garbage-collected (LRU by last-touched). `0` disables GC, so staging files persist as a read-after-write cache. Does not yet cover the HTTP download cache for non-Xet repo files. |
 | `--read-only` | `false` | Mount read-only (always on for repos) |
 | `--advanced-writes` | `false` | Enable staging files + async flush (random writes, seek, overwrite) |
 | `--poll-interval-secs` | `30` | Remote change polling interval (0 to disable) |
+| `--poll-listing-concurrency` | `4` | Max concurrent tree-listing requests per poll round. Main knob to throttle load on the Hub `/api` endpoint; lower it in shared environments where many mounts poll in parallel. |
 | `--max-threads` | `16` | Maximum FUSE worker threads (Linux only) |
 | `--metadata-ttl-ms` | `10000` | How long file metadata is cached before re-checking (ms) |
 | `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
 | `--flush-debounce-ms` | `2000` | Advanced writes: flush debounce delay (ms) |
 | `--flush-max-batch-window-ms` | `30000` | Advanced writes: max flush batch window (ms) |
+| `--flush-shutdown-timeout-ms` | `45000` | Advanced writes: max time the SIGTERM flush drain may run before abandoning unflushed data to guarantee exit. Must be < the pod's `terminationGracePeriodSeconds`, or a slow Hub/CAS backend keeps the FUSE connection alive past grace and strands the pod. |
 | `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
+| `--direct-io` | `false` | Bypass the kernel page cache (FOPEN_DIRECT_IO); every read goes through the FUSE handler. For benchmarking; not recommended in production (disables efficient mmap caching). |
 | `--no-filter-os-files` | `false` | Stop filtering OS junk files (.DS_Store, Thumbs.db, etc.) |
 | `--uid` / `--gid` | current user | Override UID/GID for mounted files |
 | `--fuse-allow-other` | `false` | Allow other local users to access a FUSE mount; by default FUSE mounts are owner-only |

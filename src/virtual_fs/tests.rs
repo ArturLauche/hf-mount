@@ -2463,6 +2463,48 @@ fn read_range_all_retries_exhausted() {
     });
 }
 
+/// A stalled CAS/CDN stream must not park the read forever: the read-fetch
+/// timeout fails it with EIO so the FUSE worker thread is freed. Without the
+/// timeout the worker would block indefinitely and, once every worker is
+/// blocked this way, the whole mount silently wedges (cold reads return
+/// nothing while `ls` still works). The outer `timeout` guard turns a
+/// regression (unbounded wait) into a deterministic test failure instead of a
+/// hung CI run.
+#[test]
+fn read_stalled_stream_times_out_with_eio() {
+    let hub = MockHub::new();
+    let content: Vec<u8> = (0..=255).collect();
+    hub.add_file("data.bin", content.len() as u64, Some("h_stall"), None);
+    let xet = MockXet::new();
+    xet.add_file("h_stall", &content);
+    // Every opened stream hangs on next() (stalled connection).
+    xet.stall_stream_reads();
+
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub.clone(),
+        xet.clone(),
+        TestOpts {
+            read_fetch_timeout: Duration::from_millis(150),
+            ..Default::default()
+        },
+        &rt,
+    );
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "data.bin").await.unwrap();
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+
+        // Non-zero offset forces a range download. Bound the whole read so a
+        // regression fails the test deterministically rather than hanging.
+        let result = tokio::time::timeout(Duration::from_secs(10), vfs.read(fh, 64, 32)).await;
+        let read_result = result.expect("read() did not return — fetch was not bounded by the timeout");
+        assert_eq!(read_result.unwrap_err(), libc::EIO);
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
 // ── advanced write local read/write ─────────────────────────────────
 
 /// Advanced mode write at arbitrary offset (random write).
@@ -2825,7 +2867,7 @@ fn poll_calls_invalidator_for_updated_file() {
     let invalidated: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     {
         let sink = invalidated.clone();
-        vfs.set_invalidator(Box::new(move |ino| {
+        vfs.set_invalidator(Box::new(move |ino, _kind| {
             sink.lock().unwrap().push(ino);
         }));
     }
@@ -2934,6 +2976,128 @@ fn poll_skips_deletion_with_open_handles() {
             inodes.get(open_attr.ino).is_none(),
             "orphan should be removed after release"
         );
+    });
+}
+
+/// Regression for #195: a remote deletion of a file with open handles must
+/// invalidate that inode with `AttrOnly` (never a blocking page drop, which
+/// would deadlock against the in-flight read holding the inode's folio lock),
+/// while a file with no open handles is invalidated with `Pages`. The unlinked
+/// parent directory is always invalidated with `Pages`.
+#[test]
+fn poll_deletion_uses_attr_only_for_open_handles() {
+    let hub = MockHub::new_repo();
+    hub.add_file("open.txt", 10, Some("h1"), None);
+    hub.add_file("closed.txt", 20, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    let calls: Arc<std::sync::Mutex<Vec<(u64, InvalKind)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let sink = calls.clone();
+        vfs.set_invalidator(Box::new(move |ino, kind| {
+            sink.lock().unwrap().push((ino, kind));
+        }));
+    }
+
+    rt.block_on(async {
+        let open_attr = vfs.lookup(ROOT_INODE, "open.txt").await.unwrap();
+        let closed_attr = vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap();
+
+        // Hold an open handle on open.txt; closed.txt has none.
+        let fh = vfs.open(open_attr.ino, false, false, None).await.unwrap();
+
+        hub.remove_file("open.txt");
+        hub.remove_file("closed.txt");
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        // Snapshot (releasing the lock) so the guard isn't held across the await below.
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&(open_attr.ino, InvalKind::AttrOnly)),
+            "orphaned open inode must be invalidated AttrOnly (got {:?})",
+            recorded,
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|&(ino, k)| ino == open_attr.ino && k == InvalKind::Pages),
+            "orphaned open inode must never get a blocking Pages drop (got {:?})",
+            recorded,
+        );
+        assert!(
+            recorded.contains(&(closed_attr.ino, InvalKind::Pages)),
+            "deleted inode without handles must be invalidated Pages (got {:?})",
+            recorded,
+        );
+        assert!(
+            recorded.contains(&(ROOT_INODE, InvalKind::Pages)),
+            "unlinked parent dir must be invalidated Pages (got {:?})",
+            recorded,
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Regression for #195: a remote *update* of a file with open handles must also
+/// use `AttrOnly` — an updated open file deadlocks the same way as a deleted one
+/// if a full page invalidation races the in-flight read. A file with no open
+/// handle gets `Pages` so its stale cache is dropped.
+#[test]
+fn poll_update_uses_attr_only_for_open_handles() {
+    let hub = MockHub::new_repo();
+    hub.add_file("open.txt", 10, Some("old_a"), None);
+    hub.add_file("closed.txt", 10, Some("old_b"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_repo(&hub, &xet);
+
+    let calls: Arc<std::sync::Mutex<Vec<(u64, InvalKind)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let sink = calls.clone();
+        vfs.set_invalidator(Box::new(move |ino, kind| {
+            sink.lock().unwrap().push((ino, kind));
+        }));
+    }
+
+    rt.block_on(async {
+        let open_attr = vfs.lookup(ROOT_INODE, "open.txt").await.unwrap();
+        let closed_attr = vfs.lookup(ROOT_INODE, "closed.txt").await.unwrap();
+        let fh = vfs.open(open_attr.ino, false, false, None).await.unwrap();
+
+        // Remote content changes on both files.
+        hub.add_file("open.txt", 99, Some("new_a"), None);
+        hub.add_file("closed.txt", 99, Some("new_b"), None);
+
+        let prefixes = vfs.inode_table.read().unwrap().loaded_dir_prefixes();
+        let mut remote = Vec::new();
+        for prefix in &prefixes {
+            remote.extend(hub.list_tree(prefix).await.unwrap());
+        }
+        let polled: std::collections::HashSet<String> = prefixes.into_iter().collect();
+        VirtualFs::apply_poll_diff(remote, &polled, &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        // Snapshot (releasing the lock) so the guard isn't held across the await below.
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&(open_attr.ino, InvalKind::AttrOnly)),
+            "updated open inode must be invalidated AttrOnly (got {:?})",
+            recorded,
+        );
+        assert!(
+            recorded.contains(&(closed_attr.ino, InvalKind::Pages)),
+            "updated inode without handles must be invalidated Pages (got {:?})",
+            recorded,
+        );
+
+        vfs.release(fh).await.unwrap();
     });
 }
 
@@ -3362,6 +3526,61 @@ fn shutdown_flushes_dirty() {
     // After shutdown, batch log should show the flush
     let logs = hub.take_batch_log();
     assert!(!logs.is_empty());
+}
+
+/// Pins the load-bearing `InvalKind → (offset, len)` contract for #195. The
+/// kernel skips page invalidation when `offset < 0`, so `AttrOnly` MUST map to a
+/// negative offset and `Pages` to `offset = 0`. Inverting these would silently
+/// reintroduce the deadlock (a blocking page drop on a busy inode), so lock it
+/// down here — the live mapping has no other unit coverage.
+#[cfg(feature = "fuse")]
+#[test]
+fn inval_kind_offset_len_mapping() {
+    // AttrOnly: negative offset → kernel never touches pages.
+    let (off, _len) = InvalKind::AttrOnly.offset_len();
+    assert!(off < 0, "AttrOnly must use a negative offset, got {}", off);
+
+    // Pages: non-negative offset, full-file length.
+    assert_eq!(InvalKind::Pages.offset_len(), (0, -1));
+}
+
+/// The kernel-cache invalidator must stop firing once shutdown begins. This
+/// mirrors the flag-gated closure installed in `fuse.rs::mount_fuse` and guards
+/// the unkillable-pod regression: an `inval_inode` writev issued during teardown
+/// can wedge a thread in uninterruptible D-state.
+#[test]
+fn invalidator_disarmed_on_shutdown() {
+    use std::sync::atomic::Ordering;
+
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (_rt, vfs) = vfs_advanced(&hub, &xet);
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    // Build the same flag-gated closure shape used in production.
+    let flag = vfs.shutdown_flag();
+    let rec = calls.clone();
+    vfs.set_invalidator(Box::new(move |ino, _kind| {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        rec.lock().unwrap().push(ino);
+    }));
+
+    let invalidate = vfs.invalidator.get().expect("invalidator set");
+
+    // Before shutdown: invalidations go through.
+    invalidate(42, InvalKind::Pages);
+    assert_eq!(*calls.lock().unwrap(), vec![42]);
+
+    // After signalling shutdown: invalidations are no-ops.
+    vfs.signal_shutting_down();
+    invalidate(43, InvalKind::Pages);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![42],
+        "invalidator must be disarmed during shutdown"
+    );
 }
 
 /// Helper: create VFS with advanced writes + staging GC enabled (low limit).
@@ -4236,6 +4455,208 @@ fn rename_clean_file_remote_and_local() {
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(src_ino).unwrap();
         assert_eq!(entry.full_path.as_ref(), "dst.txt");
+    });
+}
+
+// ── link(): server-side copy ─────────────────────────────────────────────
+
+/// link() on a clean remote file commits one AddFile with the source's xet
+/// hash (no data upload) and inserts a separate alias inode locally.
+#[test]
+fn link_clean_file_creates_server_side_copy() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+
+        let alias_attr = vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap();
+        assert_ne!(alias_attr.ino, src_attr.ino, "alias gets its own inode");
+        assert_eq!(alias_attr.size, 100);
+
+        let logs = hub.take_batch_log();
+        assert_eq!(logs.len(), 1, "exactly one batch commit");
+        assert_eq!(logs[0].len(), 1, "a single AddFile, no delete");
+        match &logs[0][0] {
+            BatchOp::AddFile { path, xet_hash, .. } => {
+                assert_eq!(path, "alias.txt");
+                assert_eq!(xet_hash, "hash1");
+            }
+            other => panic!("expected AddFile, got {other:?}"),
+        }
+
+        // The alias is a real entry: resolvable, right hash, source untouched.
+        let inodes = vfs.inode_table.read().unwrap();
+        let alias = inodes.get(alias_attr.ino).unwrap();
+        assert_eq!(alias.full_path.as_ref(), "alias.txt");
+        assert_eq!(alias.xet_hash.as_deref(), Some("hash1"));
+        assert!(!alias.is_dirty());
+        let src = inodes.get(src_attr.ino).unwrap();
+        assert_eq!(src.full_path.as_ref(), "src.txt");
+    });
+}
+
+/// link() on a dirty source must not alias a stale hash: ENOTSUP so the
+/// caller falls back to a regular copy.
+#[test]
+fn link_dirty_source_not_supported() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            inodes.get_mut(src_attr.ino).unwrap().set_dirty();
+        }
+
+        let err = vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOTSUP);
+        assert!(hub.take_batch_log().is_empty(), "no remote op for a rejected link");
+    });
+}
+
+/// link() onto an existing name is EEXIST and sends no remote op.
+#[test]
+fn link_existing_target_eexist() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    hub.add_file("dst.txt", 50, Some("hash2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, ROOT_INODE, "dst.txt").await.unwrap_err();
+        assert_eq!(err, libc::EEXIST);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() on a directory is EPERM (POSIX).
+#[test]
+fn link_directory_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("d/x.txt", 10, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let dir_attr = vfs.lookup(ROOT_INODE, "d").await.unwrap();
+        let err = vfs.link(dir_attr.ino, ROOT_INODE, "d2").await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() on a clean file whose committed hash is missing/empty returns
+/// ENOTSUP (we never alias a hashless entry), with no remote op.
+#[test]
+fn link_no_committed_hash_not_supported() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        {
+            let mut inodes = vfs.inode_table.write().unwrap();
+            inodes.get_mut(src_attr.ino).unwrap().xet_hash = None;
+        }
+
+        let err = vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOTSUP);
+        assert!(hub.take_batch_log().is_empty(), "no remote op for a rejected link");
+    });
+}
+
+/// link() into a missing parent directory is ENOENT, with no remote op.
+#[test]
+fn link_missing_parent_enoent() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, 999_999, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOENT);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() into a non-directory parent is ENOTDIR, with no remote op.
+#[test]
+fn link_nondir_parent_enotdir() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    hub.add_file("file.txt", 50, Some("hash2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let file_attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, file_attr.ino, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOTDIR);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() to an OS junk name is rejected with EACCES, with no remote op.
+#[test]
+fn link_os_junk_name_eacces() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, ROOT_INODE, ".DS_Store").await.unwrap_err();
+        assert_eq!(err, libc::EACCES);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() on a read-only mount is EROFS, with no remote op.
+#[test]
+fn link_read_only_erofs() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_readonly(&hub, &xet);
+
+    rt.block_on(async {
+        let src_attr = vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::EROFS);
+        assert!(hub.take_batch_log().is_empty());
+    });
+}
+
+/// link() in overlay mode is ENOTSUP (committing an alias would mutate the
+/// remote behind the overlay's back), with no remote op.
+#[test]
+fn link_overlay_not_supported() {
+    let hub = MockHub::new();
+    hub.add_file("src.txt", 100, Some("hash1"), None);
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("link");
+    let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let src_attr = t.vfs.lookup(ROOT_INODE, "src.txt").await.unwrap();
+        let err = t.vfs.link(src_attr.ino, ROOT_INODE, "alias.txt").await.unwrap_err();
+        assert_eq!(err, libc::ENOTSUP);
+        assert!(hub.take_batch_log().is_empty());
     });
 }
 
@@ -5241,5 +5662,52 @@ fn overlay_rmdir_remote_dir_eperm() {
         // rmdir should also fail: clean remote directory
         let err = t.vfs.rmdir(ROOT_INODE, "subdir").await.unwrap_err();
         assert_eq!(err, libc::EPERM);
+    });
+}
+
+/// Regression: when a streaming write fails, the worker must surface the real Hub
+/// error (including its HTTP status) on Finish, not a hardcoded generic. A quota
+/// reject (HTTP 413) was previously logged as "Hub API error: streaming write failed"
+/// and mapped to a blanket EIO, hiding the actual cause and making the importing app
+/// (Radarr/Sonarr) retry into a quota wall instead of stopping.
+#[test]
+fn streaming_worker_surfaces_real_hub_error_on_failed_write() {
+    struct FailingWriter;
+
+    #[async_trait::async_trait]
+    impl StreamingWriterOps for FailingWriter {
+        async fn write(&mut self, _data: &[u8]) -> crate::error::Result<()> {
+            Err(crate::error::Error::hub_status(413, "storage quota exceeded"))
+        }
+        async fn finish_boxed(self: Box<Self>) -> crate::error::Result<XetFileInfo> {
+            unreachable!("finish must not be called after a failed write");
+        }
+        fn len(&self) -> u64 {
+            0
+        }
+        fn is_empty(&self) -> bool {
+            true
+        }
+    }
+
+    new_runtime().block_on(async {
+        let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(4);
+        let error = Arc::new(std::sync::Mutex::new(None));
+        let worker = tokio::spawn(streaming_worker(Box::new(FailingWriter), rx, error.clone()));
+
+        tx.send(WriteMsg::Data(vec![0u8; 8])).await.unwrap();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tx.send(WriteMsg::Finish(result_tx)).await.unwrap();
+
+        let result = result_rx.await.expect("worker dropped reply");
+        let err = result.expect_err("failed write must produce an error");
+        let msg = err.to_string();
+        assert!(msg.contains("413"), "lost HTTP status: {msg}");
+        assert!(msg.contains("storage quota exceeded"), "lost real detail: {msg}");
+        // Structured status must survive so it maps to a meaningful errno, not blanket EIO.
+        assert_eq!(err.status(), Some(413));
+        assert_eq!(err.to_errno(), libc::ENOSPC);
+
+        worker.await.unwrap();
     });
 }

@@ -23,7 +23,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -45,7 +45,24 @@ use hf_mount::virtual_fs::VirtualFs;
 #[cfg(unix)]
 type VfsRegistry = Arc<Mutex<Vec<Arc<VirtualFs>>>>;
 
-#[cfg(unix)]
+/// Hard deadline (ms) for the SIGTERM handler to force `exit()`, even if the
+/// per-mount flush drain can't make progress (e.g. the tokio runtime is
+/// saturated by FUSE `block_on` so the bounded-flush timeout future is never
+/// polled). Sized from the configured flush timeout + margin once mounts are
+/// discovered; the default covers the signal-during-discovery window. Exiting
+/// closes the FUSE fd so the kernel tears down the connection and the pod can
+/// terminate — the alternative is an unkillable, node-stranding pod.
+static SHUTDOWN_WATCHDOG_MS: AtomicU64 = AtomicU64::new(55_000);
+
+/// Floor for the termination grace handed to us via the
+/// `HF_CSI_TERMINATION_GRACE_SECONDS` env. The injecting CSI webhook always
+/// raises the pod's grace to at least this before passing it down (it mirrors
+/// the webhook's `MinTerminationGracePeriodSeconds`), so any smaller value we
+/// receive is a stale or buggy env. Flooring it stops a bad env from collapsing
+/// the flush drain / hard-exit watchdog to ~0s — which would exit the FUSE
+/// daemon while the workload still has the mount busy and strand the pod in an
+/// unkillable D-state.
+const MIN_TERMINATION_GRACE_SECS: u64 = 60;
 #[derive(Parser)]
 #[command(about = "CSI sidecar mounter for HF volumes")]
 struct Args {
@@ -103,6 +120,30 @@ fn main() {
                 std::process::exit(0);
             }
             info!("Received shutdown signal, flushing {} mount(s)", vfs_list.len());
+            // Disarm the kernel-cache invalidators on every mount immediately,
+            // before the flush drain starts. This stops the poll loop / revalidate
+            // path from issuing `inval_inode` writevs during teardown, which can
+            // wedge a thread in uninterruptible D-state (folio writeback wait) that
+            // not even `exit_group` can reap.
+            for vfs in &vfs_list {
+                vfs.signal_shutting_down();
+            }
+            // Hard watchdog: bound the shutdown so the process exits even if the
+            // flush drain can't make progress (saturated runtime). NOTE: forcing
+            // `exit()` releases the FUSE fd ONLY if no thread is wedged in the
+            // kernel — a D-state thread survives `exit_group` and leaves an
+            // unreapable zombie. The guaranteed connection release for that case
+            // is the CSI driver aborting the FUSE connection on NodeUnpublish;
+            // the disarm above prevents us from creating such a wedge here.
+            let watchdog = Duration::from_millis(SHUTDOWN_WATCHDOG_MS.load(Ordering::Relaxed));
+            std::thread::spawn(move || {
+                std::thread::sleep(watchdog);
+                error!(
+                    "Shutdown watchdog fired after {:?}; forcing exit to release the FUSE connection",
+                    watchdog
+                );
+                std::process::exit(0);
+            });
             // Drain in parallel — total wall time is max(flush), not sum(flush).
             let drain_handles: Vec<_> = vfs_list
                 .into_iter()
@@ -134,13 +175,50 @@ fn main() {
         }
     };
 
-    let pending = wait_for_configs(&args.tmp_dir, args.poll_secs, args.timeout_secs, args.expected_mounts);
+    let mut pending = wait_for_configs(&args.tmp_dir, args.poll_secs, args.timeout_secs, args.expected_mounts);
     if pending.is_empty() {
         error!("No mount configs found after {}s, exiting", args.timeout_secs);
         std::process::exit(1);
     }
 
     info!("Discovered {} pending mount(s)", pending.len());
+
+    // Bound the SIGTERM shutdown from the pod's termination grace when the
+    // webhook provides it (env HF_CSI_TERMINATION_GRACE_SECONDS). This lets the
+    // flush drain use the FULL grace the pod was actually given — e.g. ~9m50s
+    // for a 10-minute grace — instead of a fixed default that would truncate a
+    // slow-but-progressing flush and drop data. The hard-exit watchdog sits
+    // just under grace so the process always exits before SIGKILL (closing the
+    // FUSE fd, tearing down the connection). Falls back to the per-mount option
+    // (+margin) when the env is absent (dev / direct hf-mount-fuse).
+    let grace_secs = std::env::var("HF_CSI_TERMINATION_GRACE_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        // Defense in depth against a stale/buggy webhook env: never let a value
+        // below the enforced minimum collapse the flush drain / watchdog to ~0s
+        // and exit the daemon while the mount is still busy. See the const.
+        .map(|g| g.max(MIN_TERMINATION_GRACE_SECS));
+
+    let watchdog_ms = if let Some(grace) = grace_secs {
+        let flush_secs = grace.saturating_sub(10).max(5);
+        let watchdog_secs = grace.saturating_sub(5).max(flush_secs + 2);
+        for mount in &mut pending {
+            mount.mount_args.options.flush_shutdown_timeout_ms = flush_secs * 1_000;
+        }
+        info!(
+            "Termination grace {}s: flush drain bounded to {}s, hard-exit watchdog at {}s",
+            grace, flush_secs, watchdog_secs
+        );
+        watchdog_secs * 1_000
+    } else {
+        pending
+            .iter()
+            .map(|m| m.mount_args.options.flush_shutdown_timeout_ms)
+            .max()
+            .unwrap_or(45_000)
+            + 10_000
+    };
+    SHUTDOWN_WATCHDOG_MS.store(watchdog_ms, Ordering::Relaxed);
 
     let mut handles = Vec::with_capacity(pending.len());
     let mut error_paths = Vec::with_capacity(pending.len());

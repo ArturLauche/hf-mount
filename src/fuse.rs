@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use crate::daemon::DaemonGuard;
 use crate::setup::MountSetup;
 use crate::virtual_fs::inode::{self, InodeKind};
-use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
+use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr};
 
 /// Always 0: we never recycle inode numbers, so generation is unnecessary.
 const GENERATION: Generation = Generation(0);
@@ -423,8 +423,16 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    fn link(&self, _req: &Request, _ino: INodeNo, _newparent: INodeNo, _newname: &OsStr, reply: ReplyEntry) {
-        reply.error(Errno::from_i32(libc::ENOTSUP));
+    /// Hard link, implemented as a server-side copy: a new Hub entry pointing at
+    /// the source's xet hash (no data re-uploaded). The alias gets its own inode,
+    /// so st_ino differs from the source; callers like the *arr import pipelines
+    /// only need the instant copy semantics.
+    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
+        let newname = os_to_str!(newname, reply);
+        match self.runtime.block_on(self.virtual_fs.link(ino.0, newparent.0, newname)) {
+            Ok(attr) => self.reply_entry_tracked(reply, &attr),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
     }
 
     /// Remove an empty directory.
@@ -695,12 +703,61 @@ pub fn mount_fuse(
     };
     let notifier = session.notifier();
     let notifier_for_inode = notifier.clone();
-    setup.virtual_fs.set_invalidator(Box::new(move |ino| {
-        if let Err(e) = notifier_for_inode.inval_inode(fuser::INodeNo(ino), 0, -1) {
-            tracing::debug!("inval_inode({}) failed: {}", ino, e);
+    // Both invalidator closures short-circuit once shutdown begins. `inval_inode`
+    // / `inval_entry` issue synchronous writevs to /dev/fuse; during teardown
+    // those can block uninterruptibly in the kernel (folio writeback wait) and
+    // leave a D-state thread that `exit_group` can't reap → unkillable pod.
+    let shutdown_flag_inode = setup.virtual_fs.shutdown_flag();
+    let shutdown_flag_entry = setup.virtual_fs.shutdown_flag();
+    // The poll loop / HEAD-revalidate path run on tokio core workers. A full
+    // `inval_inode` page drop (`Pages`) is a *blocking* writev that, in the
+    // kernel, waits on per-folio locks; if a concurrent read() holds that folio
+    // it deadlocks, wedging the core worker in D-state and (on small pods)
+    // starving the runtime so the read can never complete — an unkillable pod
+    // (#195). Two guards:
+    //   1. Callers pass `AttrOnly` for inodes with open handles. A negative
+    //      offset makes the kernel skip page invalidation entirely, so the
+    //      writev never waits on a folio and is safe to issue inline on the
+    //      calling core worker.
+    //   2. `Pages` (which can block) is offloaded to the blocking pool via
+    //      `spawn_blocking`, never a core worker, so even a residual wedge
+    //      (e.g. a handle opened just after the caller's check) can't starve
+    //      request servicing — the read stays serviceable, the folio unlocks,
+    //      the writev drains. Fire-and-forget: we don't await the result.
+    let invalidate_runtime = setup.runtime.clone();
+    setup.virtual_fs.set_invalidator(Box::new(move |ino, kind| {
+        if shutdown_flag_inode.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let (offset, len) = kind.offset_len();
+        match kind {
+            // Non-blocking (attrs only): issue inline, no thread-pool hop.
+            InvalKind::AttrOnly => {
+                if let Err(e) = notifier_for_inode.inval_inode(fuser::INodeNo(ino), offset, len) {
+                    tracing::debug!("inval_inode({}) failed: {}", ino, e);
+                }
+            }
+            // Potentially blocking: keep it off the core workers.
+            InvalKind::Pages => {
+                let notifier = notifier_for_inode.clone();
+                let shutdown = shutdown_flag_inode.clone();
+                invalidate_runtime.spawn_blocking(move || {
+                    // Re-check: shutdown may have begun while this task was queued.
+                    if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), offset, len) {
+                        tracing::debug!("inval_inode({}) failed: {}", ino, e);
+                    }
+                });
+            }
         }
     }));
     setup.virtual_fs.set_entry_invalidator(Box::new(move |parent, name| {
+        if shutdown_flag_entry.load(std::sync::atomic::Ordering::SeqCst) {
+            // Stop the sweep; we're tearing down.
+            return false;
+        }
         let name_os = std::ffi::OsStr::new(name);
         match notifier.inval_entry(fuser::INodeNo(parent), name_os) {
             Ok(()) => true,

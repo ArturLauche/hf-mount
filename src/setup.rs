@@ -169,6 +169,18 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 16)]
     pub max_threads: usize,
 
+    /// Maximum time (ms) a single remote chunk fetch may stall before the read
+    /// is failed with EIO. Each FUSE `read()` blocks a worker thread on a
+    /// synchronous CAS/CDN fetch; without a ceiling, a stalled fetch (e.g. a
+    /// client-aborted media seek, a hung CDN connection) parks that thread
+    /// forever. After enough stalled reads accumulate, all `max_threads`
+    /// workers are wedged and the whole mount silently stops serving cold
+    /// reads. Bounding the per-chunk wait frees the thread (and cancels the
+    /// in-flight request by dropping the stream) so the mount stays alive.
+    /// 0 disables the timeout (legacy unbounded behaviour).
+    #[arg(long, default_value_t = 30_000)]
+    pub read_fetch_timeout_ms: u64,
+
     /// Flush debounce delay in milliseconds. After the first dirty file is
     /// enqueued, the flush batch waits this long for more writes before firing.
     #[arg(long, default_value_t = 2_000)]
@@ -178,6 +190,14 @@ pub struct MountOptions {
     /// within this time regardless of ongoing writes resetting the debounce.
     #[arg(long, default_value_t = 30_000)]
     pub flush_max_batch_window_ms: u64,
+
+    /// Maximum time (ms) the SIGTERM shutdown drain may spend flushing dirty
+    /// data before abandoning it to guarantee the process exits. MUST be set
+    /// below the pod's terminationGracePeriodSeconds: an unbounded drain on a
+    /// slow Hub/CAS backend keeps the FUSE connection alive past grace, leaving
+    /// processes blocked on the mount unkillable and stranding the pod.
+    #[arg(long, default_value_t = 45_000)]
+    pub flush_shutdown_timeout_ms: u64,
 
     /// Disable filtering of OS junk files (.DS_Store, Thumbs.db, etc.).
     /// By default these files are rejected on create/mkdir/rename.
@@ -317,9 +337,15 @@ pub fn init_tracing(daemon: bool) {
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
-        // Raise read_timeout from 120s default so large shard uploads don't get killed
-        // by the global client read_timeout before the per-request timeout kicks in.
-        ("HF_XET_CLIENT_READ_TIMEOUT", "600"),
+        // Per-read inactivity timeout for CAS/CDN transfers (resets on every byte
+        // received, so slow-but-progressing reads are fine). This governs the
+        // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
+        // shard uploads use a separate client with no read_timeout, so this no
+        // longer needs to be large for their sake. Keep it short so a stalled
+        // read fails fast and frees the FUSE worker thread instead of pinning it
+        // for minutes — a long value here is what let stalled reads accumulate
+        // and wedge the mount.
+        ("HF_XET_CLIENT_READ_TIMEOUT", "30"),
         // Upload tuning: skip slow adaptive concurrency ramp-up
         ("HF_XET_CLIENT_AC_INITIAL_UPLOAD_CONCURRENCY", "16"),
         // Larger ingestion blocks = fewer CDC calls
@@ -438,14 +464,24 @@ pub fn build_with_runtime(
         ))
         .map_err(|e| setup_err(format!("failed to initialize Hub client: {e}")))?;
 
-    // Validate that the subfolder exists on the remote.
-    if !hub_client.path_prefix().is_empty() {
-        runtime.block_on(hub_client.validate_path_prefix())?;
-    }
-
     let read_only = (options.read_only || hub_client.is_repo()) && !options.overlay;
     if hub_client.is_repo() && !options.read_only && !options.overlay {
         info!("Repo mounts are always read-only");
+    }
+
+    // Validate that the subfolder exists on the remote, but only for read-only
+    // mounts. A bucket subfolder cannot be distinguished from a non-existent
+    // one (both list as empty), so failing here would block the legitimate
+    // case of mounting an empty/new subfolder to write into it. For write
+    // mounts the folder is created by writing, so we skip the check entirely.
+    // For read-only mounts a missing prefix just yields an empty mount, so we
+    // warn instead of panicking the sidecar.
+    if read_only && !hub_client.path_prefix().is_empty() {
+        runtime.block_on(async {
+            if let Err(e) = hub_client.validate_path_prefix().await {
+                warn!("{e}");
+            }
+        });
     }
 
     // Overlay: local writes allowed, but no remote write token/upload.
@@ -566,7 +602,7 @@ pub fn build_with_runtime(
         "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
          poll_listing_concurrency={} metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
-         flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
+         flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms uid={} gid={} filter_os_files={}",
         advanced_writes,
         options.overlay,
         remote_read_only,
@@ -582,6 +618,7 @@ pub fn build_with_runtime(
         options.max_threads,
         options.flush_debounce_ms,
         options.flush_max_batch_window_ms,
+        options.read_fetch_timeout_ms,
         uid,
         gid,
         !options.no_filter_os_files,
@@ -609,6 +646,8 @@ pub fn build_with_runtime(
             direct_io: options.direct_io && !is_nfs,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+            flush_shutdown_timeout: std::time::Duration::from_millis(options.flush_shutdown_timeout_ms),
+            read_fetch_timeout: std::time::Duration::from_millis(options.read_fetch_timeout_ms),
             // NFS clients use inode numbers as stable file IDs; evicting an
             // inode the client still holds would surface as NFS3ERR_STALE on
             // its next RPC. The eviction safety hooks (forget / inval_entry)

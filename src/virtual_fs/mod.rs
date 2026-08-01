@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -89,7 +89,43 @@ const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 const INVAL_BATCH_SIZE: usize = 64;
 const INVAL_BATCH_PAUSE: Duration = Duration::from_millis(10);
 
-type InvalidatorFn = Box<dyn Fn(u64) + Send + Sync>;
+/// What to drop when invalidating a cached inode.
+///
+/// `Pages` issues a full kernel page-cache invalidation (`inval_inode` with a
+/// non-negative offset), which in-kernel walks `invalidate_inode_pages2_range`
+/// and *blocks on per-folio locks*. If a concurrent `read()` holds a folio lock
+/// while waiting for the daemon to fill it, that blocking writev deadlocks
+/// against the in-flight read (see #195). `AttrOnly` issues `inval_inode` with a
+/// negative offset, which the kernel gates so it drops only cached attributes
+/// and never touches pages — so it can never wait on a folio. Use `AttrOnly`
+/// for any inode with open handles (an in-flight read may be holding its
+/// folios); use `Pages` only when no handle is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalKind {
+    /// Drop attributes and the full page cache (blocking; safe only with no open handles).
+    Pages,
+    /// Drop cached attributes only; never touches pages (non-blocking).
+    AttrOnly,
+}
+
+impl InvalKind {
+    /// The `(offset, len)` pair to pass to `notify_inval_inode`. The kernel
+    /// gates page invalidation on `offset >= 0`, so a negative offset
+    /// (`AttrOnly`) drops attributes only and never waits on a folio, while
+    /// `Pages` (`offset = 0, len = -1`) invalidates the whole page cache. This
+    /// `(-1, 0)` vs `(0, -1)` contract is load-bearing for the #195 fix —
+    /// inverting it would reintroduce the deadlock — so it is unit-tested.
+    /// Only the FUSE backend issues `notify_inval_inode`; NFS ignores the kind.
+    #[cfg(feature = "fuse")]
+    pub(crate) fn offset_len(self) -> (i64, i64) {
+        match self {
+            InvalKind::Pages => (0, -1),
+            InvalKind::AttrOnly => (-1, 0),
+        }
+    }
+}
+
+type InvalidatorFn = Box<dyn Fn(u64, InvalKind) + Send + Sync>;
 /// `(parent, name) -> Ok/Err` maps to `fuse_notify_inval_entry`. Returns
 /// false when the FUSE notify channel is saturated (EAGAIN/ENOMEM) so the
 /// sweep can back off instead of burning CPU on a full queue. Separate
@@ -129,6 +165,16 @@ pub struct VfsConfig {
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
+    /// Max time the SIGTERM shutdown drain may spend flushing dirty data before
+    /// abandoning it to guarantee the process exits within the pod's termination
+    /// grace period. Must be < terminationGracePeriodSeconds, otherwise a slow
+    /// Hub/CAS backend wedges the FUSE connection and strands the pod.
+    pub flush_shutdown_timeout: Duration,
+    /// Upper bound on a single remote chunk fetch during a read. A stalled
+    /// fetch otherwise parks the FUSE worker thread that issued the `read()`
+    /// indefinitely; once all worker threads are parked the mount silently
+    /// wedges. `Duration::ZERO` disables the bound (legacy behaviour).
+    pub read_fetch_timeout: Duration,
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,
     pub lru_sweep_interval: Duration,
@@ -156,6 +202,10 @@ pub struct VfsConfig {
 /// inode.size between the file truncation and the metadata update.
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
+    /// Upper bound on the SIGTERM flush drain (see `VfsConfig`).
+    flush_shutdown_timeout: Duration,
+    /// Upper bound on a single remote chunk fetch during a read (see `VfsConfig`).
+    read_fetch_timeout: Duration,
     hub_client: Arc<dyn HubOps>,
     xet_sessions: Arc<dyn XetOps>,
     /// Staging area + per-inode locks. The per-inode locks are always
@@ -196,8 +246,21 @@ pub struct VirtualFs {
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
     /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
+    /// Callers pass [`InvalKind`] to pick a blocking page-drop vs a non-blocking
+    /// attribute-only drop: an inode with open handles must use `AttrOnly`, since a
+    /// full page invalidation would deadlock against an in-flight `read()` holding
+    /// the same folio lock (#195).
     invalidator: Invalidator,
     entry_invalidator: EntryInvalidator,
+    /// Set once a SIGTERM/shutdown begins. The kernel-cache invalidator
+    /// closures check this and become no-ops, so the poll loop / revalidate
+    /// path stop issuing synchronous `inval_inode` writevs to /dev/fuse during
+    /// teardown. Those writevs can otherwise block uninterruptibly in
+    /// `folio_wait_bit_common` (a folio under writeback the dying server can no
+    /// longer complete), leaving an unreapable D-state thread that `exit_group`
+    /// can't kill — an unkillable pod. See the CSI driver's connection-abort
+    /// for the kernel-level backstop covering any already-in-flight writev.
+    shutting_down: Arc<AtomicBool>,
     /// Background LRU evictor handle, aborted in `shutdown()`.
     lru_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// How long a file's metadata is trusted before re-checking via HEAD.
@@ -287,6 +350,8 @@ impl VirtualFs {
         let entry_invalidator: EntryInvalidator = Arc::new(OnceLock::new());
         let vfs = Arc::new(Self {
             runtime,
+            flush_shutdown_timeout: config.flush_shutdown_timeout,
+            read_fetch_timeout: config.read_fetch_timeout,
             hub_client,
             xet_sessions,
             staging,
@@ -306,6 +371,7 @@ impl VirtualFs {
             poll_handle: Mutex::new(poll_handle),
             invalidator,
             entry_invalidator,
+            shutting_down: Arc::new(AtomicBool::new(false)),
             lru_handle: Mutex::new(None),
             metadata_ttl: config.metadata_ttl,
             serve_lookup_from_cache: config.serve_lookup_from_cache,
@@ -453,6 +519,21 @@ impl VirtualFs {
         let _ = self.entry_invalidator.set(f);
     }
 
+    /// Shared shutdown flag. Cloned into the invalidator closures so they can
+    /// short-circuit once teardown starts — without holding an `Arc<VirtualFs>`
+    /// (which would form a reference cycle with the closure stored in the
+    /// `OnceLock`).
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.shutting_down.clone()
+    }
+
+    /// Mark teardown as started so the invalidator closures stop issuing FUSE
+    /// notifies. Idempotent; called early from the SIGTERM handler and again at
+    /// the top of `shutdown()`.
+    pub fn signal_shutting_down(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
     async fn lru_sweep_loop(weak: std::sync::Weak<Self>, soft_limit: usize, interval: Duration) {
         loop {
             tokio::time::sleep(interval).await;
@@ -570,6 +651,9 @@ impl VirtualFs {
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
     pub fn shutdown(&self) {
         info!("Shutting down VFS, flushing pending writes...");
+        // Stop the invalidator closures first: any further `inval_inode` writev
+        // to /dev/fuse during teardown risks an unkillable D-state wedge.
+        self.signal_shutting_down();
         // Abort background tasks.
         if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
             handle.abort();
@@ -580,7 +664,7 @@ impl VirtualFs {
         // Flush all dirty files + queued deletes.
         if let Some(fm) = &self.flush_manager {
             let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
-            fm.shutdown(dirty, &self.runtime);
+            fm.shutdown(dirty, &self.runtime, self.flush_shutdown_timeout);
         }
         info!("Flush loop finished, VFS shut down.");
     }
@@ -648,15 +732,23 @@ impl VirtualFs {
         // blocks on per-folio waits. Calling it under the global write lock can
         // stall the whole VFS (and has been observed to deadlock production
         // pods). Apply the mutation, drop the lock, then notify.
-        let mut to_invalidate: Vec<u64> = Vec::new();
+        let mut to_invalidate: Vec<(u64, InvalKind)> = Vec::new();
         match remote {
             None => {
                 // File deleted remotely → remove from inode table
                 info!("Remote deletion detected via HEAD: {}", full_path);
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if let Some(entry) = inodes.get(ino) {
-                    to_invalidate.push(entry.parent);
-                    to_invalidate.push(ino);
+                    let parent = entry.parent;
+                    // A full page drop on an inode with an in-flight read deadlocks
+                    // against the read's folio lock (#195); fall back to attr-only.
+                    let kind = if inodes.has_open_handles(ino) {
+                        InvalKind::AttrOnly
+                    } else {
+                        InvalKind::Pages
+                    };
+                    to_invalidate.push((parent, InvalKind::Pages));
+                    to_invalidate.push((ino, kind));
                 }
                 inodes.remove(ino);
             }
@@ -691,7 +783,12 @@ impl VirtualFs {
                         remote_size,
                         remote_mtime,
                     );
-                    to_invalidate.push(ino);
+                    let kind = if inodes.has_open_handles(ino) {
+                        InvalKind::AttrOnly
+                    } else {
+                        InvalKind::Pages
+                    };
+                    to_invalidate.push((ino, kind));
                 } else {
                     // Update stored etag even when content didn't change,
                     // so future revalidations have the latest value.
@@ -714,8 +811,8 @@ impl VirtualFs {
         if !to_invalidate.is_empty()
             && let Some(invalidate) = self.invalidator.get()
         {
-            for ino in to_invalidate {
-                invalidate(ino);
+            for (ino, kind) in to_invalidate {
+                invalidate(ino, kind);
             }
         }
     }
@@ -1076,7 +1173,7 @@ impl VirtualFs {
         // unbounded memory. 32 slots × ~128KB FUSE write = ~4MB max in-flight.
         // blocking_send is safe here: FUSE threads are not tokio workers.
         let (tx, rx) = tokio::sync::mpsc::channel::<WriteMsg>(32);
-        let error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let error: Arc<std::sync::Mutex<Option<crate::error::Error>>> = Arc::new(std::sync::Mutex::new(None));
         self.runtime
             .spawn(streaming_worker(streaming_writer, rx, error.clone()));
 
@@ -2008,7 +2105,36 @@ impl VirtualFs {
                 let mut failed = false;
                 let mut stream_eof = false;
                 while (total as u64) < plan.fetch_size {
-                    match stream.next().await {
+                    // Bound each chunk read. A FUSE `read()` runs on a worker
+                    // thread blocked in `block_on` on this future; if the
+                    // CAS/CDN connection stalls (client-aborted seek, hung
+                    // socket), an unbounded `next()` parks that thread forever.
+                    // Enough stalled reads exhaust all worker threads and the
+                    // mount silently stops serving cold reads. The timeout frees
+                    // the thread, and dropping `stream` on the way out cancels
+                    // the in-flight request.
+                    let next = match self.read_fetch_timeout {
+                        Duration::ZERO => stream.next().await,
+                        timeout => match tokio::time::timeout(timeout, stream.next()).await {
+                            Ok(result) => result,
+                            Err(_elapsed) => {
+                                error!(
+                                    "prefetch: stream read timed out after {:?} at cursor={}, got={}/{}, \
+                                     attempt={}/{}, hash={} — aborting fetch to free the FUSE worker thread",
+                                    timeout,
+                                    cursor,
+                                    total,
+                                    plan.fetch_size,
+                                    attempt + 1,
+                                    MAX_ATTEMPTS,
+                                    prefetch_state.xet_hash,
+                                );
+                                failed = true;
+                                break;
+                            }
+                        },
+                    };
+                    match next {
                         Ok(Some(chunk)) => {
                             total += chunk.len();
                             chunks.push_back(chunk);
@@ -2246,8 +2372,8 @@ impl VirtualFs {
                 channel,
             } => {
                 // Check for previous worker error
-                if channel.error.lock().expect("error poisoned").is_some() {
-                    return Err(libc::EIO);
+                if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
+                    return Err(err.to_errno());
                 }
 
                 // Enforce append-only: offset must match bytes written so far
@@ -2292,8 +2418,8 @@ impl VirtualFs {
 
         if let Some(channel) = streaming_channel {
             // Check for worker errors first.
-            if channel.error.lock().expect("error poisoned").is_some() {
-                return Err(libc::EIO);
+            if let Some(err) = channel.error.lock().expect("error poisoned").as_ref() {
+                return Err(err.to_errno());
             }
 
             // Check current commit state.
@@ -2559,7 +2685,7 @@ impl VirtualFs {
                     Ok(Ok(info)) => info,
                     Ok(Err(e)) => {
                         error!("Streaming upload failed for ino={}: {}", ino, e);
-                        return Err(libc::EIO);
+                        return Err(e.to_errno());
                     }
                     Err(_) => {
                         error!("Streaming worker dropped for ino={}", ino);
@@ -2595,7 +2721,7 @@ impl VirtualFs {
             error!("Failed to commit file {}: {}", full_path, e);
             // CAS upload succeeded — preserve file_info for retry in release()
             *channel.pending_info.lock().expect("pending_info poisoned") = Some(file_info);
-            return Err(libc::EIO);
+            return Err(e.to_errno());
         }
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -2823,6 +2949,131 @@ impl VirtualFs {
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
 
+    /// Hard-link `ino` at `newparent/newname` as a server-side copy: a new Hub
+    /// file entry referencing the source's xet hash, so no bytes move through
+    /// CAS. The alias gets its own inode (writes to one path never affect the
+    /// other), which diverges from POSIX same-inode semantics but matches what
+    /// link() callers like the *arr import pipelines need: an instant,
+    /// storage-free copy. Re-uploading the content instead would shred its
+    /// layout (dedup against the existing xorbs runs into xet-core's defrag
+    /// prevention, re-storing a large share of the bytes in fragments).
+    ///
+    /// Sources without a committed hash (dirty, or created and never flushed)
+    /// return ENOTSUP so callers fall back to a regular copy.
+    pub async fn link(&self, ino: u64, newparent: u64, newname: &str) -> VirtualFsResult<VirtualFsAttr> {
+        inode::validate_child_name(newname)?;
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        // Overlay keeps writes local; committing an alias to the Hub would
+        // mutate the remote behind the overlay's back.
+        if self.overlay() {
+            return Err(libc::ENOTSUP);
+        }
+        if self.filter_os_files && is_os_junk(newname) {
+            debug!("link: rejecting OS junk name: {}", newname);
+            return Err(libc::EACCES);
+        }
+
+        debug!("link: ino={}, newparent={}, newname={}", ino, newparent, newname);
+
+        // Phase 1a: validate the source under a read lock, before loading the
+        // destination's remote children. A rejected source (dirty or hashless,
+        // the routine *arr link-then-copy fallback) must not pay for a
+        // list_tree it would throw away.
+        let (source_path, xet_hash, size, mode, uid, gid) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let source = inodes.get(ino).ok_or(libc::ENOENT)?;
+            if source.kind != InodeKind::File {
+                return Err(libc::EPERM);
+            }
+            if source.is_dirty() {
+                return Err(libc::ENOTSUP);
+            }
+            let Some(hash) = source.xet_hash.as_ref().filter(|hash| !hash.is_empty()).cloned() else {
+                return Err(libc::ENOTSUP);
+            };
+            (
+                source.full_path.clone(),
+                hash,
+                source.size,
+                source.mode,
+                source.uid,
+                source.gid,
+            )
+        };
+
+        // Load remote children so the EEXIST check below also sees files that
+        // exist remotely but were never looked up (also validates newparent).
+        self.ensure_children_loaded(newparent).await?;
+
+        // Phase 1b: validate the destination under a read lock.
+        let new_full_path = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let parent_entry = match inodes.get(newparent) {
+                Some(e) if e.kind == InodeKind::Directory => e,
+                Some(_) => return Err(libc::ENOTDIR),
+                None => return Err(libc::ENOENT),
+            };
+            let new_full_path = inode::child_path(&parent_entry.full_path, newname);
+            if inodes.lookup_child(newparent, newname).is_some() {
+                return Err(libc::EEXIST);
+            }
+            new_full_path
+        };
+
+        // Phase 2: commit the alias to the Hub.
+        let now = SystemTime::now();
+        let mtime_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let ops = [BatchOp::AddFile {
+            path: new_full_path.clone(),
+            xet_hash: xet_hash.clone(),
+            mtime: mtime_ms,
+            content_type: None,
+        }];
+        if let Err(e) = self.hub_client.batch_operations(&ops).await {
+            error!(
+                "link: failed to commit {} as alias of {}: {}",
+                new_full_path, source_path, e
+            );
+            return Err(libc::EIO);
+        }
+
+        self.negative_cache_remove(&new_full_path);
+        // Cancel any queued remote delete for the destination path (rm b && ln a b).
+        if let Some(fm) = &self.flush_manager {
+            fm.cancel_delete(&new_full_path);
+        }
+
+        // Phase 3: insert the alias into the inode table under the write lock.
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        if inodes.get(newparent).is_none() {
+            return Err(libc::ENOENT);
+        }
+        // A concurrent create may have won the race since phase 1; the remote
+        // add already landed, but locally the newer entry owns the name.
+        if inodes.lookup_child(newparent, newname).is_some() {
+            return Err(libc::EEXIST);
+        }
+        info!("Linked {} -> {} (server-side copy)", source_path, new_full_path);
+        let new_ino = inodes.insert(
+            newparent,
+            newname.to_string(),
+            new_full_path,
+            InodeKind::File,
+            size,
+            now,
+            Some(xet_hash),
+            mode,
+            uid,
+            gid,
+        );
+        inodes.touch_parent(newparent, now);
+        inodes.touch(new_ino);
+
+        Ok(self.make_vfs_attr(inodes.get(new_ino).ok_or(libc::EIO)?))
+    }
+
     pub async fn unlink(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
         inode::validate_child_name(name)?;
         if self.read_only {
@@ -2986,13 +3237,6 @@ impl VirtualFs {
             Some(_) => Err(libc::EINVAL),
             None => Err(libc::ENOENT),
         }
-    }
-
-    pub async fn link(&self, _ino: u64, _new_parent: u64, new_name: &str) -> VirtualFsResult<VirtualFsAttr> {
-        inode::validate_child_name(new_name)?;
-        // Hard links are not supported — they are ephemeral (in-memory only) and never
-        // persisted to the hub, which makes them a source of subtle bugs with no benefit.
-        Err(libc::ENOTSUP)
     }
 
     pub async fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
@@ -3775,7 +4019,8 @@ struct StreamingChannel {
     tx: tokio::sync::mpsc::Sender<WriteMsg>,
     bytes_written: AtomicU64,
     /// Set by the background worker if add_data() fails. Shared with worker via Arc.
-    error: Arc<std::sync::Mutex<Option<String>>>,
+    /// Holds the structured error so its HTTP status survives to errno mapping.
+    error: Arc<std::sync::Mutex<Option<crate::error::Error>>>,
     /// Commit lifecycle state machine.
     state: std::sync::Mutex<CommitState>,
     /// CAS upload succeeded but Hub commit failed — stored for retry.
@@ -3842,7 +4087,7 @@ fn same_process(pid_a: u32, pid_b: u32) -> bool {
 async fn streaming_worker(
     mut writer: Box<dyn StreamingWriterOps>,
     mut rx: tokio::sync::mpsc::Receiver<WriteMsg>,
-    error: Arc<std::sync::Mutex<Option<String>>>,
+    error: Arc<std::sync::Mutex<Option<crate::error::Error>>>,
 ) {
     let mut failed = false;
     while let Some(msg) = rx.recv().await {
@@ -3852,13 +4097,21 @@ async fn streaming_worker(
                     continue; // drain remaining messages
                 }
                 if let Err(e) = writer.write(&data).await {
-                    *error.lock().unwrap() = Some(e.to_string());
+                    *error.lock().expect("error poisoned") = Some(e);
                     failed = true;
                 }
             }
             WriteMsg::Finish(reply) => {
                 let result = if failed {
-                    Err(crate::error::Error::hub("streaming write failed"))
+                    // Surface the real error captured on the failing write() instead of a
+                    // hardcoded generic. Keeping the structured Error preserves its HTTP
+                    // status (e.g. 413/507 on a quota reject), which both logs the real
+                    // cause and lets streaming_commit map it to a meaningful errno.
+                    Err(error
+                        .lock()
+                        .expect("error poisoned")
+                        .take()
+                        .unwrap_or_else(|| crate::error::Error::hub("streaming write failed: unknown error")))
                 } else {
                     writer.finish_boxed().await
                 };
