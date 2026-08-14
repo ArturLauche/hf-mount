@@ -41,6 +41,29 @@ impl RecentSource {
     }
 }
 
+// Serde defaults mirror the CLI defaults in `MountOptions` so profiles saved
+// by older GUI versions keep loading and behave exactly as before.
+pub const DEFAULT_CACHE_SIZE_GB: u64 = 10;
+pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_METADATA_TTL_MS: u64 = 10_000;
+pub const DEFAULT_READ_FETCH_TIMEOUT_MS: u64 = 30_000;
+
+fn default_cache_size_gb() -> u64 {
+    DEFAULT_CACHE_SIZE_GB
+}
+
+fn default_poll_interval_secs() -> u64 {
+    DEFAULT_POLL_INTERVAL_SECS
+}
+
+fn default_metadata_ttl_ms() -> u64 {
+    DEFAULT_METADATA_TTL_MS
+}
+
+fn default_read_fetch_timeout_ms() -> u64 {
+    DEFAULT_READ_FETCH_TIMEOUT_MS
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MountProfile {
     pub source: GuiSource,
@@ -55,6 +78,14 @@ pub struct MountProfile {
     pub run_in_background: bool,
     #[serde(default)]
     pub nfs_allow_unsafe_loopback: bool,
+    #[serde(default = "default_cache_size_gb")]
+    pub cache_size_gb: u64,
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_metadata_ttl_ms")]
+    pub metadata_ttl_ms: u64,
+    #[serde(default = "default_read_fetch_timeout_ms")]
+    pub read_fetch_timeout_ms: u64,
     #[serde(default)]
     pub recent_sources: Vec<RecentSource>,
 }
@@ -151,18 +182,20 @@ pub fn profile_mount_options(profile: &MountProfile) -> Result<MountOptions, Str
         gid: None,
         read_only: profile.source == GuiSource::Repo || profile.read_only,
         advanced_writes: false,
-        poll_interval_secs: 30,
+        poll_interval_secs: profile.poll_interval_secs,
         poll_listing_concurrency: 4,
-        cache_size: 10_000_000_000,
+        cache_size: profile.cache_size_gb.saturating_mul(1_000_000_000),
         max_staging_size: 0,
         no_disk_cache: false,
         cache_mode: CacheMode::Chunk,
         direct_io: false,
-        metadata_ttl_ms: 10_000,
+        metadata_ttl_ms: profile.metadata_ttl_ms,
         metadata_ttl_minimal: false,
         max_threads: 16,
+        read_fetch_timeout_ms: profile.read_fetch_timeout_ms,
         flush_debounce_ms: 2_000,
         flush_max_batch_window_ms: 30_000,
+        flush_shutdown_timeout_ms: 45_000,
         no_filter_os_files: false,
         fuse_owner_only: false,
         fuse_allow_other: false,
@@ -189,6 +222,10 @@ mod tests {
             read_only: true,
             run_in_background: true,
             nfs_allow_unsafe_loopback: false,
+            cache_size_gb: DEFAULT_CACHE_SIZE_GB,
+            poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+            metadata_ttl_ms: DEFAULT_METADATA_TTL_MS,
+            read_fetch_timeout_ms: DEFAULT_READ_FETCH_TIMEOUT_MS,
             recent_sources: Vec::new(),
         }
     }
@@ -263,5 +300,44 @@ mod tests {
         profile.read_only = false;
         let options = profile_mount_options(&profile).unwrap();
         assert!(options.read_only);
+    }
+
+    #[test]
+    fn old_profiles_without_tuning_fields_get_cli_defaults() {
+        let json = r#"{
+            "source":"Repo",
+            "source_id":"openai-community/gpt2",
+            "revision":"main",
+            "mount_point":"/tmp/hf-mount",
+            "hub_endpoint":"https://huggingface.co",
+            "cache_dir":"/tmp/hf-cache",
+            "read_only":true,
+            "run_in_background":false
+        }"#;
+        let profile: MountProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(profile.cache_size_gb, DEFAULT_CACHE_SIZE_GB);
+        assert_eq!(profile.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
+        assert_eq!(profile.metadata_ttl_ms, DEFAULT_METADATA_TTL_MS);
+        assert_eq!(profile.read_fetch_timeout_ms, DEFAULT_READ_FETCH_TIMEOUT_MS);
+
+        let options = profile_mount_options(&profile).unwrap();
+        assert_eq!(options.cache_size, 10_000_000_000);
+        assert_eq!(options.poll_interval_secs, 30);
+        assert_eq!(options.metadata_ttl_ms, 10_000);
+        assert_eq!(options.read_fetch_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn tuning_fields_flow_into_mount_options() {
+        let mut profile = sample_profile();
+        profile.cache_size_gb = 25;
+        profile.poll_interval_secs = 0;
+        profile.metadata_ttl_ms = 2_500;
+        profile.read_fetch_timeout_ms = 0;
+        let options = profile_mount_options(&profile).unwrap();
+        assert_eq!(options.cache_size, 25_000_000_000);
+        assert_eq!(options.poll_interval_secs, 0);
+        assert_eq!(options.metadata_ttl_ms, 2_500);
+        assert_eq!(options.read_fetch_timeout_ms, 0);
     }
 }

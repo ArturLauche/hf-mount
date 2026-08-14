@@ -1,101 +1,121 @@
-//! Dark neutral theme: flat surfaces, 1px borders, 8px radius, one orange
-//! accent. No gradients, no glows, no decorative chrome.
+//! Visual design system: a layered dark palette with a single Hugging Face
+//! orange accent. Flat surfaces, 1px borders, 8px radius — no gradients, no
+//! glows. All colors live here so the tabs stay palette-free.
 
 use eframe::egui;
 
+// ── Surfaces ──────────────────────────────────────────────────────────
+
 pub fn app_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(24, 24, 24)
+    egui::Color32::from_rgb(19, 19, 22)
 }
 
-pub fn header_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(28, 28, 28)
+pub fn sidebar_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(14, 14, 17)
 }
 
 pub fn panel_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(33, 33, 33)
+    egui::Color32::from_rgb(27, 27, 31)
 }
 
 pub fn elevated_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(42, 42, 42)
+    egui::Color32::from_rgb(37, 37, 43)
 }
 
 pub fn input_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(42, 42, 42)
+    egui::Color32::from_rgb(34, 34, 40)
 }
+
+// ── Lines ─────────────────────────────────────────────────────────────
 
 pub fn border() -> egui::Color32 {
-    egui::Color32::from_rgb(58, 58, 58)
+    egui::Color32::from_rgb(48, 48, 56)
 }
 
-pub fn primary_button_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(242, 242, 242)
+pub fn border_strong() -> egui::Color32 {
+    egui::Color32::from_rgb(66, 66, 76)
 }
 
-pub fn primary_button_text() -> egui::Color32 {
-    egui::Color32::from_rgb(28, 28, 28)
-}
-
-pub fn accent() -> egui::Color32 {
-    egui::Color32::from_rgb(240, 122, 50)
-}
-
-pub fn success_fg() -> egui::Color32 {
-    egui::Color32::from_rgb(102, 192, 133)
-}
+// ── Text ──────────────────────────────────────────────────────────────
 
 pub fn text_primary() -> egui::Color32 {
-    egui::Color32::from_rgb(242, 242, 242)
+    egui::Color32::from_rgb(240, 240, 243)
 }
 
 pub fn text_secondary() -> egui::Color32 {
-    egui::Color32::from_rgb(168, 168, 168)
+    egui::Color32::from_rgb(166, 166, 176)
 }
 
 pub fn muted_text() -> egui::Color32 {
-    egui::Color32::from_rgb(126, 126, 126)
+    egui::Color32::from_rgb(118, 118, 128)
+}
+
+// ── Accent & semantic colors ──────────────────────────────────────────
+
+pub fn accent() -> egui::Color32 {
+    egui::Color32::from_rgb(255, 140, 60)
+}
+
+pub fn success_fg() -> egui::Color32 {
+    egui::Color32::from_rgb(104, 200, 138)
 }
 
 pub fn warning_fg() -> egui::Color32 {
-    egui::Color32::from_rgb(240, 173, 78)
+    egui::Color32::from_rgb(240, 180, 84)
 }
 
 pub fn error_fg() -> egui::Color32 {
-    egui::Color32::from_rgb(238, 107, 107)
+    egui::Color32::from_rgb(240, 110, 110)
 }
 
 pub fn success_chip_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(31, 48, 38)
+    egui::Color32::from_rgb(26, 46, 34)
 }
 
 pub fn warning_chip_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(56, 44, 30)
+    egui::Color32::from_rgb(52, 42, 26)
 }
 
 pub fn error_chip_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(58, 36, 36)
+    egui::Color32::from_rgb(54, 32, 32)
+}
+
+// ── Buttons ───────────────────────────────────────────────────────────
+
+pub fn primary_button_bg() -> egui::Color32 {
+    accent()
+}
+
+pub fn primary_button_text() -> egui::Color32 {
+    egui::Color32::from_rgb(24, 16, 8)
 }
 
 pub fn danger_button_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(70, 40, 40)
+    egui::Color32::from_rgb(66, 36, 36)
 }
 
+// ── Style application ─────────────────────────────────────────────────
+
 pub fn apply_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    // The palette is dark-only; pin the theme so an OS light-mode preference
+    // doesn't swap in unstyled light visuals.
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     let mut visuals = egui::Visuals::dark();
-    let rounding = egui::Rounding::same(8.0);
+    let radius = egui::CornerRadius::same(8);
 
     visuals.panel_fill = app_bg();
     visuals.window_fill = panel_bg();
     visuals.extreme_bg_color = input_bg();
     visuals.faint_bg_color = elevated_bg();
     visuals.code_bg_color = input_bg();
-    visuals.selection.bg_fill = egui::Color32::from_rgb(70, 70, 70);
-    visuals.selection.stroke = egui::Stroke::new(1.0, text_primary());
+    visuals.selection.bg_fill = egui::Color32::from_rgb(80, 56, 34);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, accent());
     visuals.hyperlink_color = accent();
     visuals.warn_fg_color = warning_fg();
     visuals.error_fg_color = error_fg();
-    visuals.window_rounding = rounding;
-    visuals.menu_rounding = rounding;
+    visuals.window_corner_radius = radius;
+    visuals.menu_corner_radius = radius;
 
     for widgets in [
         &mut visuals.widgets.noninteractive,
@@ -104,25 +124,25 @@ pub fn apply_theme(ctx: &egui::Context) {
         &mut visuals.widgets.active,
         &mut visuals.widgets.open,
     ] {
-        widgets.rounding = rounding;
+        widgets.corner_radius = radius;
     }
 
     visuals.widgets.noninteractive.bg_fill = panel_bg();
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border());
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_primary());
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border());
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_primary());
     visuals.widgets.inactive.bg_fill = input_bg();
     visuals.widgets.inactive.weak_bg_fill = elevated_bg();
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border());
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_primary());
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(52, 52, 52);
-    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(48, 48, 48);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 82, 82));
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(58, 58, 58);
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, text_secondary());
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border());
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text_primary());
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(46, 46, 54);
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(42, 42, 50);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, border_strong());
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(54, 54, 62);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, accent());
 
     style.visuals = visuals;
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    style.spacing.window_margin = egui::Margin::same(0.0);
-    ctx.set_style(style);
+    style.spacing.window_margin = egui::Margin::same(0);
+    ctx.set_style_of(egui::Theme::Dark, style);
 }

@@ -87,7 +87,7 @@ reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v Enable
 
 ### Build from source
 
-Requires Rust 1.89+.
+Requires Rust 1.95+.
 
 ```bash
 # NFS only (Windows builds produce hf-mount-nfs.exe)

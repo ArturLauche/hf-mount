@@ -1,51 +1,86 @@
-//! Reusable UI primitives: tab bar, chips, labeled field rows, buttons.
+//! Reusable UI primitives: sidebar navigation, cards, chips, labeled field
+//! rows, buttons, segmented controls.
 
 use eframe::egui::{self, RichText};
 
 use crate::app::MountState;
 use crate::theme::*;
 
-/// Underline-style tab button. Returns `true` when clicked.
-pub fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
-    let color = if active { text_primary() } else { text_secondary() };
-    let text = RichText::new(label).size(14.0).strong().color(color);
-    let response = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+/// Sidebar navigation entry with an active accent bar. Returns `true` on click.
+pub fn nav_item(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
-    let underline = if active {
-        Some(accent())
-    } else if response.hovered() {
-        Some(border())
-    } else {
-        None
-    };
-    if let Some(color) = underline {
-        let rect = response.rect;
+    if active {
         ui.painter()
-            .hline(rect.x_range(), rect.bottom() + 6.0, egui::Stroke::new(2.0, color));
+            .rect_filled(rect, egui::CornerRadius::same(6), elevated_bg());
+        let bar = egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
+        ui.painter().rect_filled(bar, egui::CornerRadius::same(2), accent());
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(6), panel_bg());
     }
+
+    let color = if active { text_primary() } else { text_secondary() };
+    ui.painter().text(
+        egui::pos2(rect.min.x + 14.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.5),
+        color,
+    );
     response.clicked()
 }
 
+/// Card container: a bordered panel with padding, used to group form sections
+/// and content blocks.
+pub fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(panel_bg())
+        .stroke(egui::Stroke::new(1.0_f32, border()))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add_contents(ui)
+        })
+        .inner
+}
+
+/// Small uppercase section title inside a card.
+pub fn card_title(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .size(10.5)
+            .strong()
+            .color(muted_text()),
+    );
+    ui.add_space(6.0);
+}
+
 pub fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(bg)
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {
             ui.label(RichText::new(text).small().strong().color(fg));
         });
 }
 
-pub fn status_chip(ui: &mut egui::Ui, state: &MountState) {
-    let (label, fg, bg) = match state {
+pub fn state_colors(state: &MountState) -> (&'static str, egui::Color32, egui::Color32) {
+    match state {
         MountState::Ready => ("Ready", text_secondary(), elevated_bg()),
         MountState::Mounting => ("Mounting", warning_fg(), warning_chip_bg()),
         MountState::Mounted => ("Mounted", success_fg(), success_chip_bg()),
         MountState::Stopping => ("Stopping", warning_fg(), warning_chip_bg()),
         MountState::Stopped => ("Stopped", text_secondary(), elevated_bg()),
         MountState::Failed => ("Error", error_fg(), error_chip_bg()),
-    };
+    }
+}
+
+pub fn status_chip(ui: &mut egui::Ui, state: &MountState) {
+    let (label, fg, bg) = state_colors(state);
     chip(ui, label, fg, bg);
 }
 
@@ -86,6 +121,17 @@ pub fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, password: b
     )
 }
 
+/// Numeric field bound to a `u64`, with a unit suffix. Edits go through a
+/// `DragValue` so typing and scrubbing both work; invalid input can't occur.
+pub fn number_field(ui: &mut egui::Ui, value: &mut u64, suffix: &str, max: u64) -> egui::Response {
+    ui.add(
+        egui::DragValue::new(value)
+            .range(0..=max)
+            .speed(1.0)
+            .suffix(format!(" {suffix}")),
+    )
+}
+
 pub fn field_hint(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(11.0).color(muted_text()));
 }
@@ -107,7 +153,7 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool, width: f32)
 }
 
 pub fn danger_button(ui: &mut egui::Ui, label: &str, enabled: bool, width: f32) -> egui::Response {
-    let fg = if enabled { text_primary() } else { muted_text() };
+    let fg = if enabled { error_fg() } else { muted_text() };
     let button = egui::Button::new(RichText::new(label).strong().color(fg))
         .fill(danger_button_bg())
         .min_size(egui::vec2(width, 32.0));
@@ -123,11 +169,11 @@ pub fn secondary_button(ui: &mut egui::Ui, label: &str, enabled: bool, width: f3
 /// Two-option segmented control. Returns `true` when the selection changed.
 pub fn segmented_pair<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: [(T, &str); 2]) -> bool {
     let mut changed = false;
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(input_bg())
-        .stroke(egui::Stroke::new(1.0, border()))
-        .rounding(8.0)
-        .inner_margin(egui::Margin::same(3.0))
+        .stroke(egui::Stroke::new(1.0_f32, border()))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let spacing = ui.spacing().item_spacing.x;
@@ -136,13 +182,18 @@ pub fn segmented_pair<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, opt
                     let selected = *value == option;
                     let fg = if selected { text_primary() } else { text_secondary() };
                     let fill = if selected {
-                        egui::Color32::from_rgb(58, 58, 58)
+                        elevated_bg()
                     } else {
                         egui::Color32::TRANSPARENT
                     };
+                    let stroke = if selected {
+                        egui::Stroke::new(1.0_f32, border_strong())
+                    } else {
+                        egui::Stroke::NONE
+                    };
                     let button = egui::Button::new(RichText::new(label).strong().color(fg))
                         .fill(fill)
-                        .stroke(egui::Stroke::NONE)
+                        .stroke(stroke)
                         .min_size(egui::vec2(width, 26.0));
                     if ui.add(button).clicked() && !selected {
                         *value = option;

@@ -1,4 +1,5 @@
-//! Mount tab: the source/mount form, blocker banner, and Start/Stop actions.
+//! Mount tab: the source/mount form grouped into cards, a mounted "hero"
+//! panel while a mount is active, the blocker banner, and Start/Stop actions.
 
 use eframe::egui::{self, RichText};
 
@@ -7,33 +8,112 @@ use crate::platform;
 use crate::preflight::{CheckItem, blocker_command};
 use crate::profile::GuiSource;
 use crate::theme::*;
+use crate::util::format_elapsed;
 use crate::widgets::{
-    danger_button, field_error, field_hint, field_row, primary_button, secondary_button, segmented_pair, text_field,
+    card, card_title, danger_button, field_error, field_hint, field_row, number_field, primary_button,
+    secondary_button, segmented_pair, text_field,
 };
 
 impl MountGuiApp {
     pub fn draw_mount_tab(&mut self, ui: &mut egui::Ui) {
+        // The action row stays pinned below the scrolling form so Start/Stop
+        // are always reachable regardless of window height.
+        let actions_height = 52.0;
+        let form_height = (ui.available_height() - actions_height).max(120.0);
+
         egui::ScrollArea::vertical()
             .id_salt("mount-form")
+            .max_height(form_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let form_width = ui.available_width().min(640.0);
+                let form_width = ui.available_width().min(660.0);
                 ui.vertical(|ui| {
                     ui.set_width(form_width);
-                    self.draw_form(ui);
-                    ui.add_space(12.0);
+
+                    if self.current_status().state == MountState::Mounted {
+                        self.draw_mounted_hero(ui);
+                        ui.add_space(12.0);
+                    }
+
+                    card(ui, |ui| {
+                        card_title(ui, "Source");
+                        self.draw_source_section(ui);
+                    });
+                    ui.add_space(10.0);
+                    card(ui, |ui| {
+                        card_title(ui, "Destination");
+                        self.draw_destination_section(ui);
+                    });
+                    ui.add_space(10.0);
+                    card(ui, |ui| {
+                        card_title(ui, "Options");
+                        self.draw_options_section(ui);
+                    });
+
                     if !self.is_mount_running()
                         && let Some(blocker) = self.first_blocking_check().cloned()
                     {
-                        self.draw_blocker_banner(ui, &blocker);
                         ui.add_space(12.0);
+                        self.draw_blocker_banner(ui, &blocker);
                     }
-                    self.draw_actions(ui);
+                    ui.add_space(8.0);
+                });
+            });
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(2.0);
+            let form_width = ui.available_width().min(660.0);
+            ui.vertical(|ui| {
+                ui.set_width(form_width);
+                self.draw_actions(ui);
+            });
+        });
+    }
+
+    /// Prominent panel while mounted: what is mounted where, uptime, and the
+    /// open-folder action front and center.
+    fn draw_mounted_hero(&mut self, ui: &mut egui::Ui) {
+        let mount_label = self
+            .active_mount_point
+            .as_ref()
+            .map(|mount_point| mount_point.display().to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let uptime = self.mounted_uptime_secs().map(format_elapsed);
+
+        egui::Frame::new()
+            .fill(success_chip_bg())
+            .stroke(egui::Stroke::new(1.0_f32, success_fg()))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&mount_label).size(20.0).strong().color(text_primary()));
+                        let mut subtitle = format!("{} mounted", self.source_label());
+                        if let Some(uptime) = uptime {
+                            subtitle.push_str(&format!(" · up {uptime}"));
+                        }
+                        ui.label(RichText::new(subtitle).size(12.0).color(text_secondary()));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button(ui, "Open folder", self.active_mount_point.is_some(), 110.0).clicked() {
+                            self.open_active_mount();
+                        }
+                    });
                 });
             });
     }
 
-    fn draw_form(&mut self, ui: &mut egui::Ui) {
+    fn source_label(&self) -> String {
+        let id = self.source_id.trim();
+        match self.source {
+            GuiSource::Repo => format!("Repo {id}"),
+            GuiSource::Bucket => format!("Bucket {id}"),
+        }
+    }
+
+    fn draw_source_section(&mut self, ui: &mut egui::Ui) {
         field_row(ui, "Type", |ui| {
             let before = self.source;
             segmented_pair(
@@ -85,6 +165,28 @@ impl MountGuiApp {
             });
         }
 
+        field_row(ui, "HF token", |ui| {
+            ui.horizontal(|ui| {
+                let toggle_width = 52.0;
+                let field_width = (ui.available_width() - toggle_width - ui.spacing().item_spacing.x).max(120.0);
+                ui.add_sized(
+                    [field_width, 30.0],
+                    egui::TextEdit::singleline(&mut self.hf_token)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Optional access token")
+                        .password(!self.show_token),
+                );
+                let label = if self.show_token { "Hide" } else { "Show" };
+                if ui.add_sized([toggle_width, 30.0], egui::Button::new(label)).clicked() {
+                    self.show_token = !self.show_token;
+                }
+            });
+            ui.add_space(2.0);
+            field_hint(ui, "Uses HF_TOKEN automatically when set. Inline tokens are not saved.");
+        });
+    }
+
+    fn draw_destination_section(&mut self, ui: &mut egui::Ui) {
         field_row(ui, "Mount point", |ui| {
             #[cfg(windows)]
             {
@@ -152,28 +254,9 @@ impl MountGuiApp {
                 }
             });
         });
+    }
 
-        field_row(ui, "HF token", |ui| {
-            ui.horizontal(|ui| {
-                let toggle_width = 52.0;
-                let field_width = (ui.available_width() - toggle_width - ui.spacing().item_spacing.x).max(120.0);
-                ui.add_sized(
-                    [field_width, 30.0],
-                    egui::TextEdit::singleline(&mut self.hf_token)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Optional access token")
-                        .password(!self.show_token),
-                );
-                let label = if self.show_token { "Hide" } else { "Show" };
-                if ui.add_sized([toggle_width, 30.0], egui::Button::new(label)).clicked() {
-                    self.show_token = !self.show_token;
-                }
-            });
-            ui.add_space(2.0);
-            field_hint(ui, "Uses HF_TOKEN automatically when set. Inline tokens are not saved.");
-        });
-
-        ui.add_space(4.0);
+    fn draw_options_section(&mut self, ui: &mut egui::Ui) {
         let advanced_label = if self.show_advanced {
             "Hide advanced options"
         } else {
@@ -185,35 +268,61 @@ impl MountGuiApp {
         {
             self.show_advanced = !self.show_advanced;
         }
-        if self.show_advanced {
-            ui.add_space(6.0);
-            field_row(ui, "Hub endpoint", |ui| {
-                text_field(ui, &mut self.hub_endpoint, "https://huggingface.co", false);
-            });
-            field_row(ui, "Cache dir", |ui| {
-                text_field(ui, &mut self.cache_dir, "Cache directory", false);
-            });
-            field_row(ui, "Token file", |ui| {
-                text_field(ui, &mut self.token_file, "Path to token file", false);
-                ui.add_space(2.0);
-                field_hint(ui, "Re-read on each request; used by background and autostart mounts.");
-            });
-            field_row(ui, "NFS access", |ui| {
-                ui.checkbox(&mut self.nfs_allow_unsafe_loopback, "Allow unsafe loopback fallback")
-                    .on_hover_text(
-                        "Permit NFS without enforceable local caller authorization. Required for \
-                         credential-backed mounts on Windows.",
-                    );
-            });
+        if !self.show_advanced {
+            return;
         }
+
+        ui.add_space(6.0);
+        field_row(ui, "Hub endpoint", |ui| {
+            text_field(ui, &mut self.hub_endpoint, "https://huggingface.co", false);
+        });
+        field_row(ui, "Cache dir", |ui| {
+            text_field(ui, &mut self.cache_dir, "Cache directory", false);
+        });
+        field_row(ui, "Cache size", |ui| {
+            ui.horizontal(|ui| {
+                number_field(ui, &mut self.cache_size_gb, "GB", 100_000);
+                field_hint(ui, "On-disk chunk cache limit.");
+            });
+        });
+        field_row(ui, "Poll interval", |ui| {
+            ui.horizontal(|ui| {
+                number_field(ui, &mut self.poll_interval_secs, "s", 86_400);
+                field_hint(ui, "How often to poll for remote changes. 0 disables polling.");
+            });
+        });
+        field_row(ui, "Metadata TTL", |ui| {
+            ui.horizontal(|ui| {
+                number_field(ui, &mut self.metadata_ttl_ms, "ms", 3_600_000);
+                field_hint(ui, "How long file attributes are trusted before re-checking.");
+            });
+        });
+        field_row(ui, "Read timeout", |ui| {
+            ui.horizontal(|ui| {
+                number_field(ui, &mut self.read_fetch_timeout_ms, "ms", 600_000);
+                field_hint(ui, "Fail a stalled remote read after this long. 0 waits forever.");
+            });
+        });
+        field_row(ui, "Token file", |ui| {
+            text_field(ui, &mut self.token_file, "Path to token file", false);
+            ui.add_space(2.0);
+            field_hint(ui, "Re-read on each request; used by background and autostart mounts.");
+        });
+        field_row(ui, "NFS access", |ui| {
+            ui.checkbox(&mut self.nfs_allow_unsafe_loopback, "Allow unsafe loopback fallback")
+                .on_hover_text(
+                    "Permit NFS without enforceable local caller authorization. Required for \
+                     credential-backed mounts on Windows.",
+                );
+        });
     }
 
     fn draw_blocker_banner(&mut self, ui: &mut egui::Ui, blocker: &CheckItem) {
-        egui::Frame::none()
+        egui::Frame::new()
             .fill(warning_chip_bg())
-            .stroke(egui::Stroke::new(1.0, accent()))
-            .rounding(8.0)
-            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+            .stroke(egui::Stroke::new(1.0_f32, accent()))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(format!("{}: {}", blocker.label, blocker.detail))
@@ -320,9 +429,6 @@ impl MountGuiApp {
             if danger_button(ui, "Stop", running && !stopping, 90.0).clicked() {
                 self.stop_mount();
             }
-            if secondary_button(ui, "Open folder", mounted && self.active_mount_point.is_some(), 110.0).clicked() {
-                self.open_active_mount();
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if secondary_button(ui, "Check setup", true, 110.0).clicked() {
                     self.refresh_checks();
@@ -332,6 +438,7 @@ impl MountGuiApp {
 
         if let Some(mount_point) = &self.active_mount_point
             && running
+            && !mounted
         {
             ui.add_space(6.0);
             ui.label(
