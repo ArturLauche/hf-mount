@@ -30,14 +30,19 @@ impl MountGuiApp {
             .id_salt("setup-checks")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let checks = self.checks.clone();
+                // Blocker actions borrow `self` mutably while we iterate the
+                // checks, so temporarily move the list out instead of cloning
+                // it every frame. Actions may replace `self.checks` (via
+                // refresh); keep whichever list is newer.
+                let checks = std::mem::take(&mut self.checks);
                 for check in &checks {
-                    egui::Frame::none()
+                    egui::Frame::new()
                         .fill(panel_bg())
-                        .stroke(egui::Stroke::new(1.0, border()))
-                        .rounding(8.0)
-                        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                        .stroke(egui::Stroke::new(1.0_f32, border()))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(12, 10))
                         .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             ui.horizontal_top(|ui| {
                                 let (mark, color) = match check.level {
                                     CheckLevel::Pass => ("OK", success_fg()),
@@ -76,6 +81,9 @@ impl MountGuiApp {
                             });
                         });
                     ui.add_space(8.0);
+                }
+                if self.checks.is_empty() {
+                    self.checks = checks;
                 }
 
                 ui.add_space(8.0);

@@ -87,7 +87,7 @@ reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v Enable
 
 ### Build from source
 
-Requires Rust 1.89+.
+Requires Rust 1.95+.
 
 ```bash
 # NFS only (Windows builds produce hf-mount-nfs.exe)
@@ -134,7 +134,7 @@ Download the GUI binary from [GitHub Releases](https://github.com/huggingface/hf
 - macOS Apple Silicon app bundle: `hf-mount-gui-arm64-apple-darwin.app.zip`
 - macOS Apple Silicon raw binary: `hf-mount-gui-arm64-apple-darwin`
 
-The window has three tabs: **Mount** (the source/mount form and Start/Stop actions), **Activity** (the session log, with copy-to-clipboard), and **Setup** (environment checks with fix actions). A status bar at the bottom always shows the current mount state and, while mounted, the elapsed time.
+The window has a sidebar with three sections: **Mount** (the source/mount form and Start/Stop actions; while mounted, a hero panel shows the mount target, the mounted source, uptime, and an Open folder action), **Activity** (the timestamped session log, with copy-to-clipboard), and **Setup** (environment checks with fix actions). A status bar at the bottom always shows the current mount state.
 
 Windows users must enable Client for NFS and run the GUI from an Administrator session. The **Setup** tab validates elevation, the Windows NFS client tools, port `111`, and the mount target; each failing check comes with a fix action (**Enable NFS** launches the feature install, **Restart as admin** relaunches with a UAC prompt) or a copyable command. On Windows the mount-point field has a **Free** drive-letter picker that lists currently unassigned letters. Fill in the repo or bucket ID, mount point, optional token, then press **Start mount**. Press **Stop** to unmount — this also works while the mount is still starting. Recently mounted sources are offered in a **Recent** dropdown for one-click refill.
 

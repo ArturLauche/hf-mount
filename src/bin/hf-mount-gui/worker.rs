@@ -47,6 +47,10 @@ pub struct WorkerStatus {
     pub detail: String,
     #[serde(default)]
     pub mount_point: Option<String>,
+    /// Identity of the mounted source, captured when the mount starts so the
+    /// GUI can describe a reconnected worker even after the form was edited.
+    #[serde(default)]
+    pub source_label: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
     #[serde(default)]
@@ -107,6 +111,7 @@ fn write_worker_status(
     headline: impl Into<String>,
     detail: impl Into<String>,
     mount_point: Option<&Path>,
+    source_label: Option<&str>,
     pid: Option<u32>,
 ) -> Result<(), String> {
     let path = worker_status_path()?;
@@ -115,6 +120,7 @@ fn write_worker_status(
         headline: headline.into(),
         detail: detail.into(),
         mount_point: mount_point.map(|mount_point| mount_point.to_string_lossy().into_owned()),
+        source_label: source_label.map(str::to_owned),
         pid,
         updated_at_secs: current_unix_secs(),
     };
@@ -136,6 +142,7 @@ pub fn mark_worker_stopped(mount_point: Option<&Path>) {
         "Background mount stopped",
         "The worker was stopped before the mount completed.",
         mount_point,
+        None,
         None,
     );
 }
@@ -244,7 +251,7 @@ fn worker_log_file() -> Result<std::fs::File, String> {
 // ── Spawning ──────────────────────────────────────────────────────────
 
 /// Launch a detached `--background-worker` process for the saved profile.
-pub fn spawn_background_worker(mount_point: &Path) -> Result<Child, String> {
+pub fn spawn_background_worker(mount_point: &Path, source_label: &str) -> Result<Child, String> {
     let exe = std::env::current_exe().map_err(|e| format!("Could not locate current executable: {e}"))?;
     clear_worker_status();
     write_worker_status(
@@ -252,6 +259,7 @@ pub fn spawn_background_worker(mount_point: &Path) -> Result<Child, String> {
         "Background worker launching",
         "Starting detached process.",
         Some(mount_point),
+        Some(source_label),
         None,
     )?;
     let result = (|| {
@@ -305,6 +313,7 @@ pub fn run_background_worker() -> Result<(), String> {
                 "Background worker failed to start",
                 &e,
                 None,
+                None,
                 Some(std::process::id()),
             );
             return Err(e);
@@ -312,11 +321,13 @@ pub fn run_background_worker() -> Result<(), String> {
     };
     let worker_mount_point = source.mount_point().to_path_buf();
     let mount_label = worker_mount_point.display().to_string();
+    let source_label = source.label();
     write_worker_status(
         WorkerState::Mounting,
         "Background worker starting",
         format!("Target: {mount_label}"),
         Some(&worker_mount_point),
+        Some(&source_label),
         Some(std::process::id()),
     )?;
 
@@ -333,6 +344,7 @@ pub fn run_background_worker() -> Result<(), String> {
             shutdown: None,
         };
         let event_mount_point = mount_point.clone();
+        let event_source_label = source_label.clone();
         setup
             .runtime
             .block_on(hf_mount::nfs::mount_nfs_with_callback(
@@ -340,7 +352,7 @@ pub fn run_background_worker() -> Result<(), String> {
                 &mount_point,
                 params,
                 None,
-                move |event| handle_background_mount_event(&event_mount_point, event),
+                move |event| handle_background_mount_event(&event_mount_point, &event_source_label, event),
             ))
             .map_err(|e| e.to_string())
     }));
@@ -353,6 +365,7 @@ pub fn run_background_worker() -> Result<(), String> {
                 "Background mount stopped",
                 "The background worker exited cleanly.",
                 Some(&worker_mount_point),
+                Some(&source_label),
                 Some(std::process::id()),
             )?;
             Ok(())
@@ -364,6 +377,7 @@ pub fn run_background_worker() -> Result<(), String> {
                 "Mount failed",
                 &message,
                 Some(&worker_mount_point),
+                Some(&source_label),
                 Some(std::process::id()),
             );
             Err(message)
@@ -376,6 +390,7 @@ pub fn run_background_worker() -> Result<(), String> {
                 "Mount crashed",
                 &message,
                 Some(&worker_mount_point),
+                Some(&source_label),
                 Some(std::process::id()),
             );
             Err(message)
@@ -383,7 +398,7 @@ pub fn run_background_worker() -> Result<(), String> {
     }
 }
 
-fn handle_background_mount_event(default_mount_point: &Path, event: NfsMountEvent) {
+fn handle_background_mount_event(default_mount_point: &Path, source_label: &str, event: NfsMountEvent) {
     match event {
         NfsMountEvent::ServerListening { port } => {
             append_worker_log(format!("Local NFS server is listening on 127.0.0.1:{port}"));
@@ -392,6 +407,7 @@ fn handle_background_mount_event(default_mount_point: &Path, event: NfsMountEven
                 "Local NFS server is listening",
                 format!("127.0.0.1:{port}"),
                 Some(default_mount_point),
+                Some(source_label),
                 Some(std::process::id()),
             );
         }
@@ -406,6 +422,7 @@ fn handle_background_mount_event(default_mount_point: &Path, event: NfsMountEven
                 "Mounted",
                 format!("Mounted at {mount_point}"),
                 Some(event_mount_point),
+                Some(source_label),
                 Some(std::process::id()),
             );
         }
@@ -416,6 +433,7 @@ fn handle_background_mount_event(default_mount_point: &Path, event: NfsMountEven
                 "Shutting down",
                 reason,
                 Some(default_mount_point),
+                Some(source_label),
                 Some(std::process::id()),
             );
         }
@@ -542,5 +560,42 @@ impl Drop for WorkerPoller {
                 let _ = handle.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_status_without_source_label_still_parses() {
+        // Status files written by older GUI versions lack `source_label`.
+        let json = r#"{
+            "state":"Mounted",
+            "headline":"Mounted",
+            "detail":"Mounted at /tmp/hf-mount",
+            "mount_point":"/tmp/hf-mount",
+            "pid":1234,
+            "updated_at_secs":1700000000
+        }"#;
+        let status: WorkerStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status.source_label, None);
+        assert_eq!(status.mount_point.as_deref(), Some("/tmp/hf-mount"));
+    }
+
+    #[test]
+    fn worker_status_roundtrips_source_label() {
+        let status = WorkerStatus {
+            state: WorkerState::Mounted,
+            headline: "Mounted".to_string(),
+            detail: "Mounted at /tmp/hf-mount".to_string(),
+            mount_point: Some("/tmp/hf-mount".to_string()),
+            source_label: Some("model/openai-community/gpt2/main".to_string()),
+            pid: Some(1234),
+            updated_at_secs: 1_700_000_000,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: WorkerStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, status);
     }
 }

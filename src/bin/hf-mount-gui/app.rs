@@ -1,4 +1,4 @@
-//! Application state and frame layout: header with tabs, central tab body,
+//! Application state and frame layout: sidebar navigation, central tab body,
 //! bottom status bar. Mount control (start/stop) and background-worker
 //! synchronization live here; the tab bodies are in `*_tab.rs`.
 
@@ -21,7 +21,7 @@ use crate::profile::{
 };
 use crate::theme::*;
 use crate::util::{current_env_hf_token, format_elapsed, optional_text, panic_message};
-use crate::widgets::{status_chip, tab_button};
+use crate::widgets::{nav_item, status_chip};
 use crate::worker::{WorkerPoller, WorkerSnapshot, WorkerStatus, spawn_background_worker};
 
 const MAX_LOG_LINES: usize = 200;
@@ -33,7 +33,7 @@ pub enum Tab {
     Setup,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountState {
     Ready,
     Mounting,
@@ -43,19 +43,58 @@ pub enum MountState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Error,
+}
+
+impl LogLevel {
+    /// Stable token used when serializing log lines (e.g. Copy log).
+    pub fn as_token(self) -> &'static str {
+        match self {
+            LogLevel::Info => "INFO",
+            LogLevel::Error => "ERROR",
+        }
+    }
+}
+
+/// One session-log line: wall-clock timestamp, severity, message. Structured
+/// at insert time so the Activity tab renders without per-frame formatting.
+#[derive(Clone, Debug)]
+pub struct LogEntry {
+    pub time: String,
+    pub level: LogLevel,
+    pub text: String,
+}
+
+impl LogEntry {
+    fn new(level: LogLevel, text: String) -> Self {
+        Self {
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            level,
+            text,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SharedStatus {
+    /// Bumped on every mutation. The UI thread re-clones this struct only when
+    /// the revision moved, instead of cloning the whole log every frame.
+    pub revision: u64,
     pub state: MountState,
     pub headline: String,
     pub detail: String,
-    pub log: VecDeque<String>,
+    pub log: VecDeque<LogEntry>,
 }
 
 impl Default for SharedStatus {
     fn default() -> Self {
         let mut log = VecDeque::new();
-        log.push_back("Ready".to_string());
+        log.push_back(LogEntry::new(LogLevel::Info, "Ready".to_string()));
         Self {
+            revision: 1,
             state: MountState::Ready,
             headline: "Ready".to_string(),
             detail: "Configure a source and start the mount.".to_string(),
@@ -65,6 +104,13 @@ impl Default for SharedStatus {
 }
 
 pub type SharedMountStatus = Arc<Mutex<SharedStatus>>;
+
+fn level_for_state(state: MountState) -> LogLevel {
+    match state {
+        MountState::Failed => LogLevel::Error,
+        _ => LogLevel::Info,
+    }
+}
 
 pub fn set_status(
     status: &SharedMountStatus,
@@ -78,7 +124,7 @@ pub fn set_status(
     status.state = state;
     status.headline = headline.clone();
     status.detail = detail.clone();
-    push_log_locked(&mut status, format!("{headline}: {detail}"));
+    push_log_locked(&mut status, level_for_state(state), format!("{headline}: {detail}"));
 }
 
 pub fn set_status_if_changed(
@@ -96,16 +142,21 @@ pub fn set_status_if_changed(
     status.state = state;
     status.headline = headline.clone();
     status.detail = detail.clone();
-    push_log_locked(&mut status, format!("{headline}: {detail}"));
+    push_log_locked(&mut status, level_for_state(state), format!("{headline}: {detail}"));
 }
 
 pub fn push_log(status: &SharedMountStatus, message: impl Into<String>) {
-    let mut status = status.lock().expect("status mutex poisoned");
-    push_log_locked(&mut status, message.into());
+    push_log_with_level(status, LogLevel::Info, message);
 }
 
-fn push_log_locked(status: &mut SharedStatus, message: String) {
-    status.log.push_back(message);
+pub fn push_log_with_level(status: &SharedMountStatus, level: LogLevel, message: impl Into<String>) {
+    let mut status = status.lock().expect("status mutex poisoned");
+    push_log_locked(&mut status, level, message.into());
+}
+
+fn push_log_locked(status: &mut SharedStatus, level: LogLevel, message: String) {
+    status.revision = status.revision.wrapping_add(1);
+    status.log.push_back(LogEntry::new(level, message));
     while status.log.len() > MAX_LOG_LINES {
         status.log.pop_front();
     }
@@ -125,6 +176,10 @@ pub struct MountGuiApp {
     pub read_only: bool,
     pub run_in_background: bool,
     pub nfs_allow_unsafe_loopback: bool,
+    pub cache_size_gb: u64,
+    pub poll_interval_secs: u64,
+    pub metadata_ttl_ms: u64,
+    pub read_fetch_timeout_ms: u64,
     pub autostart_enabled: bool,
     pub show_advanced: bool,
     pub recent_sources: Vec<RecentSource>,
@@ -132,6 +187,9 @@ pub struct MountGuiApp {
     // UI state.
     pub tab: Tab,
     pub checks: Vec<CheckItem>,
+    /// Frame-local copy of the shared status, refreshed only when the shared
+    /// revision moves — the UI never re-clones an unchanged log.
+    status_cache: SharedStatus,
 
     // Mount state.
     pub status: SharedMountStatus,
@@ -141,6 +199,9 @@ pub struct MountGuiApp {
     background_child: Option<Child>,
     pub active_background: bool,
     pub active_mount_point: Option<PathBuf>,
+    /// Identity of the source captured when the active mount started;
+    /// independent of the editable form fields.
+    pub active_source_label: Option<String>,
     mounted_since: Option<Instant>,
     worker_poller: Option<WorkerPoller>,
     last_worker_generation: u64,
@@ -156,6 +217,9 @@ impl MountGuiApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mount_point = platform::default_mount_point();
         let checks = run_preflight_checks(&mount_point);
+        // Cache and shared status must start from the same snapshot: the
+        // revision-gated refresh assumes equal revision implies equal content.
+        let initial_status = SharedStatus::default();
         let mut app = Self {
             source: GuiSource::Repo,
             source_id: "openai-community/gpt2".to_string(),
@@ -169,18 +233,24 @@ impl MountGuiApp {
             read_only: true,
             run_in_background: false,
             nfs_allow_unsafe_loopback: false,
+            cache_size_gb: crate::profile::DEFAULT_CACHE_SIZE_GB,
+            poll_interval_secs: crate::profile::DEFAULT_POLL_INTERVAL_SECS,
+            metadata_ttl_ms: crate::profile::DEFAULT_METADATA_TTL_MS,
+            read_fetch_timeout_ms: crate::profile::DEFAULT_READ_FETCH_TIMEOUT_MS,
             autostart_enabled: crate::autostart::autostart_is_enabled(),
             show_advanced: false,
             recent_sources: Vec::new(),
             tab: Tab::Mount,
             checks,
-            status: Arc::new(Mutex::new(SharedStatus::default())),
+            status_cache: initial_status.clone(),
+            status: Arc::new(Mutex::new(initial_status)),
             mount_thread: None,
             mount_shutdown: None,
             stop_thread: None,
             background_child: None,
             active_background: false,
             active_mount_point: None,
+            active_source_label: None,
             mounted_since: None,
             worker_poller: None,
             last_worker_generation: 0,
@@ -194,7 +264,11 @@ impl MountGuiApp {
                 app.checks = run_preflight_checks(&app.mount_point);
             }
             Ok(None) => {}
-            Err(e) => push_log(&app.status, format!("Could not load saved settings: {e}")),
+            Err(e) => push_log_with_level(
+                &app.status,
+                LogLevel::Error,
+                format!("Could not load saved settings: {e}"),
+            ),
         }
 
         // Reconcile any existing background worker synchronously before the
@@ -221,6 +295,10 @@ impl MountGuiApp {
         self.read_only = profile.read_only || self.source == GuiSource::Repo;
         self.run_in_background = profile.run_in_background;
         self.nfs_allow_unsafe_loopback = profile.nfs_allow_unsafe_loopback;
+        self.cache_size_gb = profile.cache_size_gb;
+        self.poll_interval_secs = profile.poll_interval_secs;
+        self.metadata_ttl_ms = profile.metadata_ttl_ms;
+        self.read_fetch_timeout_ms = profile.read_fetch_timeout_ms;
         self.recent_sources = profile.recent_sources;
     }
 
@@ -236,6 +314,10 @@ impl MountGuiApp {
             read_only: self.source == GuiSource::Repo || self.read_only,
             run_in_background: self.run_in_background,
             nfs_allow_unsafe_loopback: self.nfs_allow_unsafe_loopback,
+            cache_size_gb: self.cache_size_gb,
+            poll_interval_secs: self.poll_interval_secs,
+            metadata_ttl_ms: self.metadata_ttl_ms,
+            read_fetch_timeout_ms: self.read_fetch_timeout_ms,
             recent_sources: self.recent_sources.clone(),
         }
     }
@@ -288,8 +370,30 @@ impl MountGuiApp {
         push_log(&self.status, summarize_checks(&self.checks));
     }
 
-    pub fn current_status(&self) -> SharedStatus {
-        self.status.lock().expect("status mutex poisoned").clone()
+    /// Refresh the frame-local status cache if the shared status changed.
+    /// Called once per frame before drawing; the lock is held only long enough
+    /// to compare revisions (and clone when they differ).
+    fn refresh_status_cache(&mut self) {
+        let shared = self.status.lock().expect("status mutex poisoned");
+        if shared.revision != self.status_cache.revision {
+            self.status_cache = shared.clone();
+        }
+    }
+
+    /// Frame-local snapshot of the shared status. Cheap — no lock, no clone.
+    pub fn current_status(&self) -> &SharedStatus {
+        &self.status_cache
+    }
+
+    /// Read the live shared state directly (single small lock). For control
+    /// paths that must observe status written earlier in the same frame.
+    pub fn live_state(&self) -> MountState {
+        self.status.lock().expect("status mutex poisoned").state
+    }
+
+    /// Seconds since the current mount reached `Mounted`, if it is mounted.
+    pub fn mounted_uptime_secs(&self) -> Option<u64> {
+        self.mounted_since.map(|since| since.elapsed().as_secs())
     }
 
     pub fn is_mount_running(&self) -> bool {
@@ -347,6 +451,7 @@ impl MountGuiApp {
         };
         let mount_point = source.mount_point().to_path_buf();
         let mount_label = mount_point.display().to_string();
+        let source_label = source.label();
 
         let inline_token = optional_text(&self.hf_token);
         if self.run_in_background
@@ -378,11 +483,12 @@ impl MountGuiApp {
 
         if self.run_in_background {
             self.background_stop_requested = false;
-            match spawn_background_worker(&mount_point) {
+            match spawn_background_worker(&mount_point, &source_label) {
                 Ok(child) => {
                     self.background_child = Some(child);
                     self.active_background = true;
                     self.active_mount_point = Some(mount_point);
+                    self.active_source_label = Some(source_label);
                     set_status(
                         &self.status,
                         MountState::Mounting,
@@ -399,6 +505,7 @@ impl MountGuiApp {
 
         self.active_background = false;
         self.active_mount_point = Some(mount_point);
+        self.active_source_label = Some(source_label);
         let shutdown = MountShutdown::new();
         self.mount_shutdown = Some(shutdown.clone());
         let shared_status = self.status.clone();
@@ -509,6 +616,7 @@ impl MountGuiApp {
         if crate::worker::worker_status_heartbeat_fresh(&status) {
             self.active_background = true;
             self.active_mount_point = worker_mount_point(&status);
+            self.active_source_label = status.source_label.clone();
             set_status_if_changed(
                 &self.status,
                 worker_mount_state(&status),
@@ -540,6 +648,7 @@ impl MountGuiApp {
                 crate::worker::mark_worker_stopped(self.active_mount_point.as_deref());
                 self.active_background = false;
                 self.active_mount_point = None;
+                self.active_source_label = None;
                 set_status(
                     &self.status,
                     MountState::Stopped,
@@ -583,13 +692,18 @@ impl MountGuiApp {
                 if platform::mount_point_is_ours(&mount_point)
                     && let Err(e) = platform::unmount_path(&mount_point)
                 {
-                    push_log(&status, format!("Post-stop cleanup unmount failed: {e}"));
+                    push_log_with_level(
+                        &status,
+                        LogLevel::Error,
+                        format!("Post-stop cleanup unmount failed: {e}"),
+                    );
                 }
             }));
         }
 
         self.active_background = false;
         self.active_mount_point = None;
+        self.active_source_label = None;
         set_status(
             &self.status,
             MountState::Stopped,
@@ -629,7 +743,11 @@ impl MountGuiApp {
 
     fn apply_worker_snapshot(&mut self, snapshot: WorkerSnapshot, first: bool) {
         if let Some(error) = &snapshot.error {
-            push_log(&self.status, format!("Could not read background status: {error}"));
+            push_log_with_level(
+                &self.status,
+                LogLevel::Error,
+                format!("Could not read background status: {error}"),
+            );
             return;
         }
 
@@ -638,6 +756,7 @@ impl MountGuiApp {
             if self.active_background {
                 self.active_background = false;
                 self.active_mount_point = None;
+                self.active_source_label = None;
                 set_status(
                     &self.status,
                     MountState::Failed,
@@ -660,6 +779,9 @@ impl MountGuiApp {
             if let Some(mount_point) = worker_mount_point(&status) {
                 self.active_mount_point = Some(mount_point);
             }
+            if let Some(label) = &status.source_label {
+                self.active_source_label = Some(label.clone());
+            }
             if newly_connected && first {
                 push_log(&self.status, "Reconnected to background worker");
             }
@@ -677,6 +799,7 @@ impl MountGuiApp {
                 self.background_child = None;
                 if self.mount_thread.is_none() {
                     self.active_mount_point = None;
+                    self.active_source_label = None;
                 }
             }
         }
@@ -704,9 +827,10 @@ impl MountGuiApp {
                 self.background_child = None;
                 self.active_background = false;
                 self.active_mount_point = None;
+                self.active_source_label = None;
                 // The worker's own status file usually carries a more specific
                 // message; only fall back to the exit code when it didn't.
-                let current = self.current_status().state;
+                let current = self.live_state();
                 if exit_status.success() {
                     if !matches!(current, MountState::Stopped | MountState::Failed) {
                         set_status(
@@ -761,9 +885,10 @@ impl MountGuiApp {
         self.mount_shutdown = None;
         if !self.active_background {
             self.active_mount_point = None;
+            self.active_source_label = None;
         }
 
-        let current = self.current_status().state;
+        let current = self.live_state();
         if !matches!(current, MountState::Failed | MountState::Stopped) {
             set_status(
                 &self.status,
@@ -783,7 +908,7 @@ impl MountGuiApp {
     }
 
     fn track_mounted_since(&mut self) {
-        let mounted = self.current_status().state == MountState::Mounted;
+        let mounted = self.live_state() == MountState::Mounted;
         match (mounted, self.mounted_since) {
             (true, None) => self.mounted_since = Some(Instant::now()),
             (false, Some(_)) => self.mounted_since = None,
@@ -793,47 +918,74 @@ impl MountGuiApp {
 
     // ── Frame layout ──────────────────────────────────────────────────
 
-    fn draw_header(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(12.0);
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(18.0);
+
+        // Identity block.
         ui.horizontal(|ui| {
-            ui.add_space(16.0);
-            ui.label(RichText::new("hf-mount").size(16.0).strong().color(text_primary()));
-            ui.label(
-                RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                    .size(11.0)
-                    .color(muted_text()),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(16.0);
-                let status = self.current_status();
-                status_chip(ui, &status.state);
+            ui.add_space(14.0);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("hf").size(17.0).strong().color(accent()));
+                    ui.add_space(-4.0);
+                    ui.label(RichText::new("mount").size(17.0).strong().color(text_primary()));
+                });
+                ui.label(
+                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .size(10.5)
+                        .color(muted_text()),
+                );
             });
         });
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.add_space(16.0);
-            ui.spacing_mut().item_spacing.x = 20.0;
-            for (tab, label) in [
-                (Tab::Mount, "Mount"),
-                (Tab::Activity, "Activity"),
-                (Tab::Setup, "Setup"),
-            ] {
-                if tab_button(ui, label, self.tab == tab) {
-                    self.tab = tab;
+        ui.add_space(18.0);
+
+        // Navigation.
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let margin = egui::Margin::symmetric(8, 0);
+            egui::Frame::new().inner_margin(margin).show(ui, |ui| {
+                for (tab, label) in [
+                    (Tab::Mount, "Mount"),
+                    (Tab::Activity, "Activity"),
+                    (Tab::Setup, "Setup"),
+                ] {
+                    if nav_item(ui, label, self.tab == tab) {
+                        self.tab = tab;
+                    }
                 }
-            }
+            });
         });
-        ui.add_space(8.0);
-        let rect = ui.max_rect();
-        ui.painter()
-            .hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, border()));
+
+        // Live status pinned to the bottom of the sidebar.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(14.0);
+            let status = &self.status_cache;
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(14, 0))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("{} · NFS", platform::platform_label()))
+                            .size(10.5)
+                            .color(muted_text()),
+                    );
+                    if let Some(since) = self.mounted_since {
+                        ui.label(
+                            RichText::new(format!("Up {}", format_elapsed(since.elapsed().as_secs())))
+                                .size(10.5)
+                                .color(text_secondary()),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    status_chip(ui, &status.state);
+                });
+        });
     }
 
     fn draw_status_bar(&mut self, ui: &mut egui::Ui) {
-        let status = self.current_status();
+        let status = &self.status_cache;
         let rect = ui.max_rect();
         ui.painter()
-            .hline(rect.x_range(), rect.top(), egui::Stroke::new(1.0, border()));
+            .hline(rect.x_range(), rect.top(), egui::Stroke::new(1.0_f32, border()));
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(16.0);
@@ -845,50 +997,38 @@ impl MountGuiApp {
                     .color(text_primary()),
             );
             ui.add(egui::Label::new(RichText::new(&status.detail).size(12.0).color(text_secondary())).truncate());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(16.0);
-                ui.label(
-                    RichText::new(format!("{} · NFS", platform::platform_label()))
-                        .size(11.0)
-                        .color(muted_text()),
-                );
-                if let Some(since) = self.mounted_since {
-                    ui.label(
-                        RichText::new(format_elapsed(since.elapsed().as_secs()))
-                            .size(11.0)
-                            .color(text_secondary()),
-                    );
-                }
-            });
         });
         ui.add_space(8.0);
     }
 }
 
 impl eframe::App for MountGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.collect_finished();
+        self.refresh_status_cache();
         // Steady repaint for elapsed time and thread collection; worker
         // updates additionally wake the UI through the poller's callback.
-        ctx.request_repaint_after(Duration::from_millis(1000));
+        ui.ctx().request_repaint_after(Duration::from_millis(1000));
 
-        egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(header_bg()))
-            .show_separator_line(false)
-            .show(ctx, |ui| self.draw_header(ui));
+        egui::Panel::left("sidebar")
+            .frame(egui::Frame::new().fill(sidebar_bg()))
+            .exact_size(168.0)
+            .resizable(false)
+            .show_separator_line(true)
+            .show(ui, |ui| self.draw_sidebar(ui));
 
-        egui::TopBottomPanel::bottom("status-bar")
-            .frame(egui::Frame::none().fill(header_bg()))
+        egui::Panel::bottom("status-bar")
+            .frame(egui::Frame::new().fill(sidebar_bg()))
             .show_separator_line(false)
-            .show(ctx, |ui| self.draw_status_bar(ui));
+            .show(ui, |ui| self.draw_status_bar(ui));
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(app_bg())
-                    .inner_margin(egui::Margin::symmetric(20.0, 16.0)),
+                    .inner_margin(egui::Margin::symmetric(24, 20)),
             )
-            .show(ctx, |ui| match self.tab {
+            .show(ui, |ui| match self.tab {
                 Tab::Mount => self.draw_mount_tab(ui),
                 Tab::Activity => self.draw_activity_tab(ui),
                 Tab::Setup => self.draw_setup_tab(ui),
