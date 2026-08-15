@@ -90,6 +90,15 @@ impl Source {
     }
 }
 
+/// Defaults for tunables that other frontends (e.g. the GUI profile) mirror.
+/// Keeping them as named constants gives those frontends a compile-time link
+/// to the CLI defaults instead of silently divergeable copies.
+pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_CACHE_SIZE_BYTES: u64 = 10_000_000_000;
+pub const DEFAULT_METADATA_TTL_MS: u64 = 10_000;
+pub const DEFAULT_READ_FETCH_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_FLUSH_SHUTDOWN_TIMEOUT_MS: u64 = 45_000;
+
 /// Mount options shared across all binaries (FUSE, NFS, daemon).
 #[derive(clap::Args)]
 pub struct MountOptions {
@@ -131,7 +140,7 @@ pub struct MountOptions {
     pub advanced_writes: bool,
 
     /// Interval in seconds for polling remote changes (0 to disable).
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_POLL_INTERVAL_SECS)]
     pub poll_interval_secs: u64,
 
     /// Maximum number of concurrent tree-listing requests per poll round.
@@ -144,7 +153,7 @@ pub struct MountOptions {
     pub poll_listing_concurrency: u32,
 
     /// Maximum size in bytes for the on-disk chunk cache.
-    #[arg(long, default_value_t = 10_000_000_000)]
+    #[arg(long, default_value_t = DEFAULT_CACHE_SIZE_BYTES)]
     pub cache_size: u64,
 
     /// Maximum size in bytes for staging files (advanced writes).
@@ -179,7 +188,7 @@ pub struct MountOptions {
     /// give fresher metadata but increase latency on directory traversals
     /// (e.g. `du`, `find`, `ls -lR`) since each file lookup triggers a
     /// HEAD request after the TTL expires.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = DEFAULT_METADATA_TTL_MS)]
     pub metadata_ttl_ms: u64,
 
     /// Always HEAD on every lookup (skip in-memory TTL cache).
@@ -199,7 +208,7 @@ pub struct MountOptions {
     /// reads. Bounding the per-chunk wait frees the thread (and cancels the
     /// in-flight request by dropping the stream) so the mount stays alive.
     /// 0 disables the timeout (legacy unbounded behaviour).
-    #[arg(long, default_value_t = 30_000)]
+    #[arg(long, default_value_t = DEFAULT_READ_FETCH_TIMEOUT_MS)]
     pub read_fetch_timeout_ms: u64,
 
     /// Flush debounce delay in milliseconds. After the first dirty file is
@@ -217,7 +226,7 @@ pub struct MountOptions {
     /// below the pod's terminationGracePeriodSeconds: an unbounded drain on a
     /// slow Hub/CAS backend keeps the FUSE connection alive past grace, leaving
     /// processes blocked on the mount unkillable and stranding the pod.
-    #[arg(long, default_value_t = 45_000)]
+    #[arg(long, default_value_t = DEFAULT_FLUSH_SHUTDOWN_TIMEOUT_MS)]
     pub flush_shutdown_timeout_ms: u64,
 
     /// Disable filtering of OS junk files (.DS_Store, Thumbs.db, etc.).

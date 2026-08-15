@@ -62,7 +62,7 @@ impl MountGuiApp {
             let text = status
                 .log
                 .iter()
-                .map(|entry| format!("{} {}", entry.time, entry.text))
+                .map(|entry| format!("{} {} {}", entry.time, entry.level.as_token(), entry.text))
                 .collect::<Vec<_>>()
                 .join("\n");
             ui.ctx().copy_text(text);

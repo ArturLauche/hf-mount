@@ -47,7 +47,9 @@ pub fn text_secondary() -> egui::Color32 {
 }
 
 pub fn muted_text() -> egui::Color32 {
-    egui::Color32::from_rgb(118, 118, 128)
+    // ≥ 4.5:1 contrast against every surface it renders on (app, panel,
+    // input, elevated) — this token is used for ~11px helper text.
+    egui::Color32::from_rgb(140, 140, 150)
 }
 
 // ── Accent & semantic colors ──────────────────────────────────────────

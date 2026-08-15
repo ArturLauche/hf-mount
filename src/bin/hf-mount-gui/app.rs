@@ -49,6 +49,16 @@ pub enum LogLevel {
     Error,
 }
 
+impl LogLevel {
+    /// Stable token used when serializing log lines (e.g. Copy log).
+    pub fn as_token(self) -> &'static str {
+        match self {
+            LogLevel::Info => "INFO",
+            LogLevel::Error => "ERROR",
+        }
+    }
+}
+
 /// One session-log line: wall-clock timestamp, severity, message. Structured
 /// at insert time so the Activity tab renders without per-frame formatting.
 #[derive(Clone, Debug)]
@@ -136,8 +146,12 @@ pub fn set_status_if_changed(
 }
 
 pub fn push_log(status: &SharedMountStatus, message: impl Into<String>) {
+    push_log_with_level(status, LogLevel::Info, message);
+}
+
+pub fn push_log_with_level(status: &SharedMountStatus, level: LogLevel, message: impl Into<String>) {
     let mut status = status.lock().expect("status mutex poisoned");
-    push_log_locked(&mut status, LogLevel::Info, message.into());
+    push_log_locked(&mut status, level, message.into());
 }
 
 fn push_log_locked(status: &mut SharedStatus, level: LogLevel, message: String) {
@@ -185,6 +199,9 @@ pub struct MountGuiApp {
     background_child: Option<Child>,
     pub active_background: bool,
     pub active_mount_point: Option<PathBuf>,
+    /// Identity of the source captured when the active mount started;
+    /// independent of the editable form fields.
+    pub active_source_label: Option<String>,
     mounted_since: Option<Instant>,
     worker_poller: Option<WorkerPoller>,
     last_worker_generation: u64,
@@ -200,6 +217,9 @@ impl MountGuiApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mount_point = platform::default_mount_point();
         let checks = run_preflight_checks(&mount_point);
+        // Cache and shared status must start from the same snapshot: the
+        // revision-gated refresh assumes equal revision implies equal content.
+        let initial_status = SharedStatus::default();
         let mut app = Self {
             source: GuiSource::Repo,
             source_id: "openai-community/gpt2".to_string(),
@@ -222,14 +242,15 @@ impl MountGuiApp {
             recent_sources: Vec::new(),
             tab: Tab::Mount,
             checks,
-            status_cache: SharedStatus::default(),
-            status: Arc::new(Mutex::new(SharedStatus::default())),
+            status_cache: initial_status.clone(),
+            status: Arc::new(Mutex::new(initial_status)),
             mount_thread: None,
             mount_shutdown: None,
             stop_thread: None,
             background_child: None,
             active_background: false,
             active_mount_point: None,
+            active_source_label: None,
             mounted_since: None,
             worker_poller: None,
             last_worker_generation: 0,
@@ -243,7 +264,11 @@ impl MountGuiApp {
                 app.checks = run_preflight_checks(&app.mount_point);
             }
             Ok(None) => {}
-            Err(e) => push_log(&app.status, format!("Could not load saved settings: {e}")),
+            Err(e) => push_log_with_level(
+                &app.status,
+                LogLevel::Error,
+                format!("Could not load saved settings: {e}"),
+            ),
         }
 
         // Reconcile any existing background worker synchronously before the
@@ -426,6 +451,7 @@ impl MountGuiApp {
         };
         let mount_point = source.mount_point().to_path_buf();
         let mount_label = mount_point.display().to_string();
+        let source_label = source.label();
 
         let inline_token = optional_text(&self.hf_token);
         if self.run_in_background
@@ -457,11 +483,12 @@ impl MountGuiApp {
 
         if self.run_in_background {
             self.background_stop_requested = false;
-            match spawn_background_worker(&mount_point) {
+            match spawn_background_worker(&mount_point, &source_label) {
                 Ok(child) => {
                     self.background_child = Some(child);
                     self.active_background = true;
                     self.active_mount_point = Some(mount_point);
+                    self.active_source_label = Some(source_label);
                     set_status(
                         &self.status,
                         MountState::Mounting,
@@ -478,6 +505,7 @@ impl MountGuiApp {
 
         self.active_background = false;
         self.active_mount_point = Some(mount_point);
+        self.active_source_label = Some(source_label);
         let shutdown = MountShutdown::new();
         self.mount_shutdown = Some(shutdown.clone());
         let shared_status = self.status.clone();
@@ -588,6 +616,7 @@ impl MountGuiApp {
         if crate::worker::worker_status_heartbeat_fresh(&status) {
             self.active_background = true;
             self.active_mount_point = worker_mount_point(&status);
+            self.active_source_label = status.source_label.clone();
             set_status_if_changed(
                 &self.status,
                 worker_mount_state(&status),
@@ -619,6 +648,7 @@ impl MountGuiApp {
                 crate::worker::mark_worker_stopped(self.active_mount_point.as_deref());
                 self.active_background = false;
                 self.active_mount_point = None;
+                self.active_source_label = None;
                 set_status(
                     &self.status,
                     MountState::Stopped,
@@ -662,13 +692,18 @@ impl MountGuiApp {
                 if platform::mount_point_is_ours(&mount_point)
                     && let Err(e) = platform::unmount_path(&mount_point)
                 {
-                    push_log(&status, format!("Post-stop cleanup unmount failed: {e}"));
+                    push_log_with_level(
+                        &status,
+                        LogLevel::Error,
+                        format!("Post-stop cleanup unmount failed: {e}"),
+                    );
                 }
             }));
         }
 
         self.active_background = false;
         self.active_mount_point = None;
+        self.active_source_label = None;
         set_status(
             &self.status,
             MountState::Stopped,
@@ -708,7 +743,11 @@ impl MountGuiApp {
 
     fn apply_worker_snapshot(&mut self, snapshot: WorkerSnapshot, first: bool) {
         if let Some(error) = &snapshot.error {
-            push_log(&self.status, format!("Could not read background status: {error}"));
+            push_log_with_level(
+                &self.status,
+                LogLevel::Error,
+                format!("Could not read background status: {error}"),
+            );
             return;
         }
 
@@ -717,6 +756,7 @@ impl MountGuiApp {
             if self.active_background {
                 self.active_background = false;
                 self.active_mount_point = None;
+                self.active_source_label = None;
                 set_status(
                     &self.status,
                     MountState::Failed,
@@ -739,6 +779,9 @@ impl MountGuiApp {
             if let Some(mount_point) = worker_mount_point(&status) {
                 self.active_mount_point = Some(mount_point);
             }
+            if let Some(label) = &status.source_label {
+                self.active_source_label = Some(label.clone());
+            }
             if newly_connected && first {
                 push_log(&self.status, "Reconnected to background worker");
             }
@@ -756,6 +799,7 @@ impl MountGuiApp {
                 self.background_child = None;
                 if self.mount_thread.is_none() {
                     self.active_mount_point = None;
+                    self.active_source_label = None;
                 }
             }
         }
@@ -783,6 +827,7 @@ impl MountGuiApp {
                 self.background_child = None;
                 self.active_background = false;
                 self.active_mount_point = None;
+                self.active_source_label = None;
                 // The worker's own status file usually carries a more specific
                 // message; only fall back to the exit code when it didn't.
                 let current = self.live_state();
@@ -840,6 +885,7 @@ impl MountGuiApp {
         self.mount_shutdown = None;
         if !self.active_background {
             self.active_mount_point = None;
+            self.active_source_label = None;
         }
 
         let current = self.live_state();

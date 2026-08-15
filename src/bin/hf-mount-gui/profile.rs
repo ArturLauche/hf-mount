@@ -41,12 +41,14 @@ impl RecentSource {
     }
 }
 
-// Serde defaults mirror the CLI defaults in `MountOptions` so profiles saved
-// by older GUI versions keep loading and behave exactly as before.
-pub const DEFAULT_CACHE_SIZE_GB: u64 = 10;
-pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
-pub const DEFAULT_METADATA_TTL_MS: u64 = 10_000;
-pub const DEFAULT_READ_FETCH_TIMEOUT_MS: u64 = 30_000;
+// Serde defaults are the CLI defaults from `setup.rs` so profiles saved by
+// older GUI versions keep loading and behave exactly as before. Deriving them
+// from the exported constants means a core default change propagates here at
+// compile time instead of diverging silently.
+pub const DEFAULT_CACHE_SIZE_GB: u64 = hf_mount::setup::DEFAULT_CACHE_SIZE_BYTES / 1_000_000_000;
+pub const DEFAULT_POLL_INTERVAL_SECS: u64 = hf_mount::setup::DEFAULT_POLL_INTERVAL_SECS;
+pub const DEFAULT_METADATA_TTL_MS: u64 = hf_mount::setup::DEFAULT_METADATA_TTL_MS;
+pub const DEFAULT_READ_FETCH_TIMEOUT_MS: u64 = hf_mount::setup::DEFAULT_READ_FETCH_TIMEOUT_MS;
 
 fn default_cache_size_gb() -> u64 {
     DEFAULT_CACHE_SIZE_GB
@@ -195,7 +197,7 @@ pub fn profile_mount_options(profile: &MountProfile) -> Result<MountOptions, Str
         read_fetch_timeout_ms: profile.read_fetch_timeout_ms,
         flush_debounce_ms: 2_000,
         flush_max_batch_window_ms: 30_000,
-        flush_shutdown_timeout_ms: 45_000,
+        flush_shutdown_timeout_ms: hf_mount::setup::DEFAULT_FLUSH_SHUTDOWN_TIMEOUT_MS,
         no_filter_os_files: false,
         fuse_owner_only: false,
         fuse_allow_other: false,
@@ -325,6 +327,7 @@ mod tests {
         assert_eq!(options.poll_interval_secs, 30);
         assert_eq!(options.metadata_ttl_ms, 10_000);
         assert_eq!(options.read_fetch_timeout_ms, 30_000);
+        assert_eq!(options.flush_shutdown_timeout_ms, 45_000);
     }
 
     #[test]

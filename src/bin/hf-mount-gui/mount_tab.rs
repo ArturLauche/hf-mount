@@ -16,14 +16,27 @@ use crate::widgets::{
 
 impl MountGuiApp {
     pub fn draw_mount_tab(&mut self, ui: &mut egui::Ui) {
-        // The action row stays pinned below the scrolling form so Start/Stop
-        // are always reachable regardless of window height.
-        let actions_height = 52.0;
-        let form_height = (ui.available_height() - actions_height).max(120.0);
+        // The action row is a nested bottom panel: it sizes to whatever it
+        // renders (the buttons may grow an "Active target" line while
+        // mounting), and the scrolling form gets exactly the space left over,
+        // so Start/Stop stay reachable at any window height without overlap.
+        egui::Panel::bottom("mount-actions")
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                top: 10,
+                ..Default::default()
+            }))
+            .resizable(false)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                let form_width = ui.available_width().min(660.0);
+                ui.vertical(|ui| {
+                    ui.set_width(form_width);
+                    self.draw_actions(ui);
+                });
+            });
 
         egui::ScrollArea::vertical()
             .id_salt("mount-form")
-            .max_height(form_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let form_width = ui.available_width().min(660.0);
@@ -59,15 +72,6 @@ impl MountGuiApp {
                     ui.add_space(8.0);
                 });
             });
-
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(2.0);
-            let form_width = ui.available_width().min(660.0);
-            ui.vertical(|ui| {
-                ui.set_width(form_width);
-                self.draw_actions(ui);
-            });
-        });
     }
 
     /// Prominent panel while mounted: what is mounted where, uptime, and the
@@ -90,7 +94,13 @@ impl MountGuiApp {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&mount_label).size(20.0).strong().color(text_primary()));
-                        let mut subtitle = format!("{} mounted", self.source_label());
+                        // Describe the mount from the identity captured at mount
+                        // start (or reported by a reconnected worker) — never the
+                        // editable form, which may have changed since.
+                        let mut subtitle = match &self.active_source_label {
+                            Some(label) => format!("{label} mounted"),
+                            None => "Mounted".to_string(),
+                        };
                         if let Some(uptime) = uptime {
                             subtitle.push_str(&format!(" · up {uptime}"));
                         }
@@ -103,14 +113,6 @@ impl MountGuiApp {
                     });
                 });
             });
-    }
-
-    fn source_label(&self) -> String {
-        let id = self.source_id.trim();
-        match self.source {
-            GuiSource::Repo => format!("Repo {id}"),
-            GuiSource::Bucket => format!("Bucket {id}"),
-        }
     }
 
     fn draw_source_section(&mut self, ui: &mut egui::Ui) {
