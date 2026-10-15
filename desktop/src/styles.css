@@ -1,0 +1,234 @@
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+/*
+ * Design tokens. Near-monochrome warm neutrals; semantic colours are muted
+ * and only used for state. Light and dark are tuned separately (dark is not
+ * an inversion): surfaces step up in lightness, borders carry separation.
+ */
+:root {
+  color-scheme: light;
+  --bg: #f7f6f4;
+  --surface: #ffffff;
+  --surface-2: #f2f1ee;
+  --surface-3: #e9e7e3;
+  --border: #e4e1dc;
+  --border-strong: #d2cec7;
+  --text: #1a1917;
+  --text-2: #5b5853;
+  --text-3: #8f8b84;
+  --accent: #1a1917;
+  --accent-hover: #34322e;
+  --accent-fg: #fbfaf8;
+  --ring: rgb(26 25 23 / 0.28);
+  --ring-soft: rgb(26 25 23 / 0.09);
+  --raised: #ffffff;
+  --shadow-card: 0 1px 2px rgb(26 25 23 / 0.04), 0 1px 1px rgb(26 25 23 / 0.02);
+  --shadow-pop: 0 12px 32px -8px rgb(26 25 23 / 0.18), 0 2px 6px rgb(26 25 23 / 0.06);
+  --overlay: rgb(26 25 23 / 0.28);
+
+  --ok: #3d7a55;
+  --ok-soft: #e8f1eb;
+  --warn: #9a6a14;
+  --warn-soft: #f7efdf;
+  --danger: #a8423a;
+  --danger-soft: #f7e7e5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0e0e0d;
+    --surface: #161615;
+    --surface-2: #1d1d1b;
+    --surface-3: #262624;
+    --border: #2a2a27;
+    --border-strong: #3a3935;
+    --text: #f2f1ee;
+    --text-2: #a6a29b;
+    --text-3: #75716a;
+    --accent: #f2f1ee;
+    --accent-hover: #ffffff;
+    --accent-fg: #121211;
+    --ring: rgb(242 241 238 / 0.32);
+    --ring-soft: rgb(242 241 238 / 0.1);
+    --raised: #2c2c29;
+    --shadow-card: 0 0 0 1px rgb(0 0 0 / 0.2);
+    --shadow-pop: 0 16px 40px -12px rgb(0 0 0 / 0.7), 0 0 0 1px rgb(255 255 255 / 0.04);
+    --overlay: rgb(0 0 0 / 0.55);
+
+    --ok: #79c093;
+    --ok-soft: #1a2a20;
+    --warn: #dbb064;
+    --warn-soft: #2d2516;
+    --danger: #e4847a;
+    --danger-soft: #2f1c1a;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0e0e0d;
+  --surface: #161615;
+  --surface-2: #1d1d1b;
+  --surface-3: #262624;
+  --border: #2a2a27;
+  --border-strong: #3a3935;
+  --text: #f2f1ee;
+  --text-2: #a6a29b;
+  --text-3: #75716a;
+  --accent: #f2f1ee;
+  --accent-hover: #ffffff;
+  --accent-fg: #121211;
+  --ring: rgb(242 241 238 / 0.32);
+  --ring-soft: rgb(242 241 238 / 0.1);
+  --raised: #2c2c29;
+  --shadow-card: 0 0 0 1px rgb(0 0 0 / 0.2);
+  --shadow-pop: 0 16px 40px -12px rgb(0 0 0 / 0.7), 0 0 0 1px rgb(255 255 255 / 0.04);
+  --overlay: rgb(0 0 0 / 0.55);
+
+  --ok: #79c093;
+  --ok-soft: #1a2a20;
+  --warn: #dbb064;
+  --warn-soft: #2d2516;
+  --danger: #e4847a;
+  --danger-soft: #2f1c1a;
+}
+
+@theme inline {
+  --font-sans: "Geist Variable", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", "Cascadia Mono", Consolas, monospace;
+
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-raised: var(--raised);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--text);
+  --color-fg-2: var(--text-2);
+  --color-fg-3: var(--text-3);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+
+  --radius-control: 12px;
+  --radius-card: 18px;
+  --radius-dialog: 22px;
+  --radius-chip: 8px;
+
+  --shadow-card: var(--shadow-card);
+  --shadow-pop: var(--shadow-pop);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "ss01", "cv11";
+  overflow: hidden;
+  user-select: none;
+}
+
+input,
+textarea,
+.selectable {
+  user-select: text;
+}
+
+::selection {
+  background: var(--surface-3);
+}
+
+/* Focus: visible, calm, consistent. */
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* Scrollbars that fit both themes. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.anim-fade {
+  animation: fade-in 160ms ease-out;
+}
+
+.anim-pop {
+  animation: pop-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.anim-spin {
+  animation: spin 900ms linear infinite;
+}
+
+.anim-pulse {
+  animation: pulse-soft 1.6s ease-in-out infinite;
+}

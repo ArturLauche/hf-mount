@@ -1,0 +1,38 @@
+[package]
+name = "hf-mount-desktop"
+version = "0.13.1"
+description = "Desktop app for hf-mount on Windows"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Built on its own (not part of the hf-mount package): the desktop app only
+# targets Windows and pulls in Tauri, which the CLI and the Linux/macOS
+# builds of hf-mount do not need.
+[workspace]
+
+[lib]
+name = "hf_mount_desktop"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.3", features = [] }
+
+[dependencies]
+hf-mount = { path = "../.." }
+tauri = { version = "=2.12.4", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "=2.7.0"
+tauri-plugin-clipboard-manager = "=2.5.0"
+tauri-plugin-dialog = "=2.8.3"
+tauri-plugin-opener = "=2.7.2"
+tauri-plugin-single-instance = "=2.5.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["time", "sync"] }
+tracing = "0.1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "debuginfo"
