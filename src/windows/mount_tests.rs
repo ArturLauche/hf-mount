@@ -200,7 +200,11 @@ fn repo_enumerates_and_reads_exact_bytes() {
         .unwrap_or_default()
         .replace(' ', "")
         .to_ascii_uppercase();
-    assert_eq!(digest, sha256_hex(b"# hf-mount\nhello from the Hub\n"), "certutil said: {certutil}");
+    assert_eq!(
+        digest,
+        sha256_hex(b"# hf-mount\nhello from the Hub\n"),
+        "certutil said: {certutil}"
+    );
 }
 
 /// Minimal SHA-256 for the cross-process check (avoids a dev-dependency).
