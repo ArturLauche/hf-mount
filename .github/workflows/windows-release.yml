@@ -1,0 +1,82 @@
+name: Windows Release
+
+# Publishes the Windows edition when a maintainer pushes a tag such as
+# windows-v0.13.1 (or windows-v0.13.1-rc.1 for a pre-release). Everything is
+# built and tested by windows.yml on GitHub-hosted runners; this workflow only
+# adds a SHA256SUMS file and creates the GitHub release. The binaries are not
+# code-signed (no signing secrets are used).
+
+on:
+  push:
+    tags: ["windows-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    uses: ./.github/workflows/windows.yml
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check that the tag matches the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          tag="${GITHUB_REF_NAME#windows-v}"
+          case "$tag" in
+            "$version"|"$version"-*) echo "Releasing $version (tag $GITHUB_REF_NAME)" ;;
+            *) echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"; exit 1 ;;
+          esac
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: hf-mount-*-windows-x64
+          path: assets
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: assets
+        run: |
+          # Artifacts keep their folders (nsis/, msi/); release assets are flat.
+          find . -mindepth 2 -type f -exec mv -n {} . \;
+          find . -mindepth 1 -type d -empty -delete
+          # "hf-mount Desktop_..." -> "hf-mount-Desktop_..." (no spaces in asset names).
+          for f in *\ *; do if [ -e "$f" ]; then mv -n -- "$f" "${f// /-}"; fi; done
+          ls -la
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(cat <<'EOF'
+          Windows edition of hf-mount: Hugging Face models, datasets and buckets as native drive letters (WinFsp).
+
+          Downloads:
+          - `hf-mount-Desktop_*_x64-setup.exe`: desktop app for the current user, with the command line. Offers to install WinFsp if it is missing.
+          - `hf-mount-Desktop_*_x64_en-US.msi`: the same app as a per-machine MSI (WinFsp can be installed from the app).
+          - `hf-mount-*-windows-x64.zip`: portable command line only (`install-winfsp.ps1` included).
+          - `SHA256SUMS.txt`: checksums of all files.
+
+          The binaries are not code-signed, so Windows SmartScreen may ask for confirmation. Verify downloads against SHA256SUMS.txt.
+
+          WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos — https://github.com/winfsp/winfsp
+          EOF
+          )
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "hf-mount for Windows ${GITHUB_REF_NAME#windows-v}" \
+            --notes "$notes" \
+            --verify-tag $prerelease

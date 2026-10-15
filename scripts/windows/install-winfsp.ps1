@@ -19,11 +19,16 @@
 
 .PARAMETER MsiPath
     Use an already downloaded MSI instead of downloading it (still verified).
+
+.PARAMETER DownloadTo
+    Only download and verify the MSI into this directory (used to bundle the
+    unmodified installer with the desktop app); nothing is installed.
 #>
 [CmdletBinding()]
 param(
     [switch]$Quiet,
-    [string]$MsiPath
+    [string]$MsiPath,
+    [string]$DownloadTo
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,7 +38,7 @@ $Url = 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156
 $Sha256 = '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
 
 $existing = Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -ErrorAction SilentlyContinue
-if ($existing -and $existing.InstallDir -and (Test-Path (Join-Path $existing.InstallDir 'bin\winfsp-x64.dll'))) {
+if (-not $DownloadTo -and $existing -and $existing.InstallDir -and (Test-Path (Join-Path $existing.InstallDir 'bin\winfsp-x64.dll'))) {
     Write-Host "WinFsp is already installed at $($existing.InstallDir)"
     exit 0
 }
@@ -49,6 +54,14 @@ if ($actual -ne $Sha256) {
     throw "WinFsp installer checksum mismatch (expected $Sha256, got $actual). Refusing to install."
 }
 Write-Host "Checksum OK ($actual)"
+
+if ($DownloadTo) {
+    New-Item -ItemType Directory -Force -Path $DownloadTo | Out-Null
+    $dest = Join-Path $DownloadTo "winfsp-$Version.msi"
+    Copy-Item -LiteralPath $MsiPath -Destination $dest -Force
+    Write-Host "Saved verified installer to $dest"
+    exit 0
+}
 
 $log = Join-Path ([System.IO.Path]::GetTempPath()) 'winfsp-install.log'
 $msiArgs = @('/i', "`"$MsiPath`"", '/norestart', '/l*v', "`"$log`"")

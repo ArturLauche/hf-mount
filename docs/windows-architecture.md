@@ -24,7 +24,8 @@ README for installation and usage.
 
 **Decision.** Use [WinFsp](https://github.com/winfsp/winfsp) ("Windows File
 System Proxy") and bind its native user-mode API (`winfsp-x64.dll`) with our
-own minimal FFI declarations (`src/windows/winfsp_sys.rs`), loaded at run time.
+own minimal FFI declarations (`src/winfs/ffi.rs` for the ABI structs,
+`src/windows/winfsp.rs` for loading), loaded at run time.
 
 Alternatives considered:
 
@@ -72,12 +73,14 @@ WinFsp is path based; `VirtualFs` is inode based (FUSE-like). The adapter:
 * Directory enumeration returns a name-sorted snapshot per handle and honours
   WinFsp's marker protocol (entries strictly after the marker), plus `.`/`..`
   for non-root directories.
-* Maps POSIX errno from `VirtualFs` to NTSTATUS (`src/windows/status.rs`):
+* Maps POSIX errno from `VirtualFs` to NTSTATUS (`src/winfs/ntstatus.rs`):
   `ENOENT → STATUS_OBJECT_NAME_NOT_FOUND` (or `…PATH_NOT_FOUND` for a missing
   parent), `EROFS → STATUS_MEDIA_WRITE_PROTECTED`, `ENOSPC → STATUS_DISK_FULL`,
-  `EACCES/EPERM → STATUS_ACCESS_DENIED`, `EAGAIN → STATUS_DEVICE_BUSY`,
-  `ENOTEMPTY → STATUS_DIRECTORY_NOT_EMPTY`, `EEXIST → STATUS_OBJECT_NAME_COLLISION`,
-  everything else `STATUS_UNEXPECTED_IO_ERROR`. Never success after a failure.
+  `EACCES/EPERM → STATUS_ACCESS_DENIED`, `EAGAIN` (rate limit, 5xx) `→
+  STATUS_NETWORK_BUSY`, `ETIMEDOUT → STATUS_IO_TIMEOUT`, `EBUSY →
+  STATUS_SHARING_VIOLATION`, `ENOTEMPTY → STATUS_DIRECTORY_NOT_EMPTY`,
+  `EEXIST → STATUS_OBJECT_NAME_COLLISION`, everything else
+  `STATUS_UNEXPECTED_IO_ERROR`. Never success after a failure.
 
 ### Windows semantics
 
@@ -88,9 +91,9 @@ WinFsp is path based; `VirtualFs` is inode based (FUSE-like). The adapter:
 | Unicode | Names are converted UTF-16 ⇄ UTF-8 losslessly; unpaired surrogates are rejected with `STATUS_OBJECT_NAME_INVALID`. |
 | Escaping the root | Every component is validated; `.`/`..`, empty components and separators inside names are rejected before reaching `VirtualFs`. Paths are always relative to the mount root, so nothing can address files outside the mounted repo/bucket prefix. |
 | Attributes | Directories: `FILE_ATTRIBUTE_DIRECTORY`; files: `FILE_ATTRIBUTE_ARCHIVE` (`NORMAL` semantics); `FILE_ATTRIBUTE_READONLY` on read-only mounts. Times come from `VirtualFs` (Hub `lastModified`/per-file mtime); creation time = mtime. File IDs are inode numbers. |
-| Security | Each volume serves one self-relative security descriptor: owner = mounting user, full access for the user, SYSTEM and Administrators, read/execute for Everyone and AppContainers (so sandboxed apps such as Photos can read). The drive letter itself is created in the user's logon session (`DefineDosDevice` semantics), so other users do not see it. |
+| Security | Each volume serves one self-relative security descriptor (`security::volume_sddl`): owner = mounting user, full access for the user, SYSTEM and Administrators, read/execute for Everyone and AppContainers (so sandboxed apps such as Photos can read). The drive letter is created by WinFsp in the mounting user's logon session, so other users' sessions do not see it. |
 | Read-only mounts | `ReadOnlyVolume=1`: the kernel rejects writes with `STATUS_MEDIA_WRITE_PROTECTED` before they reach user mode; the adapter re-checks. Repositories are always read-only (upstream semantics). |
-| Caching | `FileInfoTimeout` = metadata TTL (default 1 s on Windows), `FlushAndPurgeOnCleanup=1` so a re-opened file never serves stale cached pages after a remote change; byte caching is done by the Xet chunk cache on disk. |
+| Caching | `FileInfoTimeout` = the metadata TTL (setting, default 10 s), `FlushAndPurgeOnCleanup=1` so a re-opened file does not serve stale cached pages after a remote change; byte caching is done by the Xet chunk cache on disk. |
 | Explorer probes | `desktop.ini`, `autorun.inf`, `Thumbs.db`, `folder.jpg`, `$RECYCLE.BIN`, `System Volume Information` … are answered from the parent listing only — they never trigger the HEAD/list-tree "miss probe" that upstream issues for unknown names. Such a file added remotely becomes visible on the next poll. |
 
 ### Writes (buckets only)
@@ -130,10 +133,13 @@ What this means, stated plainly (also in the README and the app):
 * **Supervisor.** One background process per user logon session
   (`hf-mount.exe supervise`) hosts every background mount in a shared tokio
   runtime (as upstream's CSI sidecar does). It is started on demand by the CLI
-  or the app with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
-  CREATE_NO_WINDOW` (and job breakaway when allowed), so closing the terminal
-  or the app does not unmount anything. It exits by itself when idle with no
-  mounts for a few minutes.
+  or the app with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` (and job
+  breakaway when allowed), without the caller's environment secrets and
+  without inheriting the caller's standard handles, so closing the terminal
+  or the app does not unmount anything and `hf-mount start | …` returns
+  immediately. It exits by itself after 10 minutes with no mounts.
+  `hf-mount shutdown` (hidden, used by the installer before an update or
+  uninstall) unmounts everything and stops it.
 * **Foreground mode** (`hf-mount start … --foreground`) hosts the mount in the
   CLI process and exposes the same control pipe, so `status`/`stop`/the app see
   it too; Ctrl+C or closing the console unmounts cleanly.
@@ -145,8 +151,8 @@ What this means, stated plainly (also in the README and the app):
     before sending anything (a token may be sent for private mounts);
   * newline-delimited JSON, versioned (`protocol: 1`).
 * **Truthful status.** There are no PID files. State lives only in the live
-  host processes; `status` enumerates `\\.\pipe\` for this user/session's
-  hosts and asks each one. A host that dies takes its pipe and its WinFsp
+  host processes; `status` asks the supervisor's well-known pipe and the
+  foreground hosts found by enumerating `\\.\pipe\` for this user/session. A host that dies takes its pipe and its WinFsp
   volume with it (the kernel tears the volume down when the process exits), so
   a dead mount can never linger in `status`. A small journal records which
   mounts were active so the next `status` can say "N mounts were lost because
@@ -158,22 +164,33 @@ What this means, stated plainly (also in the README and the app):
 * **Duplicates and races.** The drive letter is checked before mounting
   (`GetLogicalDrives` + `QueryDosDevice`); WinFsp's own mount-point creation is
   the final arbiter, and its collision status is reported as `TargetInUse`.
-  The supervisor serialises operations per target letter.
+  The supervisor's registry refuses a second mount on a letter it already
+  serves (`AlreadyMounted`), and each source's cache directory is locked so
+  two concurrent mounts of the same source never share one.
+* **Settings** (`%LOCALAPPDATA%\hf-mount\settings.json`, shared by the CLI and
+  the app) are re-read by the supervisor for every mount, so a change applies
+  to the next mount without restarting anything.
+* **Shared operations.** `src/windows/ops.rs` holds the client-side
+  operations (overview, mount, unmount, account, diagnostics) the desktop app
+  calls; the CLI uses the same client and protocol, so both always agree.
 
 ## 4. Credentials and privacy
 
 * Public repositories need no credentials.
-* Token sources, in order: `--token-file`, `HF_TOKEN`, `--hf-token`
-  (deprecated on Windows; prints a warning because process command lines are
-  visible to other processes of the user), the token stored by
-  `hf-mount auth login` / the app in **Windows Credential Manager** (generic
-  credential `hf-mount:token`, protected by DPAPI per user), then the
-  `huggingface_hub` token file (`%HF_HOME%\token`, default
-  `%USERPROFILE%\.cache\huggingface\token`).
-* Tokens are never placed on a command line. The CLI/app send the token to the
-  supervisor over the verified, user-only pipe; the supervisor keeps it in
-  memory only. Profiles store a *reference* ("use stored credential"), never
-  the secret.
+* CLI token sources, in order: `--token-file`, `--hf-token` (accepted for
+  upstream compatibility but warned about, because process command lines are
+  visible to other processes of the user), `HF_TOKEN` /
+  `HUGGING_FACE_HUB_TOKEN`, the token stored by `hf-mount auth login` or the
+  app in **Windows Credential Manager** (generic credential
+  `hf-mount:<hub host>`, protected by DPAPI per user), then the
+  `huggingface_hub` token file (`%HF_TOKEN_PATH%`, `%HF_HOME%\token`, default
+  `%USERPROFILE%\.cache\huggingface\token`). The desktop app uses only the
+  Credential Manager token (or none).
+* Tokens are never placed on a command line, and the supervisor is started
+  without `HF_TOKEN`/`HUGGING_FACE_HUB_TOKEN` in its environment. The CLI/app
+  send the token for a specific mount to the supervisor over the verified,
+  user-only pipe; the supervisor keeps it in memory only. Saved drives store
+  a *flag* ("use the stored token"), never the secret.
 * Logs, IPC error strings, diagnostics exports and the app UI pass through a
   redactor that removes `hf_…` tokens, `Authorization`/`Bearer` values and
   signed-URL query parameters (`X-Amz-*`, `Signature`, `Policy`, `token` …).
@@ -190,6 +207,8 @@ What this means, stated plainly (also in the README and the app):
   silently or elevated behind the user's back. The app also detects a missing
   driver at start-up and offers the same installer, with a link to
   winfsp.dev as an alternative.
+* The per-machine MSI variant of the desktop app cannot chain another MSI;
+  it also ships the WinFsp MSI and the app offers it on first start.
 * The CLI zip does not bundle the driver; `hf-mount doctor` explains how to
   install it (`winget install WinFsp.WinFsp` or the official MSI).
 * After installation, mounting never needs elevation; the app and CLI run as
@@ -218,11 +237,23 @@ No upstream source file is relicensed. Third-party notices are collected in
 * **Real drive-letter tests** run on GitHub-hosted Windows runners after
   installing the pinned WinFsp MSI (SHA-256 verified): the adapter mounts a
   `VirtualFs` backed by the deterministic in-memory mocks on a free letter and
-  checks enumeration (Rust std, `cmd /c dir`, PowerShell), exact bytes,
+  checks enumeration (Rust std, `cmd /c dir`), a second process reading a
+  file (`certutil -hashfile`), exact bytes,
   random/overlapping reads, concurrent handles, Unicode names, error statuses,
   read-only enforcement, unmount and re-mount.
-* **Live smoke test** (CI, public repo, no secrets): `hf-mount start repo …`
-  in background mode, `status --json`, read bytes and compare with the Hub's
-  `resolve` URL, `stop`, drive letter released.
+* **Live smoke test** (CI, public repo, no secrets,
+  `scripts/windows/smoke-test.ps1`): `hf-mount start repo openai-community/gpt2`
+  in background mode, listing, `config.json` hash and 1 MiB ranges of
+  `model.safetensors` compared with HTTP range requests to the Hub, cache
+  growth bounded (lazy reads), write refused, `status --json`, duplicate start
+  (exit 6), `stop`, drive letter released, re-mount, `stop` of an unmounted
+  letter (exit 9).
+* **Installer test** (CI, `scripts/windows/desktop-install-test.ps1`): the
+  NSIS installer is installed silently, the bundled WinFsp MSI's SHA-256 is
+  checked, the installed CLI runs, the desktop app starts and stays running,
+  and the silent uninstall removes the app but keeps user data.
+* **Desktop UI**: TypeScript typecheck, ESLint and Vitest component tests
+  (keyboard navigation, theme switching, URL paste parsing, validation and
+  error states) run against an in-memory preview backend.
 * Private-token and writable-bucket tests are opt-in (repository secrets) and
   isolated; they are skipped — and reported as skipped — in forks.

@@ -2,14 +2,18 @@ name: Windows
 
 # CI for the Windows edition, runnable in any public fork on GitHub-hosted
 # runners (no private runners, registries or secrets). A green run means:
-# Linux/Windows lint + unit tests passed, and the WinFsp drive-letter
-# integration tests passed against the real driver on a Windows runner.
+# Linux/Windows lint + unit tests passed, the WinFsp drive-letter integration
+# tests passed against the real driver on a Windows runner, a public
+# repository was mounted end to end, the desktop UI passed its checks, and
+# the installers were built, installed, started and uninstalled.
+# windows-release.yml reuses this workflow to build release assets.
 
 on:
   pull_request:
   push:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -92,6 +96,19 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo build --release --bin hf-mount
 
+      - name: Package portable CLI
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./scripts/windows/package-cli.ps1 -Exe target/release/hf-mount.exe -OutDir dist
+
+      - name: Upload portable CLI
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-cli-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
       - name: CLI smoke tests (argument handling and exit codes)
         timeout-minutes: 5
         if: ${{ !cancelled() }}
@@ -127,5 +144,104 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hf-mount-logs-windows
+          path: ~\AppData\Local\hf-mount\logs
+          if-no-files-found: ignore
+
+  frontend:
+    name: Desktop UI checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Unit and component tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+
+  desktop:
+    name: Desktop app installers (NSIS + MSI)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> target
+          key: desktop
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build hf-mount.exe (bundled next to the app)
+        shell: pwsh
+        run: |
+          cargo build --release --bin hf-mount
+          New-Item -ItemType Directory -Force desktop/src-tauri/binaries | Out-Null
+          Copy-Item target/release/hf-mount.exe desktop/src-tauri/binaries/hf-mount-x86_64-pc-windows-msvc.exe
+
+      - name: Fetch the official WinFsp installer (SHA-256 verified, unmodified)
+        shell: pwsh
+        run: ./scripts/windows/install-winfsp.ps1 -DownloadTo desktop/src-tauri/resources/winfsp
+
+      - name: Clippy (desktop app)
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          npm run build
+          cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Build installers
+        working-directory: desktop
+        run: npx tauri build --ci --config src-tauri/tauri.winfsp.conf.json
+
+      - name: Install, start and uninstall the app
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          ./scripts/windows/desktop-install-test.ps1 -Installer $setup.FullName
+
+      - name: Upload installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-desktop-windows-x64
+          path: |
+            desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+            desktop/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+      - name: Upload app logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-desktop-logs
           path: ~\AppData\Local\hf-mount\logs
           if-no-files-found: ignore
