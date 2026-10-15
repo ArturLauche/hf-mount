@@ -102,6 +102,15 @@ fn scheme_value_start(lower: &str, i: usize) -> Option<usize> {
     (value.len() < rest.len()).then(|| lower.len() - value.len())
 }
 
+/// Whether the word after `Bearer`/`Basic` is a credential rather than prose
+/// ("no bearer token stored"): long enough, and with a digit, a symbol used
+/// in tokens or base64, or capitals after the first letter.
+fn looks_like_credential(value: &str) -> bool {
+    value.len() >= 8
+        && (value.chars().any(|c| c.is_ascii_digit() || "+/=_-.~".contains(c))
+            || value.chars().skip(1).any(|c| c.is_ascii_uppercase()))
+}
+
 /// Redact `Authorization` header values (to the end of the line or the
 /// closing quote, whatever the scheme) and credentials after `Bearer` /
 /// `Basic`, with any spacing and in any letter case.
@@ -127,6 +136,9 @@ fn redact_auth_values(input: &str) -> String {
             let len = input[start..]
                 .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | ')'))
                 .unwrap_or(input.len() - start);
+            if !looks_like_credential(&input[start..start + len]) {
+                continue;
+            }
             (start, start + len)
         } else {
             continue;
@@ -244,6 +256,13 @@ mod tests {
         // Ordinary words are left alone.
         assert_eq!(redact("basically fine"), "basically fine");
         assert_eq!(redact("no-bearer here"), "no-bearer here");
+        assert_eq!(redact("no bearer token stored"), "no bearer token stored");
+        assert_eq!(
+            redact("Basic authentication is enough"),
+            "Basic authentication is enough"
+        );
+        // Base64 without digits or symbols is still caught by its capitals.
+        assert_eq!(redact("Basic YWxhZGRpbjpvcGVuc2VzYW1l"), "Basic ***");
     }
 
     #[test]

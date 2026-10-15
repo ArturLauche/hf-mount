@@ -260,9 +260,12 @@ jobs:
     name: Opt-in private repository and bucket write test
     # Runs only where the repository owner configured a test bucket and/or a
     # private repository (Settings > Variables) and the HF_TOKEN secret; it is
-    # skipped in forks and pull requests from forks. The bucket test only
+    # skipped for pull requests from forks, which get no secrets. The bucket test only
     # touches a new folder it creates and removes.
-    if: ${{ vars.HF_MOUNT_TEST_BUCKET != '' || vars.HF_MOUNT_TEST_PRIVATE_REPO != '' }}
+    if: >-
+      ${{ (vars.HF_MOUNT_TEST_BUCKET != '' || vars.HF_MOUNT_TEST_PRIVATE_REPO != '')
+      && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: windows
     runs-on: windows-2025
     timeout-minutes: 30

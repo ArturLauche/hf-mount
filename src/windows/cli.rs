@@ -261,9 +261,26 @@ fn identity() -> Result<Identity, ErrorInfo> {
 }
 
 fn endpoint_or_default(endpoint: Option<&str>) -> Result<String, ErrorInfo> {
+    // Say so when stored settings cannot be used, so a self-hosted Hub is
+    // never replaced by huggingface.co without notice.
+    let stored = || match config::load_settings_checked() {
+        Ok((settings, problems)) => {
+            for problem in problems {
+                eprintln!(
+                    "Warning: ignoring a setting in {}: {problem}",
+                    config::settings_path().display()
+                );
+            }
+            settings.hub_endpoint
+        }
+        Err(e) => {
+            eprintln!("Warning: settings ignored ({e}); using defaults");
+            None
+        }
+    };
     let endpoint = endpoint
         .map(str::to_string)
-        .or_else(|| config::load_settings().ok().and_then(|s| s.hub_endpoint))
+        .or_else(stored)
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
     // The token is sent to this address.
     crate::manager::spec::validate_hub_endpoint(&endpoint).map_err(invalid)?;

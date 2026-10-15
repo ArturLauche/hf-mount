@@ -115,24 +115,42 @@ impl Settings {
 
     /// Reject values that would make mounts misbehave.
     pub fn validate(&self) -> Result<(), String> {
+        match self.clone().sanitize().into_iter().next() {
+            Some(problem) => Err(problem),
+            None => Ok(()),
+        }
+    }
+
+    /// Reset each value that fails validation to its default, keeping the
+    /// others. Returns one message per value that was reset.
+    pub fn sanitize(&mut self) -> Vec<String> {
+        let defaults = Settings::default();
+        let mut problems = Vec::new();
         if self.cache_size_bytes < 100_000_000 {
-            return Err("cache size must be at least 100 MB".into());
+            problems.push("cache size must be at least 100 MB".to_string());
+            self.cache_size_bytes = defaults.cache_size_bytes;
         }
         if self.upload_wait_secs > 24 * 3600 {
-            return Err("upload wait must be at most 24 hours".into());
+            problems.push("upload wait must be at most 24 hours".to_string());
+            self.upload_wait_secs = defaults.upload_wait_secs;
         }
         if self.metadata_ttl_ms > 3_600_000 {
-            return Err("metadata TTL must be at most one hour".into());
+            problems.push("metadata TTL must be at most one hour".to_string());
+            self.metadata_ttl_ms = defaults.metadata_ttl_ms;
         }
-        if let Some(endpoint) = &self.hub_endpoint {
-            super::spec::validate_hub_endpoint(endpoint).map_err(|e| e.to_string())?;
+        if let Some(endpoint) = &self.hub_endpoint
+            && let Err(e) = super::spec::validate_hub_endpoint(endpoint)
+        {
+            problems.push(format!("{e} (was {endpoint:?})"));
+            self.hub_endpoint = defaults.hub_endpoint;
         }
         if let Some(dir) = &self.cache_dir
             && !dir.is_absolute()
         {
-            return Err("cache directory must be an absolute path".into());
+            problems.push("cache directory must be an absolute path".to_string());
+            self.cache_dir = defaults.cache_dir;
         }
-        Ok(())
+        problems
     }
 }
 
@@ -201,17 +219,21 @@ pub fn profiles_path() -> PathBuf {
     home_dir().join("profiles.json")
 }
 
-/// Settings from disk. A file that does not pass [`Settings::validate`]
-/// (e.g. edited by hand to a cleartext Hub endpoint) is an error, so callers
-/// fall back to defaults instead of using unsafe values.
+/// Settings from disk, with values that fail validation (e.g. a hand-edited
+/// cleartext Hub endpoint) reset to their defaults and the other values
+/// kept. The second element names each value that was reset.
+pub fn load_settings_checked() -> std::io::Result<(Settings, Vec<String>)> {
+    let mut settings: Settings = read_json(&settings_path())?;
+    let problems = settings.sanitize();
+    Ok((settings, problems))
+}
+
+/// [`load_settings_checked`], logging the values that were reset.
 pub fn load_settings() -> std::io::Result<Settings> {
-    let settings: Settings = read_json(&settings_path())?;
-    settings.validate().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{}: {e}", settings_path().display()),
-        )
-    })?;
+    let (settings, problems) = load_settings_checked()?;
+    for problem in problems {
+        tracing::warn!("{}: ignoring invalid value: {problem}", settings_path().display());
+    }
     Ok(settings)
 }
 
@@ -309,14 +331,20 @@ mod tests {
             };
             assert!(save_settings(&s).is_err());
         });
-        // A hand-edited file with a cleartext endpoint is not used either.
+        // A hand-edited file: invalid values are reset, the others kept.
         with_home(|home| {
             std::fs::write(
                 home.join("settings.json"),
-                r#"{"hub_endpoint":"http://localhost.evil.com"}"#,
+                r#"{"theme":"dark","hub_endpoint":"http://localhost.evil.com","cache_size_bytes":5,"upload_wait_secs":60}"#,
             )
             .unwrap();
-            assert!(load_settings().is_err());
+            let (loaded, problems) = load_settings_checked().unwrap();
+            assert_eq!(problems.len(), 2, "{problems:?}");
+            assert_eq!(loaded.hub_endpoint, None);
+            assert_eq!(loaded.cache_size_bytes, Settings::default().cache_size_bytes);
+            assert_eq!(loaded.theme, Theme::Dark);
+            assert_eq!(loaded.upload_wait_secs, 60);
+            assert!(loaded.validate().is_ok());
         });
     }
 

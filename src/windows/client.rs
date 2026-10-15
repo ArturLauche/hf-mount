@@ -75,8 +75,13 @@ pub fn take_lost_session(identity: &Identity) -> Option<LostSession> {
             return None;
         }
     };
-    // Whoever removes it reports it; a concurrent caller sees it gone.
-    std::fs::remove_file(&path).ok()?;
+    // Whoever removes it reports it; a concurrent caller sees it gone. If it
+    // cannot be removed, keep reporting it rather than dropping the report.
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => tracing::warn!("could not remove the session journal {}: {e}", path.display()),
+    }
     if journal.mounts.is_empty() {
         return None;
     }

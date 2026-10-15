@@ -136,8 +136,9 @@ pub fn sign_out() -> CmdResult<()> {
     ops::sign_out(&ops::endpoint())
 }
 
-/// Unreadable or invalid settings are reported in the log and replaced by
-/// the defaults (which the engine uses too), so the page always loads.
+/// Invalid values are reset to their defaults (others are kept) and an
+/// unreadable file means all defaults, as for the engine; both are logged,
+/// so the page always loads.
 #[tauri::command]
 pub fn get_settings() -> CmdResult<Settings> {
     Ok(config::load_settings().unwrap_or_else(|e| {
