@@ -74,9 +74,13 @@ jobs:
       - name: Unit tests
         run: cargo test --lib
 
+      # The mount tests run even when an earlier test step failed, so every
+      # run reports both; the job still fails if any step failed.
       - name: Install WinFsp (pinned, SHA-256 verified)
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: ./scripts/windows/install-winfsp.ps1 -Quiet
 
       - name: WinFsp drive-letter integration tests
+        if: ${{ !cancelled() }}
         run: cargo test --lib -- --ignored --test-threads=1 windows::mount_tests

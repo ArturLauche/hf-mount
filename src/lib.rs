@@ -7,6 +7,7 @@ pub mod follow;
 #[cfg(feature = "fuse")]
 pub mod fuse;
 pub mod hub_api;
+pub mod manager;
 #[cfg(feature = "nfs")]
 pub mod nfs;
 pub mod overlay;

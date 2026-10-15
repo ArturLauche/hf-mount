@@ -758,6 +758,24 @@ fn fresh_test_dir(prefix: &str) -> std::path::PathBuf {
     }
 }
 
+/// Open a directory handle for `OverlayBacking`. Windows only hands out
+/// directory handles to opens with `FILE_FLAG_BACKUP_SEMANTICS`.
+fn open_dir(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
 /// Build a VirtualFs for testing. Must be called from a sync context
 /// (not inside #[tokio::test]) because VirtualFs::new() calls block_on internally.
 pub fn make_test_vfs(
@@ -770,7 +788,7 @@ pub fn make_test_vfs(
 
     let overlay_backing = if opts.overlay {
         let overlay_root = fresh_test_dir("hf_mount_overlay");
-        let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
+        let fd = open_dir(&overlay_root).expect("failed to open overlay root dir");
         Some(OverlayBacking::new(fd))
     } else {
         None
@@ -830,7 +848,7 @@ pub fn make_overlay_test_vfs_with_root(
         .build()
         .unwrap();
     let cache_dir = fresh_test_dir("hf_mount_test");
-    let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
+    let fd = open_dir(&overlay_root).expect("failed to open overlay root dir");
     let staging_dir = Some(StagingDir::new(&cache_dir, 0));
     let overlay_backing = Some(OverlayBacking::new(fd));
 

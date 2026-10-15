@@ -67,7 +67,7 @@ fn parse_mode(s: &str) -> Result<u16, String> {
     Ok(mode)
 }
 
-fn validate_revision(s: &str) -> Result<String, String> {
+pub fn validate_revision(s: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err("revision must not be empty".to_string());
     }
