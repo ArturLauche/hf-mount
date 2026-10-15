@@ -51,7 +51,7 @@ pub enum Request {
     /// Mounts hosted by this host.
     List,
     Mount {
-        spec: MountSpec,
+        spec: Box<MountSpec>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential: Option<Credential>,
     },
@@ -296,7 +296,7 @@ pub struct ActivityEvent {
 pub enum Response {
     Hello { host: HostInfo },
     Mounts { host: HostInfo, mounts: Vec<MountInfo> },
-    Mounted { mount: MountInfo },
+    Mounted { mount: Box<MountInfo> },
     Unmounted { report: UnmountReport },
     Activity { events: Vec<ActivityEvent> },
     Ok,
@@ -338,7 +338,7 @@ mod tests {
             },
             Request::List,
             Request::Mount {
-                spec: spec.clone(),
+                spec: Box::new(spec.clone()),
                 credential: Some(Credential::Token {
                     token: "hf_secret".into(),
                     source: "HF_TOKEN".into(),
@@ -367,7 +367,7 @@ mod tests {
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("hf_abc"), "{dbg}");
         let req = Request::Mount {
-            spec: MountSpec::parse("bucket", "a/b", "X:").unwrap(),
+            spec: Box::new(MountSpec::parse("bucket", "a/b", "X:").unwrap()),
             credential: Some(c),
         };
         assert!(!format!("{req:?}").contains("hf_abc"));

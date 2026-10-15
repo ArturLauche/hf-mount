@@ -271,9 +271,11 @@ mod tests {
     fn settings_roundtrip_and_defaults() {
         with_home(|home| {
             assert_eq!(load_settings().unwrap(), Settings::default());
-            let mut s = Settings::default();
-            s.theme = Theme::Dark;
-            s.upload_wait_secs = 60;
+            let s = Settings {
+                theme: Theme::Dark,
+                upload_wait_secs: 60,
+                ..Default::default()
+            };
             save_settings(&s).unwrap();
             assert_eq!(load_settings().unwrap(), s);
             assert!(home.join("settings.json").exists());

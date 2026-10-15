@@ -154,8 +154,8 @@ impl Registry {
                 host: self.host.clone(),
                 mounts: self.list(),
             },
-            Request::Mount { spec, credential } => match self.mount(spec, credential) {
-                Ok(mount) => Response::Mounted { mount },
+            Request::Mount { spec, credential } => match self.mount(*spec, credential) {
+                Ok(mount) => Response::Mounted { mount: Box::new(mount) },
                 Err(e) => error_response(e),
             },
             Request::Unmount { target, force } => match self.unmount(&target, force) {
@@ -619,7 +619,7 @@ mod tests {
 
     fn mount_req(id: &str, target: &str) -> Request {
         Request::Mount {
-            spec: MountSpec::parse("repo", id, target).unwrap(),
+            spec: Box::new(MountSpec::parse("repo", id, target).unwrap()),
             credential: None,
         }
     }
