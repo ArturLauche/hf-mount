@@ -1,0 +1,82 @@
+name: Windows
+
+# CI for the Windows edition, runnable in any public fork on GitHub-hosted
+# runners (no private runners, registries or secrets). A green run means:
+# Linux/Windows lint + unit tests passed, and the WinFsp drive-letter
+# integration tests passed against the real driver on a Windows runner.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux lint & unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (no features)
+        run: cargo clippy -- -D warnings
+
+      - name: Clippy (FUSE + NFS)
+        run: cargo clippy --features fuse,nfs -- -D warnings
+
+      - name: Clippy (lib tests)
+        run: cargo clippy --lib --profile test -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --lib --features fuse,nfs
+
+  windows:
+    name: Windows build, tests & WinFsp mount tests
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      - name: Clippy (lib + lib tests)
+        run: |
+          cargo clippy --lib -- -D warnings
+          cargo clippy --lib --profile test -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Install WinFsp (pinned, SHA-256 verified)
+        shell: pwsh
+        run: ./scripts/windows/install-winfsp.ps1 -Quiet
+
+      - name: WinFsp drive-letter integration tests
+        run: cargo test --lib -- --ignored --test-threads=1 windows::mount_tests

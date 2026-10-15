@@ -1740,6 +1740,64 @@ impl VirtualFs {
         }
     }
 
+    /// Local changes not yet committed to the Hub, for status reporting.
+    /// Only advanced-writes mounts defer uploads; other modes report zero.
+    pub fn pending_uploads(&self) -> PendingUploads {
+        let Some(fm) = &self.flush_manager else {
+            return PendingUploads::default();
+        };
+        PendingUploads {
+            dirty_files: self.inode_table.read().expect("inodes poisoned").dirty_inos().len(),
+            pending_deletes: fm.pending_delete_count(),
+            failed_files: fm.error_count(),
+        }
+    }
+
+    /// Whether `ino` has local writes that have not been committed yet.
+    pub fn is_dirty(&self, ino: u64) -> bool {
+        self.inode_table
+            .read()
+            .expect("inodes poisoned")
+            .get(ino)
+            .is_some_and(|e| e.is_dirty())
+    }
+
+    /// Take (and clear) the error of the last failed background flush of `ino`.
+    pub fn take_flush_error(&self, ino: u64) -> Option<String> {
+        self.flush_manager.as_ref().and_then(|fm| fm.check_error(ino))
+    }
+
+    /// Remote path and local staging file of every file with uncommitted
+    /// writes, so a host tearing a mount down after a failed final flush can
+    /// preserve the data instead of letting the staging directory be deleted.
+    /// Empty in overlay mode (overlay data already lives in the user's directory).
+    pub fn dirty_files(&self) -> Vec<(String, PathBuf)> {
+        if self.overlay() {
+            return Vec::new();
+        }
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        inodes
+            .dirty_inos()
+            .into_iter()
+            .filter_map(|ino| {
+                let entry = inodes.get(ino)?;
+                let staging = self.staging.path(ino)?;
+                Some((entry.full_path.to_string(), staging))
+            })
+            .collect()
+    }
+
+    /// Re-enqueue every dirty inode, e.g. to retry uploads that failed while
+    /// the network was down. Returns how many were queued.
+    pub fn requeue_dirty(&self) -> usize {
+        let Some(fm) = &self.flush_manager else { return 0 };
+        let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
+        for ino in &dirty {
+            fm.enqueue(*ino);
+        }
+        dirty.len()
+    }
+
     /// Enqueues the inode for background flush rather than blocking on a
     /// synchronous Hub upload. Data is already durable in the local staging
     /// file after write(); the background flush loop commits to Hub.
@@ -4387,6 +4445,17 @@ pub struct VirtualFsAttr {
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
+}
+
+/// See [`VirtualFs::pending_uploads`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PendingUploads {
+    /// Files with local writes not yet committed to the Hub.
+    pub dirty_files: usize,
+    /// Remote deletes queued but not yet committed.
+    pub pending_deletes: usize,
+    /// Files whose last upload attempt failed (they stay dirty and are retried).
+    pub failed_files: usize,
 }
 
 #[derive(Debug)]

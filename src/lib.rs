@@ -12,6 +12,9 @@ pub mod nfs;
 pub mod overlay;
 pub mod setup;
 pub mod virtual_fs;
+#[cfg(windows)]
+pub mod windows;
+pub mod winfs;
 pub mod xet;
 
 #[cfg(test)]

@@ -6991,3 +6991,94 @@ fn install_commit_hook_on_terminal_channel_does_not_wedge_pending_commits() {
         vfs.release(fh).await.unwrap();
     });
 }
+
+// ── pending upload reporting ────────────────────────────────────────
+
+/// `pending_uploads` reports a written-but-unflushed file, `is_dirty` tracks
+/// it, and both clear once the background flush commits it.
+#[test]
+fn pending_uploads_track_dirty_files_until_flushed() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        assert_eq!(vfs.pending_uploads(), PendingUploads::default());
+        let (attr, fh) = vfs.create(ROOT_INODE, "new.bin", 0o644, 0, 0, None).await.unwrap();
+        write_blocking(&vfs, attr.ino, fh, 0, b"payload").await.unwrap();
+        assert!(vfs.is_dirty(attr.ino));
+        assert_eq!(vfs.pending_uploads().dirty_files, 1);
+        vfs.release(fh).await.unwrap();
+
+        // Debounce is 100 ms in tests; wait for the commit.
+        for _ in 0..100 {
+            if !vfs.is_dirty(attr.ino) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!vfs.is_dirty(attr.ino), "flush never committed");
+        assert_eq!(vfs.pending_uploads(), PendingUploads::default());
+        assert_eq!(vfs.take_flush_error(attr.ino), None);
+    });
+}
+
+/// Read-only mounts never report pending uploads.
+#[test]
+fn pending_uploads_zero_without_flush_manager() {
+    let hub = MockHub::new_repo();
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub,
+        xet,
+        TestOpts {
+            read_only: true,
+            ..Default::default()
+        },
+        &rt,
+    );
+    assert_eq!(vfs.pending_uploads(), PendingUploads::default());
+    assert_eq!(vfs.requeue_dirty(), 0);
+}
+
+/// Lazy remote reads at offsets past 4 GiB return the right bytes (the
+/// Windows adapter relies on 64-bit offsets end to end).
+#[test]
+fn lazy_reads_beyond_4gib_return_correct_bytes() {
+    const SIZE: u64 = 5 * 1024 * 1024 * 1024 + 99;
+    let hub = MockHub::new_repo();
+    hub.add_file("huge.bin", SIZE, Some("h_huge"), None);
+    let xet = MockXet::new();
+    xet.add_generated_file("h_huge", SIZE);
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub,
+        xet,
+        TestOpts {
+            read_only: true,
+            ..Default::default()
+        },
+        &rt,
+    );
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "huge.bin").await.unwrap();
+        assert_eq!(attr.size, SIZE);
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+        for offset in [
+            0u64,
+            4 * 1024 * 1024 * 1024 - 10,
+            4 * 1024 * 1024 * 1024 + 4096,
+            SIZE - 50,
+        ] {
+            let (data, _) = vfs.read(fh, offset, 100).await.unwrap();
+            assert_eq!(data.len() as u64, 100.min(SIZE - offset));
+            for (i, b) in data.iter().enumerate() {
+                assert_eq!(*b, crate::test_mocks::generated_byte(offset + i as u64));
+            }
+        }
+        let (tail, eof) = vfs.read(fh, SIZE, 10).await.unwrap();
+        assert!(tail.is_empty() && eof);
+        vfs.release(fh).await.unwrap();
+    });
+}

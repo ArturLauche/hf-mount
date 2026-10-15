@@ -85,6 +85,16 @@ impl FlushManager {
         self.errors.lock().expect("flush_errors poisoned").remove(&ino)
     }
 
+    /// Number of inodes whose last flush attempt failed (not consumed).
+    pub(crate) fn error_count(&self) -> usize {
+        self.errors.lock().expect("flush_errors poisoned").len()
+    }
+
+    /// Number of remote deletes queued but not yet committed.
+    pub(crate) fn pending_delete_count(&self) -> usize {
+        self.pending_deletes.lock().expect("pending_deletes poisoned").len()
+    }
+
     // ── Remote delete queue ─────────────────────────────────────────
 
     /// Queue a path for batched remote deletion (flushed in next flush_loop cycle).
