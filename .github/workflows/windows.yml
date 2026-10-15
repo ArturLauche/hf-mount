@@ -132,6 +132,8 @@ jobs:
           # the Hub (not found or private) -> auth_required (4).
           & $exe --json start repo hf-mount-ci/this-repo-does-not-exist-0000 Q: | Out-Host
           if ($LASTEXITCODE -ne 4 -and $LASTEXITCODE -ne 5) { throw "missing repo exited $LASTEXITCODE" }
+          # The expected non-zero code above must not become the step's result.
+          exit 0
 
       - name: Live end-to-end mount of a public repository
         timeout-minutes: 20
@@ -212,6 +214,14 @@ jobs:
         shell: pwsh
         run: ./scripts/windows/install-winfsp.ps1 -DownloadTo desktop/src-tauri/resources/winfsp
 
+      - name: License lists for the installer (Rust crates, npm packages)
+        shell: pwsh
+        run: >
+          ./scripts/windows/dependency-licenses.ps1
+          -Manifest desktop/src-tauri/Cargo.toml
+          -NpmLock desktop/package-lock.json
+          -OutDir desktop/src-tauri/resources/licenses
+
       - name: Clippy (desktop app)
         working-directory: desktop
         shell: pwsh
@@ -221,7 +231,7 @@ jobs:
 
       - name: Build installers
         working-directory: desktop
-        run: npx tauri build --ci --config src-tauri/tauri.winfsp.conf.json
+        run: npx tauri build --ci --config src-tauri/tauri.release.conf.json
 
       - name: Install, start and uninstall the app
         shell: pwsh
@@ -245,3 +255,40 @@ jobs:
           name: hf-mount-desktop-logs
           path: ~\AppData\Local\hf-mount\logs
           if-no-files-found: ignore
+
+  authenticated:
+    name: Opt-in private repository and bucket write test
+    # Runs only where the repository owner configured a test bucket and/or a
+    # private repository (Settings > Variables) and the HF_TOKEN secret; it is
+    # skipped in forks and pull requests from forks. The bucket test only
+    # touches a new folder it creates and removes.
+    if: ${{ vars.HF_MOUNT_TEST_BUCKET != '' || vars.HF_MOUNT_TEST_PRIVATE_REPO != '' }}
+    needs: windows
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: hf-mount-cli-windows-x64
+          path: cli
+
+      - name: Unpack CLI and install WinFsp
+        shell: pwsh
+        run: |
+          Expand-Archive -Path (Get-ChildItem cli/*.zip | Select-Object -First 1).FullName -DestinationPath cli/unpacked
+          ./scripts/windows/install-winfsp.ps1 -Quiet
+
+      - name: Private repository and bucket round trip
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TEST_BUCKET: ${{ vars.HF_MOUNT_TEST_BUCKET }}
+          TEST_PRIVATE_REPO: ${{ vars.HF_MOUNT_TEST_PRIVATE_REPO }}
+        run: |
+          $exe = (Get-ChildItem -Recurse cli/unpacked -Filter hf-mount.exe | Select-Object -First 1).FullName
+          $testArgs = @{ Exe = $exe }
+          if ($env:TEST_BUCKET) { $testArgs.Bucket = $env:TEST_BUCKET }
+          if ($env:TEST_PRIVATE_REPO) { $testArgs.PrivateRepo = $env:TEST_PRIVATE_REPO }
+          ./scripts/windows/authenticated-test.ps1 @testArgs

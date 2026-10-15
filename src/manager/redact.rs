@@ -77,35 +77,71 @@ fn redact_jwts(input: &str) -> String {
     out
 }
 
-/// Redact the value after `Bearer ` / `Authorization:` markers.
+/// Header names whose whole value is a credential.
+const AUTH_HEADERS: [&str; 2] = ["proxy-authorization", "authorization"];
+/// Authorization schemes followed by a credential (`Bearer <token>`).
+const AUTH_SCHEMES: [&str; 2] = ["bearer", "basic"];
+
+/// Byte offset where the value of an `Authorization:` / `authorization=`
+/// marker starting at `i` begins (after separators and an opening quote).
+fn header_value_start(lower: &str, i: usize) -> Option<usize> {
+    let name = AUTH_HEADERS.iter().find(|h| lower[i..].starts_with(*h))?;
+    let rest = &lower[i + name.len()..];
+    let after_ws = rest.trim_start_matches([' ', '\t']);
+    let after_sep = after_ws.strip_prefix([':', '='])?;
+    let value = after_sep.trim_start_matches([' ', '\t', '"', '\'']);
+    Some(lower.len() - value.len())
+}
+
+/// Byte offset where the credential after `Bearer`/`Basic` and at least one
+/// space or tab begins.
+fn scheme_value_start(lower: &str, i: usize) -> Option<usize> {
+    let scheme = AUTH_SCHEMES.iter().find(|s| lower[i..].starts_with(*s))?;
+    let rest = &lower[i + scheme.len()..];
+    let value = rest.trim_start_matches([' ', '\t']);
+    (value.len() < rest.len()).then(|| lower.len() - value.len())
+}
+
+/// Redact `Authorization` header values (to the end of the line or the
+/// closing quote, whatever the scheme) and credentials after `Bearer` /
+/// `Basic`, with any spacing and in any letter case.
 fn redact_auth_values(input: &str) -> String {
-    let mut out = input.to_string();
-    for marker in [
-        "Bearer ",
-        "bearer ",
-        "Authorization: ",
-        "authorization: ",
-        "Authorization=",
-        "authorization=",
-    ] {
-        let mut result = String::with_capacity(out.len());
-        let mut rest = out.as_str();
-        while let Some(pos) = rest.find(marker) {
-            let (before, after) = rest.split_at(pos + marker.len());
-            result.push_str(before);
-            let value_len = after
-                .chars()
-                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != ',')
-                .map(char::len_utf8)
-                .sum::<usize>();
-            if value_len > 0 {
-                result.push_str(MASK);
-            }
-            rest = &after[value_len..];
+    // ASCII lowercasing keeps byte offsets identical to `input`.
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut last = 0usize;
+    let mut prev: Option<char> = None;
+    let mut iter = input.char_indices();
+    while let Some((i, c)) = iter.next() {
+        let at_word_start = prev.is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != '-');
+        prev = Some(c);
+        if i < last || !at_word_start {
+            continue;
         }
-        result.push_str(rest);
-        out = result;
+        let (start, end) = if let Some(start) = header_value_start(&lower, i) {
+            let len = input[start..]
+                .find(['\n', '\r', '"', '\''])
+                .unwrap_or(input.len() - start);
+            (start, start + len)
+        } else if let Some(start) = scheme_value_start(&lower, i) {
+            let len = input[start..]
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | ')'))
+                .unwrap_or(input.len() - start);
+            (start, start + len)
+        } else {
+            continue;
+        };
+        if end > start {
+            out.push_str(&input[last..start]);
+            out.push_str(MASK);
+            last = end;
+            // Skip the masked value.
+            while iter.clone().next().is_some_and(|(j, _)| j < end) {
+                prev = iter.next().map(|(_, ch)| ch);
+            }
+        }
     }
+    out.push_str(&input[last..]);
     out
 }
 
@@ -192,6 +228,22 @@ mod tests {
         let s = redact(r#"Authorization: Bearer abc.def.ghi-secret, "authorization=xyz""#);
         assert!(!s.contains("secret"), "{s}");
         assert!(!s.contains("xyz"), "{s}");
+        // Any spacing, any case, other schemes, header values to end of line.
+        for (input, secret) in [
+            ("bearer\tsecret-value-1", "secret-value-1"),
+            ("BEARER   secret-value-2 next", "secret-value-2"),
+            ("Authorization:Basic dXNlcjpwYXNzd29yZA==\nnext line", "dXNlcjpwYXNz"),
+            ("authorization = Token some-opaque-token", "some-opaque-token"),
+            ("Proxy-Authorization: Negotiate YIIabc123", "YIIabc123"),
+            ("basic c2VjcmV0OnZhbHVl;", "c2VjcmV0"),
+        ] {
+            let s = redact(input);
+            assert!(!s.contains(secret), "{input:?} -> {s:?}");
+        }
+        assert_eq!(redact("Authorization: x\nnext line"), "Authorization: ***\nnext line");
+        // Ordinary words are left alone.
+        assert_eq!(redact("basically fine"), "basically fine");
+        assert_eq!(redact("no-bearer here"), "no-bearer here");
     }
 
     #[test]

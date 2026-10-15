@@ -130,7 +130,11 @@ export function NewDriveDialog({ open, onOpenChange, initial, freeLetters, profi
     if (LOOKS_LIKE_SOURCE.test(id)) {
       // A URL typed by hand and submitted with Enter: split it first and let
       // the person review the filled-in fields.
-      applySourceText(idText);
+      try {
+        applySourceText(idText);
+      } catch (e) {
+        setError(errorInfo(e));
+      }
       return;
     }
     if (invalid || submitting) {

@@ -42,19 +42,31 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [account, setAccount] = useState<AccountStatus | null>(null);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
-  const inFlight = useRef(false);
+  const inFlight = useRef<Promise<void> | null>(null);
+  const again = useRef(false);
 
-  const refresh = useCallback(async () => {
-    if (inFlight.current) return;
-    inFlight.current = true;
-    try {
-      setOverview(await api.overview());
-      setOverviewError(null);
-    } catch (e) {
-      setOverviewError(errorInfo(e));
-    } finally {
-      inFlight.current = false;
+  // One request at a time. A refresh asked for while one is running (a poll
+  // tick racing a button) is not dropped: it runs once more afterwards, and
+  // every caller's promise resolves only after that fresh result is in.
+  const refresh = useCallback((): Promise<void> => {
+    if (inFlight.current) {
+      again.current = true;
+      return inFlight.current;
     }
+    const run = async () => {
+      do {
+        again.current = false;
+        try {
+          setOverview(await api.overview());
+          setOverviewError(null);
+        } catch (e) {
+          setOverviewError(errorInfo(e));
+        }
+      } while (again.current);
+      inFlight.current = null;
+    };
+    inFlight.current = run();
+    return inFlight.current;
   }, []);
 
   const refreshProfiles = useCallback(async () => {

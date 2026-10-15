@@ -17,6 +17,8 @@ jobs:
   build:
     name: Build and test
     uses: ./.github/workflows/windows.yml
+    # The opt-in authenticated test runs only if the owner configured it.
+    secrets: inherit
 
   publish:
     name: Publish release

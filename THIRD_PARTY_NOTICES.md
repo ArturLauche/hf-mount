@@ -1,11 +1,16 @@
 # Third-party notices
 
 hf-mount is licensed under the Apache License 2.0 (see `LICENSE`). The Windows
-edition uses or ships the following third-party software. Complete
-dependency lists are in `Cargo.lock` (Rust) and `desktop/package-lock.json`
-(desktop UI); the portable CLI archive also contains
-`licenses/rust-dependencies.txt` with every crate compiled into `hf-mount.exe`
-and its license.
+edition uses or ships the third-party software below. Each package's own
+license applies; the full per-package lists, generated from `cargo metadata`
+and the npm lockfile by `scripts/windows/dependency-licenses.ps1`, ship with
+the binaries:
+
+* portable CLI archive: `licenses/rust-dependencies.txt` (every crate in
+  `hf-mount.exe`'s dependency graph, from `Cargo.lock`);
+* desktop installer: `licenses/rust-dependencies.txt` (every crate of the
+  app, from `desktop/src-tauri/Cargo.lock`) and `licenses/npm-dependencies.txt`
+  (every package bundled into the UI, from `desktop/package-lock.json`).
 
 ## WinFsp
 

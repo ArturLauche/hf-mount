@@ -102,6 +102,45 @@ fn err(msg: impl Into<String>) -> SpecError {
     SpecError(msg.into())
 }
 
+/// A Hub endpoint receives the user's token, so it must be `https://`, or
+/// plain `http://` only to this machine's loopback address (local test
+/// servers). The host is checked exactly: `http://localhost.example.com` or
+/// `http://localhost@example.com` are refused.
+pub fn validate_hub_endpoint(endpoint: &str) -> Result<(), SpecError> {
+    let invalid = || err("hub endpoint must be an https:// URL (or http:// to localhost)");
+    if endpoint.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(invalid());
+    }
+    let (rest, https) = if let Some(rest) = endpoint.strip_prefix("https://") {
+        (rest, true)
+    } else if let Some(rest) = endpoint.strip_prefix("http://") {
+        (rest, false)
+    } else {
+        return Err(invalid());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(invalid());
+    }
+    if https {
+        return Ok(());
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((host, port)) => (host, port),
+            None => return Err(invalid()),
+        },
+        // Keep the ':' with the port, as in the bracketed form.
+        None => authority.split_at(authority.find(':').unwrap_or(authority.len())),
+    };
+    let port_ok = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
+    let loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    if loopback && port_ok { Ok(()) } else { Err(invalid()) }
+}
+
 /// Hub naming rules for a namespace or repo/bucket name segment.
 pub fn validate_name_segment(segment: &str, what: &str) -> Result<(), SpecError> {
     if segment.is_empty() {
@@ -247,10 +286,8 @@ impl MountSpec {
         if spec.source_type.is_repo() {
             spec.read_only = true;
         }
-        if let Some(endpoint) = &spec.tuning.hub_endpoint
-            && !(endpoint.starts_with("https://") || endpoint.starts_with("http://localhost"))
-        {
-            return Err(err("hub endpoint must be an https:// URL"));
+        if let Some(endpoint) = &spec.tuning.hub_endpoint {
+            validate_hub_endpoint(endpoint)?;
         }
         Ok(spec)
     }
@@ -313,6 +350,33 @@ impl MountSpec {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hub_endpoints_must_be_https_or_loopback() {
+        for ok in [
+            "https://huggingface.co",
+            "https://hub.example.com/",
+            "http://localhost",
+            "http://localhost:8080/api",
+            "http://127.0.0.1:5000",
+            "http://[::1]:8000",
+        ] {
+            assert!(validate_hub_endpoint(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://localhost.evil.com",
+            "http://localhost@evil.com",
+            "http://evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://localhost:80x",
+            "https://user@evil.com",
+            "ftp://localhost",
+            "https://",
+            "https://exa mple.com",
+        ] {
+            assert!(validate_hub_endpoint(bad).is_err(), "{bad}");
+        }
+    }
     use super::*;
 
     #[test]

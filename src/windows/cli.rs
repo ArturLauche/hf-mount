@@ -260,11 +260,14 @@ fn identity() -> Result<Identity, ErrorInfo> {
         .map_err(|e| ErrorInfo::new(ErrorCode::Internal, format!("cannot determine the current user: {e}")))
 }
 
-fn endpoint_or_default(endpoint: Option<&str>) -> String {
-    endpoint
+fn endpoint_or_default(endpoint: Option<&str>) -> Result<String, ErrorInfo> {
+    let endpoint = endpoint
         .map(str::to_string)
         .or_else(|| config::load_settings().ok().and_then(|s| s.hub_endpoint))
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string())
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+    // The token is sent to this address.
+    crate::manager::spec::validate_hub_endpoint(&endpoint).map_err(invalid)?;
+    Ok(endpoint)
 }
 
 fn warn_if_elevated(out: &Out) {
@@ -389,7 +392,7 @@ fn start(out: &Out, args: StartArgs) -> Result<i32, ErrorInfo> {
     winfsp::api().map_err(|e| {
         ErrorInfo::new(ErrorCode::DriverMissing, e.to_string()).with_hint("run `hf-mount doctor` for installation help")
     })?;
-    let endpoint = endpoint_or_default(spec.tuning.hub_endpoint.as_deref());
+    let endpoint = endpoint_or_default(spec.tuning.hub_endpoint.as_deref())?;
     let credential = resolve_credential(&args, &endpoint);
 
     if args.foreground {
@@ -668,7 +671,7 @@ fn auth_cmd(out: &Out, cmd: AuthCommand) -> Result<i32, ErrorInfo> {
             no_validate,
             hub_endpoint,
         } => {
-            let endpoint = endpoint_or_default(hub_endpoint.as_deref());
+            let endpoint = endpoint_or_default(hub_endpoint.as_deref())?;
             let token = read_secret("Hugging Face token (input hidden): ", token_stdin)?;
             let token = Secret::new(token).ok_or_else(|| invalid("no token given"))?;
             let account = if no_validate {
@@ -696,7 +699,7 @@ fn auth_cmd(out: &Out, cmd: AuthCommand) -> Result<i32, ErrorInfo> {
             Ok(0)
         }
         AuthCommand::Status { offline, hub_endpoint } => {
-            let endpoint = endpoint_or_default(hub_endpoint.as_deref());
+            let endpoint = endpoint_or_default(hub_endpoint.as_deref())?;
             let stored = credman::read(&endpoint)
                 .map_err(|e| ErrorInfo::new(ErrorCode::Internal, format!("Credential Manager: {e}")))?;
             let env = ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
@@ -770,7 +773,7 @@ fn auth_cmd(out: &Out, cmd: AuthCommand) -> Result<i32, ErrorInfo> {
             Ok(0)
         }
         AuthCommand::Logout { hub_endpoint } => {
-            let endpoint = endpoint_or_default(hub_endpoint.as_deref());
+            let endpoint = endpoint_or_default(hub_endpoint.as_deref())?;
             let removed = credman::delete(&endpoint)
                 .map_err(|e| ErrorInfo::new(ErrorCode::Internal, format!("Credential Manager: {e}")))?;
             if out.json {
@@ -799,7 +802,7 @@ fn doctor(out: &Out) -> Result<i32, ErrorInfo> {
             Err(e) => Err(e.to_string()),
         }
     });
-    let endpoint = endpoint_or_default(None);
+    let endpoint = endpoint_or_default(None)?;
     let started = std::time::Instant::now();
     let hub = rt.block_on(async {
         let client = reqwest::Client::builder()
@@ -960,17 +963,19 @@ fn drives_cmd(out: &Out) -> Result<i32, ErrorInfo> {
 
 fn activity(out: &Out, limit: usize) -> Result<i32, ErrorInfo> {
     let identity = identity()?;
+    // Only "no supervisor" means "no activity"; a supervisor that fails to
+    // answer is an error worth seeing.
     let response = runtime().block_on(async {
-        let mut conn = Connection::open(&identity.supervisor_pipe(), &identity)
-            .await
-            .map_err(ErrorInfo::from)?;
-        conn.call(&Request::Activity { limit }).await
-    });
+        match Connection::open(&identity.supervisor_pipe(), &identity).await {
+            Ok(mut conn) => conn.call(&Request::Activity { limit }).await.map(Some),
+            Err(ConnectError::NotRunning) => Ok(None),
+            Err(e) => Err(ErrorInfo::from(e)),
+        }
+    })?;
     let events = match response {
-        Ok(Response::Activity { events }) => events,
-        Ok(other) => return Err(client::expect_error(other)),
-        Err(e) if e.code == ErrorCode::HostUnavailable => Vec::new(),
-        Err(e) => return Err(e),
+        Some(Response::Activity { events }) => events,
+        Some(other) => return Err(client::expect_error(other)),
+        None => Vec::new(),
     };
     if out.json {
         out.json(json!({"ok": true, "events": events}));

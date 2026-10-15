@@ -31,6 +31,13 @@ describe("parseSourceInput", () => {
   it("decodes encoded revisions", () => {
     expect(parseSourceInput("https://huggingface.co/org/repo/tree/refs%2Fpr%2F1").revision).toBe("refs/pr/1");
   });
+
+  it("keeps malformed escapes instead of throwing", () => {
+    expect(parseSourceInput("https://huggingface.co/org/repo/tree/main/100%/x%zz")).toMatchObject({
+      revision: "main",
+      subfolder: "100%/x%zz",
+    });
+  });
 });
 
 describe("validation", () => {

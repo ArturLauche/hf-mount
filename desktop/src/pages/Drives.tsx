@@ -14,6 +14,7 @@ import { displayName, hubUrl } from "../lib/source";
 import { useApp } from "../lib/state";
 import type { MountInfo, Profile, UnmountReport } from "../lib/types";
 import { plural } from "../lib/format";
+import { useGuard } from "../hooks/useGuard";
 
 const SUGGESTIONS: NewDriveInitial[] = [
   { source_type: "model", id: "openai-community/gpt2" },
@@ -23,6 +24,7 @@ const SUGGESTIONS: NewDriveInitial[] = [
 export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: number; onNavigate: (p: Page) => void }) {
   const { overview, overviewError, profiles, setProfiles, refresh, account } = useApp();
   const toast = useToast();
+  const guard = useGuard();
   const [busy, setBusy] = useState<Record<string, Busy>>({});
   const [dialog, setDialog] = useState<{ open: boolean; initial?: NewDriveInitial }>({ open: false });
   const [forceAsk, setForceAsk] = useState<{ row: DriveRow; message: string } | null>(null);
@@ -77,13 +79,13 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
           body: r.recovered_to
             ? `Copies were kept in ${r.recovered_to}. Upload them again from there.`
             : "Some changes could not be uploaded.",
-          action: r.recovered_to ? { label: "Open folder", onClick: () => void api.openPath("recovered") } : undefined,
+          action: r.recovered_to ? { label: "Open folder", onClick: () => guard(api.openPath("recovered"), "Could not open the folder") } : undefined,
         });
       } else {
         toast({ tone: "success", title: `${r.target} unmounted` });
       }
     },
-    [toast],
+    [guard, toast],
   );
 
   const doMount = useCallback(
@@ -111,7 +113,7 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
           tone: "success",
           title: `Mounted at ${mount.spec.target}`,
           body: mount.resolved_source ?? undefined,
-          action: { label: "Open in Explorer", onClick: () => void api.openDrive(mount.spec.target) },
+          action: { label: "Open in Explorer", onClick: () => guard(api.openDrive(mount.spec.target), "Could not open Explorer") },
         });
         return mount;
       } finally {
@@ -119,7 +121,7 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
         void refresh();
       }
     },
-    [persistProfile, refresh, toast],
+    [guard, persistProfile, refresh, toast],
   );
 
   const unmount = useCallback(
@@ -145,7 +147,7 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
   );
 
   const actions: DriveActions = {
-    open: (row) => void api.openDrive(row.target).catch((e) => toast({ tone: "error", title: "Could not open", body: errorInfo(e).message })),
+    open: (row) => guard(api.openDrive(row.target), "Could not open Explorer"),
     mount: (row) => {
       const go = async () => {
         if (row.mount?.state === "failed") await api.dismissMount(row.target).catch(() => {});
@@ -159,14 +161,18 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
       void go();
     },
     unmount: (row) => void unmount(row, false),
-    dismiss: (row) => void api.dismissMount(row.target).finally(() => void refresh()),
+    dismiss: (row) => guard(api.dismissMount(row.target).finally(() => void refresh()), "Could not dismiss"),
     retryUploads: (row) =>
       void api
         .retryUploads(row.target)
         .then(() => toast({ tone: "info", title: `Retrying uploads on ${row.target}` }))
         .catch((e) => toast({ tone: "error", title: "Could not retry uploads", body: errorInfo(e).message })),
-    copyPath: (row) => void copyText(`${row.target}\\`).then(() => toast({ tone: "success", title: `Copied ${row.target}\\` })),
-    viewOnHub: (row) => void openUrl(hubUrl(row.spec)),
+    copyPath: (row) =>
+      guard(
+        copyText(`${row.target}\\`).then(() => toast({ tone: "success", title: `Copied ${row.target}\\` })),
+        "Could not copy",
+      ),
+    viewOnHub: (row) => guard(openUrl(hubUrl(row.spec)), "Could not open the browser"),
     save: (row) =>
       void persistProfile({
         id: newProfileId(),
@@ -247,10 +253,10 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
             title="The mount service stopped unexpectedly"
             actions={
               <>
-                <Button size="sm" variant="ghost" onClick={() => void api.openPath("recovered")}>
+                <Button size="sm" variant="ghost" onClick={() => guard(api.openPath("recovered"), "Could not open the folder")}>
                   Recovered files
                 </Button>
-                <Button size="sm" onClick={() => void api.dismissLost().finally(() => void refresh())}>
+                <Button size="sm" onClick={() => guard(api.dismissLost().finally(() => void refresh()), "Could not dismiss")}>
                   Dismiss
                 </Button>
               </>

@@ -324,12 +324,36 @@ fn preserve(target: &str, files: &[(String, PathBuf)]) -> std::io::Result<PathBu
         for component in remote.split('/').filter(|c| !c.is_empty()) {
             dest.push(safe_component(component));
         }
+        if dest == dir {
+            dest.push("unnamed");
+        }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(staging, &dest)?;
+        // Different remote names can map to the same Windows name (made safe,
+        // or differing only in case); never let one copy replace another.
+        std::fs::copy(staging, free_path(dest))?;
     }
     Ok(dir)
+}
+
+/// `path` if nothing exists there, else `name (2).ext`, `name (3).ext`, ...
+fn free_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    (2..)
+        .map(|n| path.with_file_name(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .expect("an unused name exists")
 }
 
 fn safe_component(name: &str) -> String {

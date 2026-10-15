@@ -187,11 +187,16 @@ async fn serve_connection(pipe: NamedPipeServer, registry: Arc<Registry>, sid: S
     let (r, mut w) = tokio::io::split(pipe);
     let mut reader = BufReader::new(r);
     loop {
-        let line = match read_message(&mut reader).await {
-            Ok(Some(line)) => line,
-            Ok(None) => return,
-            Err(e) => {
+        // An idle client must not hold one of the limited pipe instances.
+        let line = match tokio::time::timeout(SERVER_IDLE_TIMEOUT, read_message(&mut reader)).await {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => return,
+            Ok(Err(e)) => {
                 debug!("control connection closed: {e}");
+                return;
+            }
+            Err(_) => {
+                debug!("closing idle control connection");
                 return;
             }
         };
@@ -205,7 +210,30 @@ async fn serve_connection(pipe: NamedPipeServer, registry: Arc<Registry>, sid: S
     }
 }
 
-/// Accept control connections until `stop` resolves.
+/// Create the next listening instance, retrying while the instance limit is
+/// reached or creation fails transiently. Returns `None` once `stop` fires.
+async fn next_instance(
+    name: &str,
+    sd: &SecurityDescriptor,
+    stop: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+) -> Option<NamedPipeServer> {
+    let mut delay = Duration::from_millis(50);
+    loop {
+        match create_server(name, false, sd) {
+            Ok(server) => return Some(server),
+            Err(e) => warn!("could not create a control pipe instance (retrying): {e}"),
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = stop.as_mut() => return None,
+        }
+        delay = (delay * 2).min(Duration::from_secs(5));
+    }
+}
+
+/// Accept control connections until `stop` resolves. Errors on a single
+/// connection are logged and never end the loop: the mounts this host serves
+/// must not go away because one client misbehaved.
 pub async fn serve(
     name: String,
     mut server: NamedPipeServer,
@@ -218,10 +246,21 @@ pub async fn serve(
     loop {
         tokio::select! {
             res = server.connect() => {
-                res?;
-                let next = create_server(&name, false, &sd)?;
+                // The next instance is created before the connected one is
+                // handed off, so the name always exists: a client never sees
+                // "not running" and a second supervisor can never bind it.
+                let Some(next) = next_instance(&name, &sd, &mut stop).await else {
+                    return Ok(());
+                };
                 let connected = std::mem::replace(&mut server, next);
-                tokio::spawn(serve_connection(connected, registry.clone(), sid.clone()));
+                match res {
+                    Ok(()) => {
+                        tokio::spawn(serve_connection(connected, registry.clone(), sid.clone()));
+                    }
+                    // The client went away before it was accepted, or the
+                    // instance broke; drop it and keep listening.
+                    Err(e) => debug!("control pipe connect failed: {e}"),
+                }
             }
             _ = &mut stop => return Ok(()),
         }
@@ -258,6 +297,25 @@ impl From<ConnectError> for ErrorInfo {
         ErrorInfo::new(code, e.to_string())
     }
 }
+
+/// How long a host may take to answer `request`. Mounting includes Hub
+/// round trips with retries; unmounting waits for pending uploads (the
+/// "upload wait" setting); everything else is answered from memory.
+pub fn request_timeout(request: &Request) -> Duration {
+    match request {
+        Request::Mount { .. } => Duration::from_secs(5 * 60),
+        Request::Unmount { .. } => {
+            let upload_wait = crate::manager::config::load_settings()
+                .map(|s| s.upload_wait_secs)
+                .unwrap_or(300);
+            Duration::from_secs(upload_wait.saturating_add(5 * 60))
+        }
+        _ => Duration::from_secs(30),
+    }
+}
+
+/// Idle time after which a host closes a control connection.
+const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// An open, verified control connection.
 pub struct Connection {
@@ -307,8 +365,21 @@ impl Connection {
         }
     }
 
-    /// Send one request and wait for its response.
+    /// Send one request and wait for its response, at most as long as the
+    /// request can legitimately take (see [`request_timeout`]).
     pub async fn call(&mut self, request: &Request) -> Result<Response, ErrorInfo> {
+        let limit = request_timeout(request);
+        match tokio::time::timeout(limit, self.exchange(request)).await {
+            Ok(result) => result,
+            Err(_) => Err(ErrorInfo::new(
+                ErrorCode::Timeout,
+                format!("the mount host did not answer within {} s", limit.as_secs()),
+            )
+            .with_hint("it may still be working; check `hf-mount status`, or see the supervisor log")),
+        }
+    }
+
+    async fn exchange(&mut self, request: &Request) -> Result<Response, ErrorInfo> {
         let io_err = |e: io::Error| ErrorInfo::new(ErrorCode::HostUnavailable, format!("control pipe: {e}"));
         self.writer
             .write_all(encode(request).as_bytes())

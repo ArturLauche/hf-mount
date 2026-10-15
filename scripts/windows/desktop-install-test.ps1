@@ -20,7 +20,8 @@ Step "Silent per-user install"
 $p = Start-Process -FilePath $Installer -ArgumentList '/S' -Wait -PassThru
 if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }
 foreach ($f in 'hf-mount-desktop.exe', 'hf-mount.exe', 'uninstall.exe',
-    'winfsp\winfsp-2.1.25156.msi', 'licenses\WinFsp-License.txt', 'licenses\hf-mount-LICENSE.txt') {
+    'winfsp\winfsp-2.1.25156.msi', 'licenses\WinFsp-License.txt', 'licenses\hf-mount-LICENSE.txt',
+    'licenses\THIRD_PARTY_NOTICES.md', 'licenses\rust-dependencies.txt', 'licenses\npm-dependencies.txt') {
     $path = Join-Path $dir $f
     if (-not (Test-Path -LiteralPath $path)) { throw "not installed: $path" }
     Write-Host "ok  $f"

@@ -121,18 +121,28 @@ pub fn split_path(path: &str) -> Result<Vec<&str>, PathError> {
     Ok(components)
 }
 
-/// Decode a NUL-terminated or length-delimited UTF-16 name. Unpaired
+/// Decode a UTF-16 name, ending at the first NUL if there is one. Unpaired
 /// surrogates (legal in NTFS names, not in Hub paths) are rejected rather
 /// than replaced, so two distinct Windows names never map to one remote name.
 pub fn utf16_to_string(units: &[u16]) -> Option<String> {
-    String::from_utf16(units).ok()
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    String::from_utf16(&units[..end]).ok()
+}
+
+/// Upcase one character the way the Windows upcase table does: a 1:1
+/// mapping only. Characters whose full uppercase is longer (`ß` → `SS`,
+/// `ﬁ` → `FI`) are left unchanged, as NTFS leaves them.
+fn upcase(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
 }
 
 /// Case-insensitive comparison approximating the Windows upcase table.
 pub fn eq_ignore_case(a: &str, b: &str) -> bool {
-    a.chars()
-        .flat_map(char::to_uppercase)
-        .eq(b.chars().flat_map(char::to_uppercase))
+    a.chars().map(upcase).eq(b.chars().map(upcase))
 }
 
 /// The single candidate equal to `wanted` ignoring case, if there is
@@ -186,6 +196,23 @@ pub fn is_shell_probe_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn case_folding_is_one_to_one_like_ntfs() {
+        assert!(eq_ignore_case("Config.JSON", "config.json"));
+        assert!(eq_ignore_case("ÄRGER", "ärger"));
+        // Full case mapping would make these equal; NTFS keeps them distinct.
+        assert!(!eq_ignore_case("STRASSE", "straße"));
+        assert!(!eq_ignore_case("FILE", "ﬁle"));
+    }
+
+    #[test]
+    fn utf16_decoding_stops_at_nul() {
+        let mut units: Vec<u16> = "name".encode_utf16().collect();
+        units.extend([0, b'x' as u16]);
+        assert_eq!(utf16_to_string(&units).as_deref(), Some("name"));
+        assert_eq!(utf16_to_string(&[0xD800]), None);
+    }
     use super::*;
 
     #[test]

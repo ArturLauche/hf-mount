@@ -7,26 +7,39 @@ import { api, errorInfo } from "../lib/api";
 import { clockTime } from "../lib/format";
 import { copyText } from "../lib/native";
 import type { ActivityEvent } from "../lib/types";
+import { useGuard } from "../hooks/useGuard";
 
 type Tab = "events" | "log";
 type Filter = "all" | "problems";
 
 const REFRESH_MS = 3000;
 
+function sameJson(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 export function ActivityPage() {
   const toast = useToast();
+  const guard = useGuard();
   const [tab, setTab] = useState<Tab>("events");
   const [filter, setFilter] = useState<Filter>("all");
   const [events, setEvents] = useState<ActivityEvent[] | null>(null);
   const [log, setLog] = useState<string[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [copying, setCopying] = useState(false);
-  const logEnd = useRef<HTMLDivElement>(null);
+  const logBox = useRef<HTMLDivElement>(null);
+  // Follow new log lines only while the reader is at the bottom.
+  const followLog = useRef(true);
 
   const load = useCallback(async () => {
     try {
-      if (tab === "events") setEvents(await api.activity(300));
-      else setLog(await api.logTail(400));
+      if (tab === "events") {
+        const next = await api.activity(300);
+        setEvents((prev) => (sameJson(prev, next) ? prev : next));
+      } else {
+        const next = await api.logTail(400);
+        setLog((prev) => (sameJson(prev, next) ? prev : next));
+      }
       setLoadError(null);
     } catch (e) {
       setLoadError(errorInfo(e).message);
@@ -42,7 +55,8 @@ export function ActivityPage() {
   }, [load]);
 
   useEffect(() => {
-    if (tab === "log") logEnd.current?.scrollIntoView({ block: "end" });
+    const box = logBox.current;
+    if (tab === "log" && box && followLog.current) box.scrollTop = box.scrollHeight;
   }, [log, tab]);
 
   const copyDiagnostics = async () => {
@@ -66,7 +80,7 @@ export function ActivityPage() {
         description="What hf-mount did recently, for this Windows session."
         actions={
           <>
-            <Button icon={<FolderOpen className="size-4" />} onClick={() => void api.openPath("logs")}>
+            <Button icon={<FolderOpen className="size-4" />} onClick={() => guard(api.openPath("logs"), "Could not open the logs folder")}>
               Logs folder
             </Button>
             <Button icon={<ClipboardCopy className="size-4" />} onClick={() => void copyDiagnostics()} loading={copying}>
@@ -133,7 +147,14 @@ export function ActivityPage() {
 
       {tab === "log" && (
         <Card className="overflow-hidden">
-          <div className="selectable max-h-[calc(100vh-260px)] min-h-[240px] overflow-auto bg-surface p-4 font-mono text-[12px] leading-[1.65] text-fg-2">
+          <div
+            ref={logBox}
+            onScroll={(e) => {
+              const el = e.currentTarget;
+              followLog.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+            }}
+            className="selectable max-h-[calc(100vh-260px)] min-h-[240px] overflow-auto bg-surface p-4 font-mono text-[12px] leading-[1.65] text-fg-2"
+          >
             {log === null ? (
               <span className="text-fg-3">Loading…</span>
             ) : log.length === 0 ? (
@@ -152,7 +173,6 @@ export function ActivityPage() {
                 </div>
               ))
             )}
-            <div ref={logEnd} />
           </div>
           <p className="border-t border-border px-4 py-2.5 text-[12px] text-fg-3">
             Tokens, authorization headers and signed links are removed before anything is written to the log.

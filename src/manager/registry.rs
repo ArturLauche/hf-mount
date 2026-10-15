@@ -56,6 +56,9 @@ pub struct Registry {
     last_request: Mutex<Instant>,
     shutdown: AtomicBool,
     journal: Option<PathBuf>,
+    /// Last journal content written, so unchanged state is not rewritten on
+    /// every status query.
+    journal_written: Mutex<Option<Vec<u8>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -85,6 +88,7 @@ impl Registry {
             last_request: Mutex::new(Instant::now()),
             shutdown: AtomicBool::new(false),
             journal,
+            journal_written: Mutex::new(None),
         })
     }
 
@@ -485,19 +489,31 @@ impl Registry {
             started_at: &self.host.started_at,
             mounts,
         };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let Ok(json) = serde_json::to_vec_pretty(&journal) else {
+            return;
+        };
+        let mut written = lock(&self.journal_written);
+        if written.as_deref() == Some(json.as_slice()) {
+            return;
         }
-        if let Ok(json) = serde_json::to_vec_pretty(&journal)
-            && let Err(e) = std::fs::write(path, json)
-        {
-            warn!("could not write session journal {}: {e}", path.display());
+        // Write a temporary file and rename it over the journal, so a crash
+        // mid-write never leaves a torn journal behind.
+        let tmp = path.with_extension("json.tmp");
+        let result = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&tmp, &json))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        match result {
+            Ok(()) => *written = Some(json),
+            Err(e) => warn!("could not write session journal {}: {e}", path.display()),
         }
     }
 
     pub fn remove_journal(&self) {
         if let Some(path) = &self.journal {
             let _ = std::fs::remove_file(path);
+            *lock(&self.journal_written) = None;
         }
     }
 }

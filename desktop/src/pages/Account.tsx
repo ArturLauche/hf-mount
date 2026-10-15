@@ -9,6 +9,7 @@ import { errorTitle, sentence } from "../lib/errors";
 import { HF_TOKENS_URL, openUrl } from "../lib/native";
 import { useApp } from "../lib/state";
 import type { ErrorInfo } from "../lib/types";
+import { useGuard } from "../hooks/useGuard";
 
 export function AccountPage() {
   const { account, refreshAccount, setAccount } = useApp();
@@ -164,6 +165,7 @@ function SignInForm({ onSignedIn, onCancel }: { onSignedIn: (a: import("../lib/t
   const [visible, setVisible] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<ErrorInfo | null>(null);
+  const guard = useGuard();
 
   const looksWrong = token.trim().length > 0 && !/^hf_[A-Za-z0-9]{20,}$/.test(token.trim());
 
@@ -244,7 +246,7 @@ function SignInForm({ onSignedIn, onCancel }: { onSignedIn: (a: import("../lib/t
               Cancel
             </Button>
           )}
-          <Button variant="ghost" className="ml-auto" icon={<ExternalLink className="size-3.5" />} onClick={() => void openUrl(HF_TOKENS_URL)}>
+          <Button variant="ghost" className="ml-auto" icon={<ExternalLink className="size-3.5" />} onClick={() => guard(openUrl(HF_TOKENS_URL), "Could not open the browser")}>
             Create a token
           </Button>
         </div>

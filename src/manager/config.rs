@@ -124,10 +124,8 @@ impl Settings {
         if self.metadata_ttl_ms > 3_600_000 {
             return Err("metadata TTL must be at most one hour".into());
         }
-        if let Some(endpoint) = &self.hub_endpoint
-            && !endpoint.starts_with("https://")
-        {
-            return Err("hub endpoint must be an https:// URL".into());
+        if let Some(endpoint) = &self.hub_endpoint {
+            super::spec::validate_hub_endpoint(endpoint).map_err(|e| e.to_string())?;
         }
         if let Some(dir) = &self.cache_dir
             && !dir.is_absolute()
@@ -203,8 +201,18 @@ pub fn profiles_path() -> PathBuf {
     home_dir().join("profiles.json")
 }
 
+/// Settings from disk. A file that does not pass [`Settings::validate`]
+/// (e.g. edited by hand to a cleartext Hub endpoint) is an error, so callers
+/// fall back to defaults instead of using unsafe values.
 pub fn load_settings() -> std::io::Result<Settings> {
-    read_json(&settings_path())
+    let settings: Settings = read_json(&settings_path())?;
+    settings.validate().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: {e}", settings_path().display()),
+        )
+    })?;
+    Ok(settings)
 }
 
 pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
@@ -300,6 +308,15 @@ mod tests {
                 ..Default::default()
             };
             assert!(save_settings(&s).is_err());
+        });
+        // A hand-edited file with a cleartext endpoint is not used either.
+        with_home(|home| {
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"hub_endpoint":"http://localhost.evil.com"}"#,
+            )
+            .unwrap();
+            assert!(load_settings().is_err());
         });
     }
 

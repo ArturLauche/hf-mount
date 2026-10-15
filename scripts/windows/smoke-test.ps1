@@ -107,7 +107,9 @@ try {
     Check "Get-ChildItem lists $SmallFile and $LargeFile" {
         ($listing.Name -contains $SmallFile) -and ($listing.Name -contains $LargeFile)
     }
-    $cmdDir = cmd /c "dir /b $Root"
+    # Pass the path as its own argument and without a trailing backslash: in
+    # "dir /b Z:\" the backslash would escape the closing quote.
+    $cmdDir = & cmd.exe /d /c dir /b "$Drive\."
     Check 'cmd dir lists the repository' { $cmdDir -contains $SmallFile }
 
     $hubSmall = HubRange $SmallFile 0 0
@@ -129,11 +131,13 @@ try {
 
     $repoBytes = ($listing | Where-Object { -not $_.PSIsContainer } | Measure-Object Length -Sum).Sum
     $cacheRoot = Join-Path $env:LOCALAPPDATA 'hf-mount\cache'
-    $cacheKey = 'models--' + $Repo.Replace('/', '--')
-    $cacheBytes = (Get-ChildItem -Path (Join-Path $cacheRoot "$cacheKey*") -Recurse -File -ErrorAction SilentlyContinue |
+    $cacheDir = Join-Path $cacheRoot ('models--' + $Repo.Replace('/', '--'))
+    Check "the mount uses its cache directory ($cacheDir)" { Test-Path -LiteralPath $cacheDir }
+    # Everything hf-mount stored on disk, for any source.
+    $cacheBytes = (Get-ChildItem -LiteralPath $cacheRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
         Measure-Object Length -Sum).Sum
     if (-not $cacheBytes) { $cacheBytes = 0 }
-    Write-Host ("Repository top-level files: {0:N0} MB; local cache: {1:N0} MB" -f ($repoBytes / 1MB), ($cacheBytes / 1MB))
+    Write-Host ("Repository top-level files: {0:N0} bytes; everything in the hf-mount cache: {1:N0} bytes" -f $repoBytes, $cacheBytes)
     Check 'repository was not downloaded in full (cache < 25% of repo size)' { $cacheBytes -lt ($repoBytes * 0.25) }
 
     $writeFailed = $false

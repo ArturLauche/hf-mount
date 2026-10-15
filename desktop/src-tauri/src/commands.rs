@@ -38,7 +38,7 @@ fn io_error(what: &str, e: std::io::Error) -> ErrorInfo {
     }
 }
 
-/// The official WinFsp installer shipped with the app (see `tauri.winfsp.conf.json`).
+/// The official WinFsp installer shipped with the app (see `tauri.release.conf.json`).
 const WINFSP_MSI: &str = "winfsp-2.1.25156.msi";
 /// SHA-256 of that MSI, as pinned in `scripts/windows/install-winfsp.ps1`.
 const WINFSP_MSI_SHA256: &str = "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a";
@@ -136,9 +136,14 @@ pub fn sign_out() -> CmdResult<()> {
     ops::sign_out(&ops::endpoint())
 }
 
+/// Unreadable or invalid settings are reported in the log and replaced by
+/// the defaults (which the engine uses too), so the page always loads.
 #[tauri::command]
 pub fn get_settings() -> CmdResult<Settings> {
-    config::load_settings().map_err(|e| io_error("settings", e))
+    Ok(config::load_settings().unwrap_or_else(|e| {
+        tracing::warn!("settings: {e}; using defaults");
+        Settings::default()
+    }))
 }
 
 #[tauri::command]

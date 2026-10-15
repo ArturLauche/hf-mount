@@ -35,15 +35,9 @@ Copy-Item -LiteralPath (Join-Path $root 'licenses\WinFsp-License.txt') -Destinat
 Copy-Item -LiteralPath (Join-Path $root 'THIRD_PARTY_NOTICES.md') -Destination (Join-Path $stage 'licenses')
 Copy-Item -LiteralPath (Join-Path $root 'scripts\windows\install-winfsp.ps1') -Destination $stage
 
-# Every crate compiled into hf-mount.exe for this platform, with its license.
-$meta = cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc `
-    --manifest-path (Join-Path $root 'Cargo.toml') | ConvertFrom-Json
-$lines = $meta.packages | Sort-Object name, version | ForEach-Object {
-    $license = if ($_.license) { $_.license } elseif ($_.license_file) { "see $($_.license_file)" } else { 'unspecified' }
-    '{0} {1}  {2}' -f $_.name, $_.version, $license
-}
-Set-Content -LiteralPath (Join-Path $stage 'licenses\rust-dependencies.txt') -Encoding utf8 -Value (
-    @("Rust crates in the hf-mount $version dependency graph for x86_64-pc-windows-msvc (name, version, license).", '') + $lines)
+# Every crate in hf-mount.exe's dependency graph, with its license.
+& (Join-Path $PSScriptRoot 'dependency-licenses.ps1') -Manifest (Join-Path $root 'Cargo.toml') `
+    -OutDir (Join-Path $stage 'licenses')
 
 $readme = @"
 hf-mount $version for Windows (x64) - portable command line

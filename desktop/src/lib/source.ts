@@ -14,6 +14,15 @@ export interface ParsedSource {
   revision?: string;
 }
 
+/** `decodeURIComponent` that keeps malformed escapes (`100%`) as typed. */
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
 /**
  * Accept what people paste: `user/name`, `datasets/user/name`, Hub URLs
  * (`https://huggingface.co/datasets/user/name/tree/main/sub`) and
@@ -50,10 +59,10 @@ export function parseSourceInput(raw: string): ParsedSource {
   let rest = parts.slice(2);
   // Hub browser URLs: <id>/tree/<rev>/<path> or <id>/blob/<rev>/<path>
   if ((rest[0] === "tree" || rest[0] === "blob" || rest[0] === "resolve") && rest.length >= 2) {
-    revision = decodeURIComponent(rest[1]!);
+    revision = safeDecode(rest[1]!);
     rest = rest.slice(2);
   }
-  if (rest.length > 0) subfolder = rest.map(decodeURIComponent).join("/");
+  if (rest.length > 0) subfolder = rest.map(safeDecode).join("/");
   if (idParts.length === 1 && parts.length === 1) idParts = [parts[0]!];
   return { source_type, id: idParts.join("/"), subfolder, revision };
 }

@@ -8,6 +8,7 @@ import { formatBytes } from "../lib/format";
 import { copyText, openUrl, pickFolder, WINFSP_REPO_URL } from "../lib/native";
 import { useApp } from "../lib/state";
 import type { Settings, Theme } from "../lib/types";
+import { useGuard } from "../hooks/useGuard";
 
 const GB = 1_000_000_000;
 const CACHE_SIZES = [2, 5, 10, 25, 50, 100, 250].map((n) => ({ value: n * GB, label: `${n} GB` }));
@@ -27,6 +28,7 @@ const TTLS = [
 export function SettingsPage() {
   const { settings, updateSettings, appInfo, overview } = useApp();
   const toast = useToast();
+  const guard = useGuard();
 
   const set = async <K extends keyof Settings>(key: K, value: Settings[K]) => {
     if (!settings) return;
@@ -114,7 +116,7 @@ export function SettingsPage() {
             >
               Change…
             </Button>
-            <Button size="sm" variant="ghost" icon={<FolderOpen className="size-3.5" />} onClick={() => void api.openPath("cache")}>
+            <Button size="sm" variant="ghost" icon={<FolderOpen className="size-3.5" />} onClick={() => guard(api.openPath("cache"), "Could not open the cache folder")}>
               Open
             </Button>
           </SettingsRow>
@@ -169,7 +171,7 @@ export function SettingsPage() {
               <Button
                 size="sm"
                 icon={<Copy className="size-3.5" />}
-                onClick={() => void copyText(appInfo.cli_path!).then(() => toast({ tone: "success", title: "Path copied" }))}
+                onClick={() => guard(copyText(appInfo.cli_path!).then(() => toast({ tone: "success", title: "Path copied" })), "Could not copy")}
               >
                 Copy path
               </Button>
@@ -193,12 +195,12 @@ export function SettingsPage() {
             <span className="font-mono text-[12.5px] text-fg-2">
               {overview?.driver.installed ? (overview.driver.version ?? "installed") : "not installed"}
             </span>
-            <Button size="sm" variant="ghost" icon={<ExternalLink className="size-3.5" />} onClick={() => void openUrl(WINFSP_REPO_URL)}>
+            <Button size="sm" variant="ghost" icon={<ExternalLink className="size-3.5" />} onClick={() => guard(openUrl(WINFSP_REPO_URL), "Could not open the browser")}>
               Source
             </Button>
           </SettingsRow>
           <SettingsRow label="Data folder" description={<span className="selectable font-mono text-[12px]">{appInfo?.home_dir ?? ""}</span>}>
-            <Button size="sm" variant="ghost" icon={<FolderOpen className="size-3.5" />} onClick={() => void api.openPath("home")}>
+            <Button size="sm" variant="ghost" icon={<FolderOpen className="size-3.5" />} onClick={() => guard(api.openPath("home"), "Could not open the folder")}>
               Open
             </Button>
           </SettingsRow>

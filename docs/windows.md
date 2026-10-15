@@ -145,7 +145,7 @@ GitHub-hosted runners (`windows-2025`, `ubuntu-24.04`) on this pull request.
 | CLI argument handling and exit codes | CI | see the pull request |
 | Installer: silent install, bundled WinFsp MSI integrity, CLI runs, app starts, silent uninstall keeps user data | CI (`scripts/windows/desktop-install-test.ps1`) | see the pull request |
 | Desktop UI: typecheck, lint, component tests (navigation, keyboard, theme, URL parsing, validation, errors) | CI (`frontend` job) | see the pull request |
-| Private repositories and bucket writes against the real Hub | Needs a token; not run in CI (no secrets are used) | **not verified** |
+| Private repositories and bucket writes against the real Hub | Opt-in CI job (`authenticated`, `scripts/windows/authenticated-test.ps1`) that runs only when the repository owner sets the `HF_TOKEN` secret and `HF_MOUNT_TEST_BUCKET` / `HF_MOUNT_TEST_PRIVATE_REPO` variables | **not verified** in this pull request (not configured) |
 | The desktop app clicked through on a real Windows desktop with real mounts | Not possible on CI runners | **not verified** (UI verified in a browser against sample data; app start verified in CI) |
 | Interactive WinFsp installation from the app or installer (UAC) | Needs an interactive session | **not verified** |
 | Windows 10, ARM64, non-English Windows | — | **not verified** |

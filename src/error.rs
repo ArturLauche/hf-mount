@@ -160,6 +160,13 @@ pub fn io_errno(err: &std::io::Error) -> i32 {
     #[cfg(not(unix))]
     {
         use std::io::ErrorKind;
+        // A file another program holds open is "busy", not "access denied"
+        // (Rust reports both as PermissionDenied).
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        if matches!(err.raw_os_error(), Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)) {
+            return libc::EBUSY;
+        }
         match err.kind() {
             ErrorKind::NotFound => libc::ENOENT,
             ErrorKind::PermissionDenied => libc::EACCES,

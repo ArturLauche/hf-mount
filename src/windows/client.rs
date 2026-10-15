@@ -66,8 +66,17 @@ pub fn take_lost_session(identity: &Identity) -> Option<LostSession> {
         return None;
     }
     let bytes = std::fs::read(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    let journal: JournalFile = serde_json::from_slice(&bytes).ok()?;
+    // Parse before deleting: an unreadable journal is kept for diagnosis
+    // (the supervisor writes it atomically, so this should not happen).
+    let journal: JournalFile = match serde_json::from_slice(&bytes) {
+        Ok(journal) => journal,
+        Err(e) => {
+            tracing::warn!("unreadable session journal {}: {e}", path.display());
+            return None;
+        }
+    };
+    // Whoever removes it reports it; a concurrent caller sees it gone.
+    std::fs::remove_file(&path).ok()?;
     if journal.mounts.is_empty() {
         return None;
     }

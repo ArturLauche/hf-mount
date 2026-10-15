@@ -8,8 +8,10 @@ pub fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }
 
-/// Read a NUL-terminated UTF-16 string. Returns `None` for null pointers or
-/// invalid UTF-16 (unpaired surrogates). Reads at most `max_units` code units.
+/// Read a NUL-terminated UTF-16 string of at most `max_units` code units.
+/// Returns `None` for null pointers, invalid UTF-16 (unpaired surrogates) and
+/// strings longer than `max_units`, which are rejected rather than truncated
+/// (a truncated path would name a different file).
 ///
 /// # Safety
 /// `ptr` must be null or point to a NUL-terminated UTF-16 string.
@@ -18,8 +20,12 @@ pub unsafe fn from_wide_ptr(ptr: *const u16, max_units: usize) -> Option<String>
         return None;
     }
     let mut len = 0usize;
-    // SAFETY: caller guarantees NUL termination; bounded by max_units.
-    while len < max_units && unsafe { *ptr.add(len) } != 0 {
+    // SAFETY: the caller guarantees NUL termination, and the loop stops at
+    // the NUL, so no unit past it is read (at most index `max_units`).
+    while unsafe { *ptr.add(len) } != 0 {
+        if len == max_units {
+            return None;
+        }
         len += 1;
     }
     let units = unsafe { std::slice::from_raw_parts(ptr, len) };
