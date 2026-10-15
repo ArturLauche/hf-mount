@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use xet_client::cas_client::Client;
@@ -192,13 +192,19 @@ pub struct StagingDir {
     max_bytes: u64,
 }
 
-/// Owns the on-disk staging directory and removes it when dropped.
+/// Owns the on-disk staging directory and removes it when dropped, unless
+/// it was marked to be kept.
 struct StagingRoot {
     dir: PathBuf,
+    keep: AtomicBool,
 }
 
 impl Drop for StagingRoot {
     fn drop(&mut self) {
+        if self.keep.load(Ordering::SeqCst) {
+            tracing::warn!("staging: keeping {} (it holds unsaved data)", self.dir.display());
+            return;
+        }
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
             tracing::warn!("staging: failed to remove {}: {}", self.dir.display(), e);
         }
@@ -213,7 +219,10 @@ impl StagingDir {
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
 
         Self {
-            root: Arc::new(StagingRoot { dir }),
+            root: Arc::new(StagingRoot {
+                dir,
+                keep: AtomicBool::new(false),
+            }),
             bytes_used: Arc::new(AtomicU64::new(0)),
             max_bytes,
         }
@@ -222,6 +231,12 @@ impl StagingDir {
     /// Root directory of the staging area.
     pub fn root(&self) -> &Path {
         &self.root.dir
+    }
+
+    /// Leave the directory on disk when the last clone is dropped, e.g.
+    /// because it holds the only copy of data that could not be uploaded.
+    pub fn keep(&self) {
+        self.root.keep.store(true, Ordering::SeqCst);
     }
 
     /// Get the staging path for a given inode.
@@ -344,5 +359,29 @@ impl StreamingWriterOps for StreamingWriter {
 
     fn is_empty(&self) -> bool {
         self.bytes_written == 0
+    }
+}
+
+#[cfg(test)]
+mod staging_dir_tests {
+    use super::StagingDir;
+
+    #[test]
+    fn staging_dir_is_removed_unless_kept() {
+        let cache = tempfile::tempdir().unwrap();
+        let dir = StagingDir::new(cache.path(), 0);
+        let root = dir.root().to_path_buf();
+        let clone = dir.clone();
+        drop(dir);
+        assert!(root.exists(), "removed only when the last clone drops");
+        drop(clone);
+        assert!(!root.exists());
+
+        let dir = StagingDir::new(cache.path(), 0);
+        let root = dir.root().to_path_buf();
+        std::fs::write(dir.path(1), b"unsaved").unwrap();
+        dir.keep();
+        drop(dir);
+        assert_eq!(std::fs::read(root.join("ino_1")).unwrap(), b"unsaved");
     }
 }

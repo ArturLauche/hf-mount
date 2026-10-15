@@ -12,9 +12,10 @@ import { errorTitle, sentence } from "../lib/errors";
 import { copyText, openUrl, WINFSP_URL } from "../lib/native";
 import { displayName, hubUrl } from "../lib/source";
 import { useApp } from "../lib/state";
-import type { MountInfo, Profile, UnmountReport } from "../lib/types";
-import { plural } from "../lib/format";
+import type { MountInfo, Profile } from "../lib/types";
 import { useGuard } from "../hooks/useGuard";
+import { useUnmountReport } from "../hooks/useUnmountReport";
+import { plural } from "../lib/format";
 
 const SUGGESTIONS: NewDriveInitial[] = [
   { source_type: "model", id: "openai-community/gpt2" },
@@ -70,23 +71,7 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
     }
   }, [overview, refresh, toast]);
 
-  const reportUnmount = useCallback(
-    (r: UnmountReport) => {
-      if (r.unflushed_files > 0) {
-        toast({
-          tone: "warning",
-          title: `${r.target} unmounted with ${plural(r.unflushed_files, "unsaved change")}`,
-          body: r.recovered_to
-            ? `Copies were kept in ${r.recovered_to}. Upload them again from there.`
-            : "Some changes could not be uploaded.",
-          action: r.recovered_to ? { label: "Open folder", onClick: () => guard(api.openPath("recovered"), "Could not open the folder") } : undefined,
-        });
-      } else {
-        toast({ tone: "success", title: `${r.target} unmounted` });
-      }
-    },
-    [guard, toast],
-  );
+  const reportUnmount = useUnmountReport();
 
   const doMount = useCallback(
     async (req: MountRequest, existing?: Profile): Promise<MountInfo> => {
@@ -97,7 +82,12 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
         const mount = await api.startMount(spec, existing?.use_stored_token ?? true);
         const stamp = new Date().toISOString();
         if (existing) {
-          await persistProfile({ ...existing, last_mounted_at: stamp });
+          // Only the time: the drive may have been edited while mounting.
+          try {
+            setProfiles(await api.markProfileMounted(existing.id));
+          } catch (e) {
+            toast({ tone: "error", title: "Could not save the drive", body: errorInfo(e).message });
+          }
         } else if (req.save) {
           await persistProfile({
             id: newProfileId(),
@@ -121,7 +111,7 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
         void refresh();
       }
     },
-    [guard, persistProfile, refresh, toast],
+    [guard, persistProfile, refresh, setProfiles, toast],
   );
 
   const unmount = useCallback(

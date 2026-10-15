@@ -356,8 +356,9 @@ impl Adapter {
         Ok(fh)
     }
 
-    /// Wait until `ino` (or every file when `None`) has been committed to the
-    /// Hub, a background upload fails, or the timeout expires.
+    /// Wait until `ino` (or every file and queued deletion when `None`) has
+    /// been committed to the Hub, a background upload fails, or the timeout
+    /// expires.
     fn wait_committed(&self, ino: Option<u64>) -> NTSTATUS {
         let deadline = Instant::now() + self.flush_wait;
         match ino {
@@ -375,7 +376,10 @@ impl Adapter {
                     }
                     self.vfs.is_dirty(ino)
                 }
-                None => self.vfs.pending_uploads().dirty_files > 0,
+                None => {
+                    let pending = self.vfs.pending_uploads();
+                    pending.dirty_files > 0 || pending.pending_deletes > 0
+                }
             };
             if !dirty {
                 return STATUS_SUCCESS;

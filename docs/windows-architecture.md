@@ -110,10 +110,15 @@ What this means, stated plainly (also in the README and the app):
 * `CloseHandle`/`FlushFileBuffers` return when data is in the local staging
   file, **not** when it is in the bucket. Upload happens in the background
   (debounce 2 s, max batch 30 s by default).
-* Pending (not yet uploaded) files are reported by `hf-mount status` and the
-  app. `hf-mount stop` waits for uploads (default up to 5 minutes, configurable)
-  and reports any file that could not be uploaded; it never claims success for
-  data that did not reach the Hub.
+* Pending (not yet uploaded) files and deletions are reported by `hf-mount
+  status` and the app. `hf-mount stop` waits for both (default up to 5
+  minutes, configurable) and reports any file that could not be uploaded and
+  any deletion that was not committed; it never claims success for changes
+  that did not reach the Hub. A delete batch sent to the Hub counts as pending
+  until the Hub accepts it. Unsent files are copied to
+  `%LOCALAPPDATA%\hf-mount\recovered`, and each copy is checked; if any copy
+  fails, the mount's staging folder is kept instead of deleted, with
+  `hf-mount-unsaved.txt` mapping its files to their bucket paths.
 * Renames, deletes and overwrites follow upstream semantics (server-side copy
   and delete, not atomic NTFS transactions). `ReplaceFile`/"save via temp file
   then rename over" works through `Rename(ReplaceIfExists)` but is not atomic
@@ -139,7 +144,11 @@ What this means, stated plainly (also in the README and the app):
   or the app does not unmount anything and `hf-mount start | …` returns
   immediately. It exits by itself after 10 minutes with no mounts.
   `hf-mount shutdown` (hidden, used by the installer before an update or
-  uninstall) unmounts everything and stops it.
+  uninstall) unmounts everything and stops it, and returns only once the
+  supervisor process has exited, so `hf-mount.exe` can be replaced. The
+  supervisor unmounts while its control pipe still exists: clients see the
+  drives stopping, new mounts are refused, and no second supervisor can start
+  before the teardown is finished.
 * **Foreground mode** (`hf-mount start … --foreground`) hosts the mount in the
   CLI process and exposes the same control pipe, so `status`/`stop`/the app see
   it too; Ctrl+C or closing the console unmounts cleanly.

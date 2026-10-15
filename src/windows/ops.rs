@@ -110,6 +110,14 @@ pub fn stored_credential(endpoint: &str) -> Option<Credential> {
         })
 }
 
+/// The stored token for the Hub that `spec` mounts from: its own Hub
+/// address when it has one, else the one in the settings. Never a token
+/// stored for a different Hub.
+pub fn stored_credential_for(spec: &MountSpec) -> Option<Credential> {
+    let endpoint = spec.tuning.hub_endpoint.clone().unwrap_or_else(endpoint);
+    stored_credential(&endpoint)
+}
+
 /// Mount through the supervisor, starting it from `cli_exe` if needed.
 pub async fn mount(
     identity: &Identity,
@@ -159,16 +167,19 @@ pub async fn unmount(identity: &Identity, target: &str, force: bool) -> Result<U
     }
 }
 
-/// Unmount every drive of this session. Errors are collected, not fatal.
-pub async fn unmount_all(identity: &Identity) -> (Vec<UnmountReport>, Vec<ErrorInfo>) {
+/// Unmount every drive of this session. Errors are collected per drive, not
+/// fatal. Without `force`, drives with files open for writing are left
+/// mounted and reported with [`ErrorCode::BusyWithOpenFiles`], as a single
+/// unmount would.
+pub async fn unmount_all(identity: &Identity, force: bool) -> (Vec<UnmountReport>, Vec<(String, ErrorInfo)>) {
     let mut reports = Vec::new();
     let mut errors = Vec::new();
     for host in client::list_hosts(identity).await {
         for m in host.mounts {
-            match unmount(identity, &m.spec.target, true).await {
+            match unmount(identity, &m.spec.target, force).await {
                 Ok(r) => reports.push(r),
                 Err(e) if e.code == ErrorCode::NotMounted => {}
-                Err(e) => errors.push(e),
+                Err(e) => errors.push((m.spec.target.clone(), e)),
             }
         }
     }

@@ -10,7 +10,7 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
-use crate::{AppState, navigate, quit, show_main};
+use crate::{AppState, navigate, quit, show_main, unmount_all_or_ask};
 
 const TRAY_ID: &str = "main";
 
@@ -49,17 +49,12 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             }
             "unmount-all" => {
                 let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let identity = app.state::<AppState>().identity.clone();
-                    let (_, errors) = ops::unmount_all(&identity).await;
-                    if !errors.is_empty() {
-                        // Show what failed (e.g. files open for writing).
-                        navigate(&app, "drives");
-                    }
-                });
+                // Drives with files open for writing are not forced; the
+                // window asks about them.
+                tauri::async_runtime::spawn(async move { unmount_all_or_ask(&app, false, false).await });
             }
-            "quit" => quit(app, Some(false)),
-            "quit-unmount" => quit(app, Some(true)),
+            "quit" => quit(app, Some(false), false),
+            "quit-unmount" => quit(app, Some(true), false),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

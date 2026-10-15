@@ -33,7 +33,7 @@ export function SettingsPage() {
   const set = async <K extends keyof Settings>(key: K, value: Settings[K]) => {
     if (!settings) return;
     try {
-      await updateSettings({ ...settings, [key]: value });
+      await updateSettings({ [key]: value } as Pick<Settings, K>);
     } catch (e) {
       toast({ tone: "error", title: "Setting not saved", body: errorInfo(e).message });
     }

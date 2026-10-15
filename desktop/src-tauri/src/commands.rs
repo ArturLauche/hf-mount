@@ -71,8 +71,7 @@ fn cli_exe(state: &AppState) -> CmdResult<&Path> {
 pub async fn start_mount(state: State<'_, AppState>, spec: MountSpec, use_stored_token: bool) -> CmdResult<MountInfo> {
     let cli = cli_exe(&state)?.to_path_buf();
     let credential = if use_stored_token {
-        let endpoint = spec.tuning.hub_endpoint.clone().unwrap_or_else(ops::endpoint);
-        ops::stored_credential(&endpoint)
+        ops::stored_credential_for(&spec)
     } else {
         None
     };
@@ -187,6 +186,13 @@ pub fn delete_profile(id: String) -> CmdResult<Vec<Profile>> {
     config::delete_profile(&id).map_err(|e| io_error("saved drives", e))
 }
 
+/// Set a saved drive's "last mounted" time, leaving the rest of it as stored.
+#[tauri::command]
+pub fn mark_profile_mounted(id: String) -> CmdResult<Vec<Profile>> {
+    config::mark_profile_mounted(&id, &now_rfc3339()).map_err(|e| io_error("saved drives", e))?;
+    config::load_profiles().map_err(|e| io_error("saved drives", e))
+}
+
 #[tauri::command]
 pub fn validate_spec(spec: MountSpec) -> CmdResult<MountSpec> {
     spec.validated().map_err(invalid)
@@ -296,10 +302,10 @@ pub fn app_info(app: AppHandle, state: State<'_, AppState>) -> CmdResult<AppInfo
 }
 
 #[tauri::command]
-pub fn quit_app(app: AppHandle, state: State<'_, AppState>, unmount_all: bool) -> CmdResult<()> {
+pub fn quit_app(app: AppHandle, state: State<'_, AppState>, unmount_all: bool, force: Option<bool>) -> CmdResult<()> {
     if state.quitting.load(Ordering::SeqCst) {
         return Ok(());
     }
-    crate::quit(&app, Some(unmount_all));
+    crate::quit(&app, Some(unmount_all), force.unwrap_or(false));
     Ok(())
 }

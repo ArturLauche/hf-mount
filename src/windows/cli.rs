@@ -478,16 +478,15 @@ fn start(out: &Out, args: StartArgs) -> Result<i32, ErrorInfo> {
 }
 
 fn print_report(r: &UnmountReport) {
-    if r.unflushed_files == 0 {
-        println!("Unmounted {}", r.target);
-    } else {
-        println!(
-            "Unmounted {} — {} file(s) were NOT uploaded to the Hub.",
-            r.target, r.unflushed_files
-        );
+    match r.incomplete_summary() {
+        None => println!("Unmounted {}", r.target),
+        Some(summary) => println!("Unmounted {} — {summary} to the Hub.", r.target),
     }
     if let Some(dir) = &r.recovered_to {
         println!("  Copies of the unsaved files: {}", dir.display());
+    }
+    if let Some(dir) = &r.kept_at {
+        println!("  Data of files that could not be copied: {}", dir.display());
     }
     for w in &r.warnings {
         println!("  Note: {w}");
@@ -539,13 +538,10 @@ fn stop(out: &Out, args: StopArgs) -> Result<i32, ErrorInfo> {
         });
         match response {
             Ok(Response::Unmounted { report }) => {
-                if report.unflushed_files > 0 {
+                if let Some(summary) = report.incomplete_summary() {
                     worst.get_or_insert(ErrorInfo::new(
                         ErrorCode::UploadsIncomplete,
-                        format!(
-                            "{} file(s) on {} were not uploaded",
-                            report.unflushed_files, report.target
-                        ),
+                        format!("on {}, {summary}", report.target),
                     ));
                 }
                 if !out.json {
@@ -628,7 +624,9 @@ fn status(out: &Out) -> Result<i32, ErrorInfo> {
         let source = m.resolved_source.clone().unwrap_or_else(|| m.spec.display_source());
         let uploads = match &m.stats {
             Some(s) if s.failed_uploads > 0 => format!("{} failed", s.failed_uploads),
-            Some(s) if s.pending_uploads > 0 => format!("{} pending", s.pending_uploads),
+            Some(s) if s.pending_uploads + s.pending_deletes > 0 => {
+                format!("{} pending", s.pending_uploads + s.pending_deletes)
+            }
             Some(_) if !m.spec.read_only => "synced".to_string(),
             _ => "-".to_string(),
         };
@@ -931,26 +929,47 @@ fn shutdown(out: &Out, wait_secs: u64) -> Result<i32, ErrorInfo> {
     let rt = runtime();
     let asked = rt.block_on(async {
         match Connection::open(&name, &identity).await {
-            Ok(mut conn) => conn.call(&Request::Shutdown).await.map(|_| true),
-            Err(ConnectError::NotRunning) => Ok(false),
+            Ok(mut conn) => {
+                // Opened while connected, so this is the verified server
+                // process and not a later process that reused its PID.
+                let process = super::process::ProcessHandle::open(conn.server_pid);
+                if let Err(e) = &process {
+                    tracing::warn!("cannot open the supervisor process {}: {e}", conn.server_pid);
+                }
+                conn.call(&Request::Shutdown).await.map(|_| Some(process.ok()))
+            }
+            Err(ConnectError::NotRunning) => Ok(None),
             Err(e) => Err(ErrorInfo::from(e)),
         }
     })?;
-    if asked {
+    if let Some(process) = &asked {
         if !out.json {
             eprintln!("Stopping the hf-mount supervisor (unmounting drives, finishing uploads)…");
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
-        while super::pipe::pipe_exists(&name) {
-            if std::time::Instant::now() > deadline {
-                return Err(ErrorInfo::new(
-                    ErrorCode::Timeout,
-                    "the supervisor is still finishing uploads; try again later",
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
+        let timeout = std::time::Duration::from_secs(wait_secs);
+        let deadline = std::time::Instant::now() + timeout;
+        // Done means the process has exited: it unmounts and saves unsent
+        // files before that, and installers replace hf-mount.exe afterwards.
+        let stopped = match process {
+            Some(process) => process.wait_exit(timeout),
+            None => loop {
+                if !super::pipe::pipe_exists(&name) {
+                    break true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            },
+        };
+        if !stopped {
+            return Err(ErrorInfo::new(
+                ErrorCode::Timeout,
+                "the supervisor is still finishing uploads; try again later",
+            ));
         }
     }
+    let asked = asked.is_some();
     if out.json {
         out.json(json!({"ok": true, "was_running": asked}));
     } else {

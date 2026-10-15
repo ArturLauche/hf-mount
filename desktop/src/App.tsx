@@ -1,6 +1,7 @@
 import * as RadixTooltip from "@radix-ui/react-tooltip";
 import { Activity, EyeOff, HardDrive, LogOut, Power, Settings as SettingsIcon, UserRound, type LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { BlockedUnmountDialog } from "./components/BlockedUnmountDialog";
 import { Logo } from "./components/common";
 import { Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger, ToastProvider, useToast } from "./components/ui/overlay";
 import { Badge, cn, Kbd, Tooltip } from "./components/ui/primitives";
@@ -81,6 +82,7 @@ function Shell() {
           {page === "settings" && <SettingsPage />}
         </div>
       </main>
+      <BlockedUnmountDialog />
     </div>
   );
 }

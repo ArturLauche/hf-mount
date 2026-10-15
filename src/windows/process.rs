@@ -3,10 +3,16 @@
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
-use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+use windows_sys::Win32::System::Threading::{
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, OpenProcess, PROCESS_SYNCHRONIZE,
+    WaitForSingleObject,
+};
 
 use crate::manager::config::home_dir;
 
@@ -61,5 +67,39 @@ fn stop_std_handle_inheritance() {
                 SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
             }
         }
+    }
+}
+
+/// A handle to a running process, held so its exit can be awaited: the
+/// handle keeps the process object alive, so a reused PID can never be
+/// mistaken for it.
+pub struct ProcessHandle(HANDLE);
+
+// SAFETY: a process handle is a kernel object reference, usable from any thread.
+unsafe impl Send for ProcessHandle {}
+
+impl ProcessHandle {
+    /// Open `pid` for waiting only (no other access).
+    pub fn open(pid: u32) -> std::io::Result<Self> {
+        // SAFETY: plain Win32 call; the handle is owned by the result.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(handle))
+    }
+
+    /// Wait up to `timeout` for the process to exit; `true` once it has.
+    pub fn wait_exit(&self, timeout: Duration) -> bool {
+        let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: `self.0` is a valid process handle opened with SYNCHRONIZE.
+        unsafe { WaitForSingleObject(self.0, ms) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned and closed exactly once.
+        unsafe { CloseHandle(self.0) };
     }
 }

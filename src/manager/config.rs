@@ -187,7 +187,8 @@ fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> std::io::Re
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {e}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
-        Err(e) => Err(e),
+        // Name the file, as for unparsable content above.
+        Err(e) => Err(std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
     }
 }
 
@@ -262,22 +263,43 @@ pub fn save_profiles(profiles: &[Profile]) -> std::io::Result<()> {
     )
 }
 
+/// Serialises the read-modify-write updates of the profiles file within this
+/// process (the app's commands and its startup reconnect run concurrently).
+static PROFILES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn update_profiles<T>(f: impl FnOnce(&mut Vec<Profile>) -> T) -> std::io::Result<(T, Vec<Profile>)> {
+    let _guard = PROFILES_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut profiles = load_profiles()?;
+    let result = f(&mut profiles);
+    save_profiles(&profiles)?;
+    Ok((result, profiles))
+}
+
 /// Insert or replace (by id) a profile.
 pub fn upsert_profile(profile: Profile) -> std::io::Result<Vec<Profile>> {
-    let mut profiles = load_profiles()?;
-    match profiles.iter_mut().find(|p| p.id == profile.id) {
+    update_profiles(|profiles| match profiles.iter_mut().find(|p| p.id == profile.id) {
         Some(existing) => *existing = profile,
         None => profiles.push(profile),
-    }
-    save_profiles(&profiles)?;
-    Ok(profiles)
+    })
+    .map(|(_, profiles)| profiles)
 }
 
 pub fn delete_profile(id: &str) -> std::io::Result<Vec<Profile>> {
+    update_profiles(|profiles| profiles.retain(|p| p.id != id)).map(|(_, profiles)| profiles)
+}
+
+/// Record that the saved drive `id` was mounted at `at`, changing nothing
+/// else in it. `false` when it no longer exists (deleted meanwhile), in
+/// which case nothing is written.
+pub fn mark_profile_mounted(id: &str, at: &str) -> std::io::Result<bool> {
+    let _guard = PROFILES_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut profiles = load_profiles()?;
-    profiles.retain(|p| p.id != id);
+    let Some(profile) = profiles.iter_mut().find(|p| p.id == id) else {
+        return Ok(false);
+    };
+    profile.last_mounted_at = Some(at.to_string());
     save_profiles(&profiles)?;
-    Ok(profiles)
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -370,6 +392,36 @@ mod tests {
             let raw = std::fs::read_to_string(home.join("profiles.json")).unwrap();
             assert!(!raw.contains("hf_"), "profiles must not contain tokens");
             assert!(delete_profile("p1").unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn marking_a_mount_keeps_later_edits_and_deletions() {
+        with_home(|_| {
+            let p = Profile {
+                id: "p1".into(),
+                name: "Data".into(),
+                spec: MountSpec::parse("bucket", "me/data", "X:").unwrap(),
+                auto_mount: true,
+                use_stored_token: true,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                last_mounted_at: None,
+            };
+            upsert_profile(p.clone()).unwrap();
+            // Edited while a startup mount of the old snapshot was running.
+            upsert_profile(Profile {
+                auto_mount: false,
+                ..p.clone()
+            })
+            .unwrap();
+            assert!(mark_profile_mounted("p1", "2026-02-02T00:00:00Z").unwrap());
+            let stored = &load_profiles().unwrap()[0];
+            assert!(!stored.auto_mount, "the edit survives");
+            assert_eq!(stored.last_mounted_at.as_deref(), Some("2026-02-02T00:00:00Z"));
+            // Deleted meanwhile: not recreated.
+            delete_profile("p1").unwrap();
+            assert!(!mark_profile_mounted("p1", "2026-03-03T00:00:00Z").unwrap());
+            assert!(load_profiles().unwrap().is_empty());
         });
     }
 

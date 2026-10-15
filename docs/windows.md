@@ -54,7 +54,10 @@ and vice versa, and drives keep working after the window or the app closes.
 * **Tray**: Open, New drive, Hide window, Unmount all drives, *Quit app
   (drives stay mounted)* and *Quit and unmount all drives* are separate
   entries. The tooltip lists mounted drives. The sidebar's power menu offers
-  the same choices.
+  the same choices. Unmounting all drives (also when quitting) skips drives
+  with files open for writing and asks whether to unmount them anyway, as the
+  Unmount button of a single drive does; the app does not quit until that is
+  answered.
 * Keyboard: `Ctrl+N` new drive, `Ctrl+1`–`Ctrl+4` pages, arrow keys in
   segmented controls, `Esc` closes dialogs; every control is reachable with
   `Tab` and has a visible focus ring. Animations are disabled when Windows
@@ -70,9 +73,15 @@ and vice versa, and drives keep working after the window or the app closes.
   read-only; writes fail with "The media is write protected".
 * **Buckets.** Read-write unless mounted read-only. Closing a file returns
   once its data is saved locally; it is uploaded in the background a moment
-  later. `hf-mount status` and the app show pending and failed uploads. Unmount
-  waits for uploads (5 minutes by default) and reports files that could not be
-  uploaded; copies are kept in `%LOCALAPPDATA%\hf-mount\recovered`.
+  later; deleting a file is likewise committed in the background. `hf-mount
+  status` and the app show pending and failed uploads and deletions. Unmount
+  waits for both (5 minutes by default) and reports files that could not be
+  uploaded and deletions that were not committed (those files are still in
+  the bucket). Copies of files that could not be uploaded are kept in
+  `%LOCALAPPDATA%\hf-mount\recovered`; if a copy cannot be made there (disk
+  full, folder not writable), the file's data is left in the drive's staging
+  folder in the cache, with `hf-mount-unsaved.txt` naming each file, and the
+  unmount report says where.
 * **Names.** The drive is case-sensitive and case-preserving, so `README.md`
   and `readme.md` stay two different files. On read-only drives a path typed
   in a different case still opens the file when exactly one file matches.

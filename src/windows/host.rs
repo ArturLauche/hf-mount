@@ -142,6 +142,14 @@ pub fn run_supervisor() -> i32 {
                 break;
             }
         }
+        // Tear down while the control pipe still exists: clients see the
+        // drives stopping, and a second supervisor cannot start (and fight
+        // over the drive letters) until the uploads are finished or saved.
+        watch.request_shutdown();
+        let r = watch.clone();
+        if let Some(reports) = off_runtime(move || r.unmount_all()).await {
+            log_reports(&watch, &reports);
+        }
     };
     let served = runtime.block_on(pipe::serve(
         name,
@@ -154,6 +162,9 @@ pub fn run_supervisor() -> i32 {
     if let Err(e) = &served {
         error!("control pipe failed: {e}");
     }
+    // Normally a no-op: `stop` already unmounted everything, unless the pipe
+    // failed first.
+    registry.request_shutdown();
     let reports = registry.unmount_all();
     log_reports(&registry, &reports);
     registry.record(EventLevel::Info, None, "Supervisor stopped");
@@ -163,12 +174,8 @@ pub fn run_supervisor() -> i32 {
 
 fn log_reports(registry: &Registry, reports: &[UnmountReport]) {
     for r in reports {
-        if r.unflushed_files > 0 {
-            registry.record(
-                EventLevel::Error,
-                Some(&r.target),
-                format!("{} file(s) were not uploaded at shutdown", r.unflushed_files),
-            );
+        if let Some(summary) = r.incomplete_summary() {
+            registry.record(EventLevel::Error, Some(&r.target), format!("At shutdown, {summary}"));
         }
     }
 }
@@ -264,7 +271,7 @@ pub fn run_foreground(
     report(ForegroundEvent::Stopped(&reports));
     stop.notify_waiters();
     drop(runtime);
-    if reports.iter().any(|r| r.unflushed_files > 0) {
+    if reports.iter().any(|r| !r.complete()) {
         crate::manager::protocol::ErrorCode::UploadsIncomplete.exit_code()
     } else {
         code

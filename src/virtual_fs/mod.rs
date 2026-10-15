@@ -1787,15 +1787,39 @@ impl VirtualFs {
             .collect()
     }
 
-    /// Re-enqueue every dirty inode, e.g. to retry uploads that failed while
-    /// the network was down. Returns how many were queued.
+    /// Re-enqueue every dirty inode and the queued remote deletes, e.g. to
+    /// retry uploads that failed while the network was down. Returns how many
+    /// changes were queued.
     pub fn requeue_dirty(&self) -> usize {
         let Some(fm) = &self.flush_manager else { return 0 };
         let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
         for ino in &dirty {
             fm.enqueue(*ino);
         }
-        dirty.len()
+        let deletes = fm.pending_delete_count();
+        if deletes > 0 {
+            fm.wake_deletes();
+        }
+        dirty.len() + deletes
+    }
+
+    /// Remote paths whose deletion was queued but not committed to the Hub
+    /// (e.g. after [`shutdown`](Self::shutdown) gave up on a failing Hub).
+    pub fn unfinished_deletes(&self) -> Vec<String> {
+        self.flush_manager
+            .as_ref()
+            .map(|fm| fm.pending_delete_paths())
+            .unwrap_or_default()
+    }
+
+    /// Keep the staging directory on disk when this filesystem is dropped,
+    /// because it holds data that could not be uploaded or saved elsewhere.
+    /// Returns its path.
+    pub fn keep_staging(&self) -> Option<PathBuf> {
+        self.staging.dir().map(|dir| {
+            dir.keep();
+            dir.root().to_path_buf()
+        })
     }
 
     /// Enqueues the inode for background flush rather than blocking on a

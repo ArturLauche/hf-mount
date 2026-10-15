@@ -92,8 +92,19 @@ export interface MountInfo {
 export interface UnmountReport {
   target: string;
   unflushed_files: number;
+  /** Deletions not committed: those files are still on the Hub. */
+  unfinished_deletes?: number;
   recovered_to?: string | null;
+  /** Where data that could not be copied to `recovered_to` was left. */
+  kept_at?: string | null;
   warnings?: string[];
+}
+
+/** Drives a bulk unmount left mounted because files are open for writing. */
+export interface BlockedUnmount {
+  drives: { target: string; message: string }[];
+  /** The app was quitting; it quits once these are unmounted. */
+  quit: boolean;
 }
 
 export type EventLevel = "info" | "warning" | "error";

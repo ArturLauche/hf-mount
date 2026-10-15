@@ -266,11 +266,39 @@ pub struct UnmountReport {
     pub target: String,
     /// Files whose final upload did not complete before the deadline.
     pub unflushed_files: usize,
+    /// Deletions of remote files that were not committed: those files are
+    /// still on the Hub.
+    #[serde(default)]
+    pub unfinished_deletes: usize,
     /// Where copies of those files were saved, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovered_to: Option<PathBuf>,
+    /// Where the original data of unsaved files was left because copying it
+    /// to `recovered_to` failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_at: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+impl UnmountReport {
+    /// Every change made on the drive reached the Hub.
+    pub fn complete(&self) -> bool {
+        self.unflushed_files == 0 && self.unfinished_deletes == 0
+    }
+
+    /// What did not reach the Hub ("2 file(s) were not uploaded and ..."),
+    /// for errors and logs.
+    pub fn incomplete_summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.unflushed_files > 0 {
+            parts.push(format!("{} file(s) were not uploaded", self.unflushed_files));
+        }
+        if self.unfinished_deletes > 0 {
+            parts.push(format!("{} deletion(s) were not committed", self.unfinished_deletes));
+        }
+        (!parts.is_empty()).then(|| parts.join(" and "))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -403,5 +431,30 @@ mod tests {
         assert!(ErrorCode::Internal.exit_code() != 0);
         let json = serde_json::to_string(&ErrorCode::BusyWithOpenFiles).unwrap();
         assert_eq!(json, format!("\"{}\"", ErrorCode::BusyWithOpenFiles.as_str()));
+    }
+
+    #[test]
+    fn unmount_reports_count_unfinished_deletes_as_incomplete() {
+        let older: UnmountReport = serde_json::from_str(r#"{"target":"X:","unflushed_files":0}"#).unwrap();
+        assert!(older.complete());
+        assert_eq!(older.incomplete_summary(), None);
+        let deletes = UnmountReport {
+            target: "X:".into(),
+            unfinished_deletes: 2,
+            ..Default::default()
+        };
+        assert!(!deletes.complete());
+        assert_eq!(
+            deletes.incomplete_summary().as_deref(),
+            Some("2 deletion(s) were not committed")
+        );
+        let both = UnmountReport {
+            unflushed_files: 1,
+            ..deletes
+        };
+        assert_eq!(
+            both.incomplete_summary().as_deref(),
+            Some("1 file(s) were not uploaded and 2 deletion(s) were not committed")
+        );
     }
 }

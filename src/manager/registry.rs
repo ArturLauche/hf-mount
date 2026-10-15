@@ -241,6 +241,14 @@ impl Registry {
         let id = uuid::Uuid::new_v4().to_string();
         {
             let mut entries = lock(&self.entries);
+            // Checked under the entries lock, which `unmount_all` takes to
+            // list what to stop, so no mount slips in behind the teardown.
+            if self.shutdown_requested() {
+                return Err(
+                    ErrorInfo::new(ErrorCode::HostUnavailable, "this hf-mount host is shutting down")
+                        .with_hint("try again in a moment"),
+                );
+            }
             if let Some(existing) = entries
                 .iter()
                 .find(|e| e.info.spec.target == target && e.info.state != MountState::Failed)
@@ -399,14 +407,30 @@ impl Registry {
                 format!(
                     "{} file(s) were not uploaded before unmount{}",
                     report.unflushed_files,
-                    report
-                        .recovered_to
-                        .as_ref()
-                        .map(|p| format!("; copies saved to {}", p.display()))
-                        .unwrap_or_default()
+                    match (&report.recovered_to, &report.kept_at) {
+                        (Some(dir), Some(kept)) => format!(
+                            "; copies saved to {}, the others' data kept in {}",
+                            dir.display(),
+                            kept.display()
+                        ),
+                        (None, Some(kept)) => format!("; their data was kept in {}", kept.display()),
+                        (Some(dir), None) => format!("; copies saved to {}", dir.display()),
+                        (None, None) => String::new(),
+                    }
                 ),
             );
-        } else {
+        }
+        if report.unfinished_deletes > 0 {
+            self.record(
+                EventLevel::Error,
+                Some(&target),
+                format!(
+                    "{} deletion(s) were not committed before unmount; those files are still on the Hub",
+                    report.unfinished_deletes
+                ),
+            );
+        }
+        if report.complete() {
             self.record(EventLevel::Info, Some(&target), "Unmounted");
         }
         for w in &report.warnings {
@@ -590,7 +614,7 @@ mod tests {
                 target: self.target.clone(),
                 unflushed_files: self.unflushed,
                 recovered_to: (self.unflushed > 0).then(|| PathBuf::from("/recovered")),
-                warnings: Vec::new(),
+                ..Default::default()
             }
         }
     }
@@ -790,6 +814,18 @@ mod tests {
         }
         assert!(matches!(r.handle(Request::Shutdown), Response::Ok));
         assert!(r.shutdown_requested());
+    }
+
+    #[test]
+    fn no_new_mounts_once_shutting_down() {
+        let (r, state) = registry();
+        assert!(matches!(r.handle(Request::Shutdown), Response::Ok));
+        match r.handle(mount_req("acme/late", "L:")) {
+            Response::Error { error } => assert_eq!(error.code, ErrorCode::HostUnavailable),
+            other => panic!("{other:?}"),
+        }
+        assert!(lock(&state.taken).is_empty(), "nothing was mounted");
+        assert!(mounts(&r).is_empty());
     }
 
     #[test]

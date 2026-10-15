@@ -5860,6 +5860,92 @@ fn flush_pending_deletes_requeue_on_failure() {
     });
 }
 
+/// Poll `cond` every 20 ms for up to 5 s.
+async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..250 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
+}
+
+/// A delete batch sent to the Hub still counts as pending until the Hub
+/// answers, so a volume flush or an unmount does not see "nothing left".
+#[test]
+fn in_flight_deletes_count_as_pending() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        fm.enqueue_delete("gone.txt".to_string());
+        // The batch has left the queue and is parked at the Hub call.
+        assert!(eventually(|| fm.pending_delete_paths().is_empty()).await);
+        assert_eq!(vfs.pending_uploads().pending_deletes, 1, "in flight is still pending");
+        barrier.wait().await;
+        assert!(eventually(|| vfs.pending_uploads().pending_deletes == 0).await);
+        let logs = hub.take_batch_log();
+        assert!(
+            logs.iter()
+                .flatten()
+                .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "gone.txt"))
+        );
+    });
+}
+
+/// A delete the Hub rejected stays pending, and retrying uploads retries it
+/// without needing another change to wake the flush loop.
+#[test]
+fn rejected_deletes_stay_pending_and_are_retried() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        hub.fail_next_batch(1);
+        fm.enqueue_delete("gone.txt".to_string());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(hub.take_batch_log().is_empty(), "first attempt failed");
+        assert_eq!(vfs.pending_uploads().pending_deletes, 1);
+        assert_eq!(vfs.unfinished_deletes(), vec!["gone.txt".to_string()]);
+
+        assert_eq!(vfs.requeue_dirty(), 1);
+        assert!(eventually(|| vfs.pending_uploads().pending_deletes == 0).await);
+        assert!(
+            hub.take_batch_log()
+                .iter()
+                .flatten()
+                .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "gone.txt"))
+        );
+    });
+}
+
+/// Deletes still rejected at shutdown are left in the queue for the host to
+/// report, not dropped.
+#[test]
+fn shutdown_leaves_rejected_deletes_reportable() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+    hub.fail_next_batch(1000);
+    rt.block_on(async {
+        vfs.flush_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_delete("gone.txt".to_string());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    });
+    vfs.shutdown();
+    assert_eq!(vfs.unfinished_deletes(), vec!["gone.txt".to_string()]);
+    assert_eq!(vfs.pending_uploads().pending_deletes, 1);
+}
+
 // ── Symlinks ────────────────────────────────────────────────────────
 
 #[test]

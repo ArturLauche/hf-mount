@@ -136,10 +136,12 @@ Manager), then the `huggingface_hub` token file. Public repositories need no
 token.
 
 **Writes (buckets).** Closing a file returns once its data is saved locally;
-the upload to the bucket happens in the background shortly after. `status`
-and the app show pending uploads, and `stop` waits for them (5 minutes by
-default) and reports any file that could not be uploaded, keeping a copy in
-`%LOCALAPPDATA%\hf-mount\recovered`. Repositories are always read-only.
+the upload to the bucket happens in the background shortly after, as do
+deletions. `status` and the app show pending uploads and deletions, and `stop`
+waits for them (5 minutes by default) and reports any file that could not be
+uploaded, keeping a copy in `%LOCALAPPDATA%\hf-mount\recovered`, and any
+deletion that was not committed (exit code 10 in both cases). Repositories are
+always read-only.
 
 See [docs/windows.md](docs/windows.md) for the desktop app, behaviour details,
 known limitations and what has been verified, and

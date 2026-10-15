@@ -260,6 +260,9 @@ export const previewBackend = {
       case "delete_profile":
         profiles = profiles.filter((x) => x.id !== args.id);
         return profiles;
+      case "mark_profile_mounted":
+        profiles = profiles.map((x) => (x.id === args.id ? { ...x, last_mounted_at: new Date().toISOString() } : x));
+        return profiles;
       case "validate_spec":
         return args.spec;
       case "app_info":

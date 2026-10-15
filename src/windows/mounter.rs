@@ -270,33 +270,78 @@ impl MountHandle for WinMountHandle {
         if let Some(mount) = &self.mount {
             mount.unmount();
         }
-        // 2. Drain uploads (bounded by the configured upload wait).
+        // 2. Drain uploads and deletions (bounded by the configured upload wait).
         if let Some(setup) = &self.setup {
             let vfs = setup.virtual_fs.clone();
             vfs.shutdown();
+            let deletes = vfs.unfinished_deletes();
+            report.unfinished_deletes = vfs.pending_uploads().pending_deletes;
+            if report.unfinished_deletes > 0 {
+                error!("{} remote deletion(s) were not committed", report.unfinished_deletes);
+                report.warnings.push(format!(
+                    "{} deletion(s) could not be committed to the Hub before unmount, so {} still in the bucket{}",
+                    report.unfinished_deletes,
+                    if report.unfinished_deletes == 1 {
+                        "that file is"
+                    } else {
+                        "those files are"
+                    },
+                    preview_list(&deletes)
+                ));
+            }
             let remaining = vfs.dirty_files();
             if !remaining.is_empty() {
                 report.unflushed_files = remaining.len();
-                match preserve(&self.target, &remaining) {
-                    Ok(dir) => {
-                        report.warnings.push(format!(
-                            "{} file(s) could not be uploaded before unmount; copies were saved to {}",
-                            remaining.len(),
-                            dir.display()
-                        ));
-                        report.recovered_to = Some(dir);
-                    }
-                    Err(e) => {
-                        error!("could not preserve unflushed files: {e}");
-                        report.warnings.push(format!(
-                            "{} file(s) could not be uploaded and could not be saved locally: {e}",
-                            remaining.len()
-                        ));
+                let saved = preserve(&recovered_dir(), &self.target, &remaining);
+                if saved.copied > 0 {
+                    report.recovered_to = Some(saved.dir.clone());
+                }
+                if saved.failed.is_empty() {
+                    report.warnings.push(format!(
+                        "{} file(s) could not be uploaded before unmount; copies were saved to {}",
+                        remaining.len(),
+                        saved.dir.display()
+                    ));
+                } else {
+                    // The staging area now holds the only copy of these
+                    // files: keep it instead of letting the engine delete it.
+                    let (path, error) = &saved.failed[0];
+                    error!(
+                        "could not save {} of {} unsent file(s) to {}: {path}: {error}",
+                        saved.failed.len(),
+                        remaining.len(),
+                        saved.dir.display()
+                    );
+                    match vfs.keep_staging() {
+                        Some(kept) => {
+                            let listing = match write_manifest(&kept, &remaining) {
+                                Ok(manifest) => format!("; {} says which file is which", manifest.display()),
+                                Err(e) => {
+                                    warn!("could not write the list of kept files: {e}");
+                                    let paths: Vec<String> = saved.failed.iter().map(|(p, _)| p.clone()).collect();
+                                    preview_list(&paths)
+                                }
+                            };
+                            report.warnings.push(format!(
+                                "{} of {} file(s) that could not be uploaded could not be saved to {} either \
+                                 ({error}); their data was left in {}{listing}",
+                                saved.failed.len(),
+                                remaining.len(),
+                                saved.dir.display(),
+                                kept.display(),
+                            ));
+                            report.kept_at = Some(kept);
+                        }
+                        None => report.warnings.push(format!(
+                            "{} file(s) could not be uploaded and could not be saved locally ({error})",
+                            saved.failed.len()
+                        )),
                     }
                 }
             }
         }
-        // 3. Free the volume, then the engine (which deletes its staging dir).
+        // 3. Free the volume, then the engine (which deletes its staging dir
+        //    unless it was kept above).
         drop(self.mount.take());
         drop(self.setup.take());
         report
@@ -314,11 +359,35 @@ impl Drop for WinMountHandle {
     }
 }
 
-/// Copy staging files of uncommitted writes to the recovery folder,
-/// preserving their remote paths (made Windows-safe).
-fn preserve(target: &str, files: &[(String, PathBuf)]) -> std::io::Result<PathBuf> {
+/// ": a, b, c and 4 more", for messages naming remote paths.
+fn preview_list(paths: &[String]) -> String {
+    const SHOWN: usize = 5;
+    if paths.is_empty() {
+        return String::new();
+    }
+    let mut s = format!(": {}", paths.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", "));
+    if paths.len() > SHOWN {
+        s.push_str(&format!(" and {} more", paths.len() - SHOWN));
+    }
+    s
+}
+
+/// Outcome of copying unsent files to the recovery folder.
+struct Preserved {
+    dir: PathBuf,
+    copied: usize,
+    /// Remote path and error of each file that has no verified copy.
+    failed: Vec<(String, std::io::Error)>,
+}
+
+/// Copy staging files of uncommitted writes to a new folder under `base`,
+/// preserving their remote paths (made Windows-safe). Every file is tried,
+/// and a copy only counts when it has the source's full length.
+fn preserve(base: &Path, target: &str, files: &[(String, PathBuf)]) -> Preserved {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let dir = recovered_dir().join(format!("{stamp}-{}", target.trim_end_matches(':')));
+    let dir = base.join(format!("{stamp}-{}", target.trim_end_matches(':')));
+    let mut copied = 0;
+    let mut failed = Vec::new();
     for (remote, staging) in files {
         let mut dest = dir.clone();
         for component in remote.split('/').filter(|c| !c.is_empty()) {
@@ -327,14 +396,51 @@ fn preserve(target: &str, files: &[(String, PathBuf)]) -> std::io::Result<PathBu
         if dest == dir {
             dest.push("unnamed");
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+        let result = (|| {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Different remote names can map to the same Windows name (made
+            // safe, or differing only in case); never let one copy replace
+            // another.
+            let expected = std::fs::metadata(staging)?.len();
+            let dest = free_path(dest);
+            std::fs::copy(staging, &dest)?;
+            // On disk before the staging copy may be deleted. The size is
+            // checked on the result, not taken from `copy`'s return value.
+            let copy = std::fs::OpenOptions::new().write(true).open(&dest)?;
+            copy.sync_all()?;
+            let written = copy.metadata()?.len();
+            if written != expected {
+                return Err(std::io::Error::other(format!(
+                    "copied {written} of {expected} bytes to {}",
+                    dest.display()
+                )));
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => copied += 1,
+            Err(e) => failed.push((remote.clone(), e)),
         }
-        // Different remote names can map to the same Windows name (made safe,
-        // or differing only in case); never let one copy replace another.
-        std::fs::copy(staging, free_path(dest))?;
     }
-    Ok(dir)
+    Preserved { dir, copied, failed }
+}
+
+/// Write `hf-mount-unsaved.txt` into a kept staging folder: which staging
+/// file holds which remote file.
+fn write_manifest(staging_root: &Path, files: &[(String, PathBuf)]) -> std::io::Result<PathBuf> {
+    let path = staging_root.join("hf-mount-unsaved.txt");
+    let mut text = String::from(
+        "These files were changed on an hf-mount drive but could not be uploaded or saved.\r\n\
+         Each line: staging file<TAB>path in the bucket.\r\n\r\n",
+    );
+    for (remote, staging) in files {
+        let name = staging.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        text.push_str(&format!("{name}\t{remote}\r\n"));
+    }
+    std::fs::write(&path, text)?;
+    Ok(path)
 }
 
 /// `path` if nothing exists there, else `name (2).ext`, `name (3).ext`, ...
@@ -397,6 +503,52 @@ mod tests {
         assert!(o.hf_token.is_none());
         assert_eq!(o.hub_endpoint, "https://huggingface.co");
         assert_eq!(o.cache_size, 10_000_000_000);
+    }
+
+    #[test]
+    fn preserve_copies_every_file_it_can_and_reports_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("ino_1"), b"first").unwrap();
+        std::fs::write(staging.join("ino_3"), b"third").unwrap();
+        let files = vec![
+            ("dir/a.txt".to_string(), staging.join("ino_1")),
+            ("dir/missing.txt".to_string(), staging.join("ino_2")),
+            ("b:c.txt".to_string(), staging.join("ino_3")),
+        ];
+        let saved = preserve(&tmp.path().join("recovered"), "X:", &files);
+        assert_eq!(saved.copied, 2, "{:?}", saved.failed);
+        assert_eq!(saved.failed.len(), 1, "a failure does not stop later copies");
+        assert_eq!(saved.failed[0].0, "dir/missing.txt");
+        assert_eq!(std::fs::read(saved.dir.join("dir").join("a.txt")).unwrap(), b"first");
+        assert_eq!(std::fs::read(saved.dir.join("b_c.txt")).unwrap(), b"third");
+    }
+
+    #[test]
+    fn preserve_into_an_unusable_folder_fails_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ino_1"), b"data").unwrap();
+        // The recovery folder's parent is a file, so no folder can be made.
+        let blocker = tmp.path().join("recovered");
+        std::fs::write(&blocker, b"not a folder").unwrap();
+        let files = vec![
+            ("a.txt".to_string(), tmp.path().join("ino_1")),
+            ("b.txt".to_string(), tmp.path().join("ino_1")),
+        ];
+        let saved = preserve(&blocker, "Y:", &files);
+        assert_eq!(saved.copied, 0);
+        assert_eq!(saved.failed.len(), 2);
+        let manifest = write_manifest(tmp.path(), &files).unwrap();
+        let text = std::fs::read_to_string(manifest).unwrap();
+        assert!(text.contains("ino_1\ta.txt") && text.contains("ino_1\tb.txt"), "{text}");
+    }
+
+    #[test]
+    fn preview_lists_are_short() {
+        assert_eq!(preview_list(&[]), "");
+        let paths: Vec<String> = (1..=7).map(|i| format!("f{i}")).collect();
+        assert_eq!(preview_list(&paths), ": f1, f2, f3, f4, f5 and 2 more");
     }
 
     #[test]

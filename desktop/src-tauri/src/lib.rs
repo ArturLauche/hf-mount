@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hf_mount::manager::config;
+use hf_mount::manager::protocol::ErrorCode;
 use hf_mount::windows::client::LostSession;
 use hf_mount::windows::ops;
 use hf_mount::windows::pipe::Identity;
@@ -66,9 +67,59 @@ pub(crate) fn navigate(app: &AppHandle, page: &str) {
     let _ = app.emit("navigate", page);
 }
 
+/// Drives that a bulk unmount left mounted because files are open for
+/// writing; the window asks whether to unmount them anyway.
+#[derive(Clone, serde::Serialize)]
+struct BlockedUnmount {
+    drives: Vec<BlockedDrive>,
+    /// The app was quitting and quits once these are unmounted.
+    quit: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct BlockedDrive {
+    target: String,
+    message: String,
+}
+
+/// Unmount every drive without cutting off applications that are writing:
+/// drives with files open for writing stay mounted, and the window asks
+/// whether to force them (as the drives screen does for a single drive).
+/// Returns `false` when drives were left mounted for that question (other
+/// errors are logged).
+pub(crate) async fn unmount_all_or_ask(app: &AppHandle, force: bool, quitting: bool) -> bool {
+    let identity = app.state::<AppState>().identity.clone();
+    let (_, errors) = ops::unmount_all(&identity, force).await;
+    let mut drives = Vec::new();
+    let mut failed = false;
+    for (target, e) in errors {
+        if e.code == ErrorCode::BusyWithOpenFiles {
+            drives.push(BlockedDrive {
+                target,
+                message: e.message,
+            });
+        } else {
+            tracing::warn!("unmounting {target}: {e}");
+            failed = true;
+        }
+    }
+    if drives.is_empty() {
+        if failed && !quitting {
+            // The drives screen shows what could not be unmounted.
+            navigate(app, "drives");
+        }
+        return true;
+    }
+    navigate(app, "drives");
+    let _ = app.emit("unmount-blocked", BlockedUnmount { drives, quit: quitting });
+    false
+}
+
 /// Quit the app. Drives keep running in the supervisor unless `unmount`
 /// (or the "unmount on quit" setting when `None`) asks to stop them first.
-pub(crate) fn quit(app: &AppHandle, unmount: Option<bool>) {
+/// Drives with files open for writing are only unmounted with `force`;
+/// otherwise the app stays open and asks.
+pub(crate) fn quit(app: &AppHandle, unmount: Option<bool>, force: bool) {
     let state = app.state::<AppState>();
     if state.quitting.swap(true, Ordering::SeqCst) {
         return;
@@ -81,10 +132,10 @@ pub(crate) fn quit(app: &AppHandle, unmount: Option<bool>) {
                 let _ = w.hide();
             }
             tray::set_status(&app, "hf-mount — unmounting drives…");
-            let identity = app.state::<AppState>().identity.clone();
-            let (_, errors) = ops::unmount_all(&identity).await;
-            for e in errors {
-                tracing::warn!("unmount on quit: {e}");
+            if !unmount_all_or_ask(&app, force, true).await {
+                tray::set_status(&app, "hf-mount — some drives are still in use");
+                app.state::<AppState>().quitting.store(false, Ordering::SeqCst);
+                return;
             }
         }
         app.exit(0);
@@ -108,21 +159,26 @@ async fn reconnect_saved_drives(app: AppHandle) {
     if !overview.driver.installed {
         return;
     }
-    let endpoint = ops::endpoint();
     for profile in profiles.into_iter().filter(|p| p.auto_mount) {
         if overview.mounts.iter().any(|m| m.spec.target == profile.spec.target) {
             continue;
         }
+        // The same token choice as mounting by hand: the drive's own Hub.
         let credential = profile
             .use_stored_token
-            .then(|| ops::stored_credential(&endpoint))
+            .then(|| ops::stored_credential_for(&profile.spec))
             .flatten();
         match ops::mount(&state.identity, &cli, profile.spec.clone(), credential).await {
-            Ok(_) => {
-                let mut p = profile;
-                p.last_mounted_at = Some(commands::now_rfc3339());
-                let _ = config::upsert_profile(p);
-            }
+            // The mount can take minutes; the drive may have been edited or
+            // deleted meanwhile, so only its "last mounted" time is updated.
+            Ok(_) => match config::mark_profile_mounted(&profile.id, &commands::now_rfc3339()) {
+                Ok(true) => {}
+                Ok(false) => tracing::info!(
+                    "{} was removed from the saved drives while mounting",
+                    profile.spec.target
+                ),
+                Err(e) => tracing::warn!("saving the mount time of {}: {e}", profile.spec.target),
+            },
             // The supervisor keeps failed mounts in its list, so the drives
             // screen shows the error with a "Try again" button.
             Err(e) => tracing::warn!("reconnecting {}: {e}", profile.spec.target),
@@ -170,6 +226,7 @@ pub fn run() {
             commands::get_profiles,
             commands::save_profile,
             commands::delete_profile,
+            commands::mark_profile_mounted,
             commands::validate_spec,
             commands::open_drive,
             commands::open_path,
@@ -192,7 +249,7 @@ pub fn run() {
                 if config::load_settings().unwrap_or_default().close_to_tray {
                     let _ = window.hide();
                 } else {
-                    quit(window.app_handle(), None);
+                    quit(window.app_handle(), None, false);
                 }
             }
         })

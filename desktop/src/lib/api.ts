@@ -65,12 +65,13 @@ export const api = {
   profiles: () => call<Profile[]>("get_profiles"),
   saveProfile: (profile: Profile) => call<Profile[]>("save_profile", { profile }),
   deleteProfile: (id: string) => call<Profile[]>("delete_profile", { id }),
+  markProfileMounted: (id: string) => call<Profile[]>("mark_profile_mounted", { id }),
   validateSpec: (spec: MountSpec) => call<MountSpec>("validate_spec", { spec }),
   openDrive: (target: string) => call<void>("open_drive", { target }),
   openPath: (kind: PathKind) => call<void>("open_path", { kind }),
   installDriver: () => call<void>("install_driver"),
   appInfo: () => call<AppInfo>("app_info"),
-  quit: (unmountAll: boolean) => call<void>("quit_app", { unmountAll }),
+  quit: (unmountAll: boolean, force = false) => call<void>("quit_app", { unmountAll, force }),
 };
 
 export function errorInfo(e: unknown): ErrorInfo {

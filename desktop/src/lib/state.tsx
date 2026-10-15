@@ -13,7 +13,8 @@ interface AppState {
   refresh: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
   setProfiles: (p: Profile[]) => void;
-  updateSettings: (s: Settings) => Promise<void>;
+  /** Save a change to some settings; changes are saved one after another. */
+  updateSettings: (change: Partial<Settings>) => Promise<void>;
   refreshAccount: (validate: boolean) => Promise<void>;
   setAccount: (a: AccountStatus) => void;
 }
@@ -44,6 +45,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const inFlight = useRef<Promise<void> | null>(null);
   const again = useRef(false);
+  const savedSettings = useRef<Settings | null>(null);
+  const settingsQueue = useRef<Promise<unknown>>(Promise.resolve());
 
   // One request at a time. A refresh asked for while one is running (a poll
   // tick racing a button) is not dropped: it runs once more afterwards, and
@@ -85,16 +88,29 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const updateSettings = useCallback(async (s: Settings) => {
-    const saved = await api.saveSettings(s);
-    setSettings(saved);
-    applyTheme(saved.theme);
+  // Saves run one at a time, each applying only its own change to the
+  // settings as last saved. Two controls changed before the first save
+  // answers therefore both stick: the second save never carries the first
+  // control's old value. A failed save changes nothing.
+  const updateSettings = useCallback((change: Partial<Settings>): Promise<void> => {
+    const save = async () => {
+      const base = savedSettings.current;
+      if (!base) throw new Error("the settings have not loaded yet");
+      const saved = await api.saveSettings({ ...base, ...change });
+      savedSettings.current = saved;
+      setSettings(saved);
+      applyTheme(saved.theme);
+    };
+    const result = settingsQueue.current.then(save, save);
+    settingsQueue.current = result.catch(() => undefined);
+    return result;
   }, []);
 
   useEffect(() => {
     void (async () => {
       try {
         const s = await api.settings();
+        savedSettings.current = s;
         setSettings(s);
         applyTheme(s.theme);
       } catch {

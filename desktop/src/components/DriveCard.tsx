@@ -39,7 +39,7 @@ export interface DriveActions {
 function Status({ row, busy, letterBusy }: { row: DriveRow; busy: Busy; letterBusy: boolean }) {
   const m = row.mount;
   if (busy === "unmounting" || m?.state === "stopping") {
-    const uploads = m?.stats?.pending_uploads ?? 0;
+    const uploads = (m?.stats?.pending_uploads ?? 0) + (m?.stats?.pending_deletes ?? 0);
     return (
       <Badge dot pulse>
         {uploads > 0 ? "Finishing uploads…" : "Unmounting…"}
@@ -84,6 +84,16 @@ function Meta({ row }: { row: DriveRow }) {
           <span className="inline-flex items-center gap-1 text-fg-2">
             <UploadCloud className="size-3.5" aria-hidden />
             {plural(s.pending_uploads, "upload")} pending
+          </span>
+        ),
+      });
+    if (s.pending_deletes > 0)
+      items.push({
+        key: "deletes",
+        node: (
+          <span className="inline-flex items-center gap-1 text-fg-2">
+            <UploadCloud className="size-3.5" aria-hidden />
+            {plural(s.pending_deletes, "deletion")} pending
           </span>
         ),
       });
