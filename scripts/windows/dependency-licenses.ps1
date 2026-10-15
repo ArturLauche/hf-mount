@@ -41,13 +41,14 @@ Set-Content -LiteralPath (Join-Path $OutDir 'rust-dependencies.txt') -Encoding u
 Write-Host "rust-dependencies.txt: $($lines.Count) crates"
 
 if ($NpmLock) {
-    $lock = Get-Content -LiteralPath $NpmLock -Raw | ConvertFrom-Json
-    $npm = $lock.packages.PSObject.Properties | Where-Object {
-        $_.Name -like 'node_modules/*' -and -not $_.Value.dev
+    # -AsHashtable: the lockfile's root package has an empty key ("").
+    $lock = Get-Content -LiteralPath $NpmLock -Raw | ConvertFrom-Json -AsHashtable
+    $npm = $lock['packages'].GetEnumerator() | Where-Object {
+        $_.Key -like 'node_modules/*' -and -not $_.Value['dev']
     } | ForEach-Object {
-        $name = $_.Name.Substring($_.Name.LastIndexOf('node_modules/') + 'node_modules/'.Length)
-        $license = if ($_.Value.license) { $_.Value.license } else { 'unspecified' }
-        '{0} {1}  {2}' -f $name, $_.Value.version, $license
+        $name = $_.Key.Substring($_.Key.LastIndexOf('node_modules/') + 'node_modules/'.Length)
+        $license = if ($_.Value['license']) { $_.Value['license'] } else { 'unspecified' }
+        '{0} {1}  {2}' -f $name, $_.Value['version'], $license
     } | Sort-Object -Unique
     $title = "npm packages bundled into the desktop app's web UI (name, version, license)."
     Set-Content -LiteralPath (Join-Path $OutDir 'npm-dependencies.txt') -Encoding utf8 -Value (@($title, '') + $npm)
