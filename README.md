@@ -77,6 +77,80 @@ cargo build --release --features fuse,nfs
 
 Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
 
+## Windows
+
+hf-mount runs natively on Windows 10 and 11 (x64): repositories and buckets
+appear as real **drive letters** that File Explorer, PowerShell and any
+Windows program can use, with files fetched on demand. It uses
+[WinFsp](https://github.com/winfsp/winfsp) for the drive (no WSL, NFS client,
+SMB or WebDAV).
+
+![hf-mount desktop app (UI preview with sample data)](docs/images/windows-drives-light.png)
+
+### Install
+
+1. **Desktop app** (recommended): download `hf-mount-Desktop_<version>_x64-setup.exe`
+   from the [releases](https://github.com/huggingface/hf-mount/releases)
+   (tags `windows-v*`). It installs for the current user without
+   administrator rights, includes the command line, and offers to install
+   WinFsp if it is missing (Windows then asks for administrator approval once).
+   A per-machine `.msi` is also available.
+2. **Command line only**: download `hf-mount-<version>-windows-x64.zip`, unzip it
+   anywhere and install WinFsp once with the included `install-winfsp.ps1`
+   (or `winget install WinFsp.WinFsp`).
+
+The binaries are not code-signed, so SmartScreen may ask for confirmation;
+compare downloads with `SHA256SUMS.txt` from the release.
+
+### Use
+
+```powershell
+hf-mount start repo openai-community/gpt2 H:           # public model, no token
+hf-mount start repo datasets/HuggingFaceFW/fineweb-edu D: --subfolder sample/10BT
+hf-mount auth login                                     # store a token (Credential Manager)
+hf-mount start bucket myuser/my-bucket X:               # read-write bucket
+hf-mount status                                         # every drive of this session
+hf-mount stop X:                                        # waits for pending uploads
+hf-mount doctor                                         # WinFsp, supervisor, connectivity
+```
+
+Drives are hosted by a small background process (one per Windows user and
+sign-in session) that the CLI and the desktop app start on demand and share:
+closing the terminal or the app keeps drives mounted, and both always show the
+same drives. `--foreground` keeps a mount in the current console instead.
+Add `--json` to any command for machine-readable output. Exit codes:
+
+| Code | Meaning | Code | Meaning |
+| --- | --- | --- | --- |
+| 0 | success | 6 | drive letter in use / already mounted |
+| 1 | internal error | 7 | network, rate limit or timeout |
+| 2 | invalid arguments | 8 | background supervisor unavailable |
+| 3 | WinFsp missing or unusable | 9 | not mounted |
+| 4 | authentication or permission | 10 | files open for writing, or uploads not finished |
+| 5 | repository or bucket not found | | |
+
+Tokens are looked up in this order: `--token-file`, `--hf-token` (discouraged on
+Windows: command lines are visible to other programs), `HF_TOKEN`, the token
+saved with `hf-mount auth login` or the desktop app (Windows Credential
+Manager), then the `huggingface_hub` token file. Public repositories need no
+token.
+
+**Writes (buckets).** Closing a file returns once its data is saved locally;
+the upload to the bucket happens in the background shortly after, as do
+deletions. `status` and the app show pending uploads and deletions, and `stop`
+waits for them (5 minutes by default) and reports any file that could not be
+uploaded, keeping a copy in `%LOCALAPPDATA%\hf-mount\recovered`, and any
+deletion that was not committed (exit code 10 in both cases). Repositories are
+always read-only.
+
+See [docs/windows.md](docs/windows.md) for the desktop app, behaviour details,
+known limitations and what has been verified, and
+[docs/windows-architecture.md](docs/windows-architecture.md) for the design.
+
+WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos —
+<https://github.com/winfsp/winfsp>. hf-mount uses WinFsp under its FLOSS
+exception; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Best for / Not for
 
 **Best for:**

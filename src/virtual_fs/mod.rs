@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -1741,6 +1740,88 @@ impl VirtualFs {
         }
     }
 
+    /// Local changes not yet committed to the Hub, for status reporting.
+    /// Only advanced-writes mounts defer uploads; other modes report zero.
+    pub fn pending_uploads(&self) -> PendingUploads {
+        let Some(fm) = &self.flush_manager else {
+            return PendingUploads::default();
+        };
+        PendingUploads {
+            dirty_files: self.inode_table.read().expect("inodes poisoned").dirty_inos().len(),
+            pending_deletes: fm.pending_delete_count(),
+            failed_files: fm.error_count(),
+        }
+    }
+
+    /// Whether `ino` has local writes that have not been committed yet.
+    pub fn is_dirty(&self, ino: u64) -> bool {
+        self.inode_table
+            .read()
+            .expect("inodes poisoned")
+            .get(ino)
+            .is_some_and(|e| e.is_dirty())
+    }
+
+    /// Take (and clear) the error of the last failed background flush of `ino`.
+    pub fn take_flush_error(&self, ino: u64) -> Option<String> {
+        self.flush_manager.as_ref().and_then(|fm| fm.check_error(ino))
+    }
+
+    /// Remote path and local staging file of every file with uncommitted
+    /// writes, so a host tearing a mount down after a failed final flush can
+    /// preserve the data instead of letting the staging directory be deleted.
+    /// Empty in overlay mode (overlay data already lives in the user's directory).
+    pub fn dirty_files(&self) -> Vec<(String, PathBuf)> {
+        if self.overlay() {
+            return Vec::new();
+        }
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        inodes
+            .dirty_inos()
+            .into_iter()
+            .filter_map(|ino| {
+                let entry = inodes.get(ino)?;
+                let staging = self.staging.path(ino)?;
+                Some((entry.full_path.to_string(), staging))
+            })
+            .collect()
+    }
+
+    /// Re-enqueue every dirty inode and the queued remote deletes, e.g. to
+    /// retry uploads that failed while the network was down. Returns how many
+    /// changes were queued.
+    pub fn requeue_dirty(&self) -> usize {
+        let Some(fm) = &self.flush_manager else { return 0 };
+        let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
+        for ino in &dirty {
+            fm.enqueue(*ino);
+        }
+        let deletes = fm.pending_delete_count();
+        if deletes > 0 {
+            fm.wake_deletes();
+        }
+        dirty.len() + deletes
+    }
+
+    /// Remote paths whose deletion was queued but not committed to the Hub
+    /// (e.g. after [`shutdown`](Self::shutdown) gave up on a failing Hub).
+    pub fn unfinished_deletes(&self) -> Vec<String> {
+        self.flush_manager
+            .as_ref()
+            .map(|fm| fm.pending_delete_paths())
+            .unwrap_or_default()
+    }
+
+    /// Keep the staging directory on disk when this filesystem is dropped,
+    /// because it holds data that could not be uploaded or saved elsewhere.
+    /// Returns its path.
+    pub fn keep_staging(&self) -> Option<PathBuf> {
+        self.staging.dir().map(|dir| {
+            dir.keep();
+            dir.root().to_path_buf()
+        })
+    }
+
     /// Enqueues the inode for background flush rather than blocking on a
     /// synchronous Hub upload. Data is already durable in the local staging
     /// file after write(); the background flush loop commits to Hub.
@@ -2394,24 +2475,16 @@ impl VirtualFs {
 
         match read_target {
             ReadTarget::LocalFd(file) => {
-                let file_descriptor = file.as_raw_fd();
                 let mut buf = BytesMut::zeroed(size as usize);
-                // SAFETY: fd is valid (Arc<File> keeps it alive), buf is correctly sized.
-                // pread is thread-safe (atomic offset, no shared seek cursor).
-                let n = unsafe {
-                    libc::pread(
-                        file_descriptor,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        size as usize,
-                        offset as i64,
-                    )
-                };
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
-                    buf.truncate(n as usize);
-                    let eof = (n as u32) < size;
-                    Ok((buf.freeze(), eof))
+                // Positional read (pread on Unix): thread-safe, no shared seek
+                // cursor. Arc<File> keeps the handle alive.
+                match read_at(&file, &mut buf, offset) {
+                    Err(e) => Err(crate::error::io_errno(&e)),
+                    Ok(n) => {
+                        buf.truncate(n);
+                        let eof = (n as u32) < size;
+                        Ok((buf.freeze(), eof))
+                    }
                 }
             }
             ReadTarget::Remote { prefetch } => {
@@ -2533,20 +2606,9 @@ impl VirtualFs {
         };
 
         match target {
-            WriteTarget::Local { file, ino: handle_ino } => {
-                let file_descriptor = file.as_raw_fd();
-                let n = unsafe {
-                    libc::pwrite(
-                        file_descriptor,
-                        data.as_ptr() as *const libc::c_void,
-                        data.len(),
-                        offset as i64,
-                    )
-                };
-
-                if n < 0 {
-                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
-                } else {
+            WriteTarget::Local { file, ino: handle_ino } => match write_at(&file, data, offset) {
+                Err(e) => Err(crate::error::io_errno(&e)),
+                Ok(n) => {
                     let written = n as u32;
                     let new_end = offset + written as u64;
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -2562,7 +2624,7 @@ impl VirtualFs {
                     inodes.touch(handle_ino);
                     Ok(written)
                 }
-            }
+            },
             WriteTarget::Streaming {
                 ino: handle_ino,
                 channel,
@@ -3202,7 +3264,7 @@ impl VirtualFs {
             if let Err(e) = overlay.create_dir(&full_path, mode) {
                 error!("Failed to create overlay directory {}: {}", full_path, e);
                 self.inode_table.write().expect("inodes poisoned").remove(ino);
-                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                return Err(crate::error::io_errno(&e));
             }
         }
 
@@ -3717,7 +3779,7 @@ impl VirtualFs {
             && let Err(e) = overlay.remove_dir(&full_path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            return Err(e.raw_os_error().unwrap_or(libc::EIO));
+            return Err(crate::error::io_errno(&e));
         }
 
         // Re-check ENOTEMPTY + remove under a single write lock to prevent
@@ -3851,14 +3913,14 @@ impl VirtualFs {
             }
             if let Err(e) = overlay.create_parent_dirs(&info.new_full_path) {
                 error!("Overlay rename: failed to create destination parents: {}", e);
-                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                return Err(crate::error::io_errno(&e));
             }
             if let Err(e) = overlay.rename(&info.old_path, &info.new_full_path) {
                 error!(
                     "Overlay rename {} -> {} failed: {}",
                     info.old_path, info.new_full_path, e
                 );
-                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                return Err(crate::error::io_errno(&e));
             }
         }
 
@@ -4213,7 +4275,7 @@ impl VirtualFs {
 
                 let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
                     error!("Failed to check local backing file for ino={}: {}", ino, e);
-                    e.raw_os_error().unwrap_or(libc::EIO)
+                    crate::error::io_errno(&e)
                 })?;
 
                 if self.overlay() && !local_exists {
@@ -4308,7 +4370,7 @@ impl VirtualFs {
                 // would silently disappear at the next remote refresh.
                 let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
                     error!("Failed to check local backing file for ino={}: {}", ino, e);
-                    e.raw_os_error().unwrap_or(libc::EIO)
+                    crate::error::io_errno(&e)
                 })?;
                 if !local_exists {
                     return Err(libc::EPERM);
@@ -4316,7 +4378,7 @@ impl VirtualFs {
                 if let Some(new_mode) = mode {
                     self.set_local_backing_mode(&full_path, new_mode).map_err(|e| {
                         error!("Failed to update local backing mode for ino={}: {}", ino, e);
-                        e.raw_os_error().unwrap_or(libc::EIO)
+                        crate::error::io_errno(&e)
                     })?;
                 }
             }
@@ -4365,6 +4427,31 @@ impl VirtualFs {
     }
 }
 
+/// Positional read: `pread` on Unix, `ReadFile` with an explicit offset on
+/// Windows. Neither moves a shared cursor that another thread relies on.
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+    }
+}
+
+/// Positional write: `pwrite` on Unix, `WriteFile` with an explicit offset on Windows.
+fn write_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_at(file, data, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_write(file, data, offset)
+    }
+}
+
 // ── VFS types ──────────────────────────────────────────────────────────
 pub type VirtualFsError = i32;
 pub type VirtualFsResult<T> = std::result::Result<T, VirtualFsError>;
@@ -4382,6 +4469,17 @@ pub struct VirtualFsAttr {
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
+}
+
+/// See [`VirtualFs::pending_uploads`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PendingUploads {
+    /// Files with local writes not yet committed to the Hub.
+    pub dirty_files: usize,
+    /// Remote deletes queued but not yet committed.
+    pub pending_deletes: usize,
+    /// Files whose last upload attempt failed (they stay dirty and are retried).
+    pub failed_files: usize,
 }
 
 #[derive(Debug)]

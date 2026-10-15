@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Once, RwLock};
+use std::sync::{Arc, Mutex, Once, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -19,6 +19,15 @@ enum FlushSignal {
     WakeDeletes,
 }
 
+/// Remote deletes not committed yet: the queued paths, plus how many were
+/// sent to the Hub in a batch that has not been answered (so status and
+/// unmount still count them while they are in flight).
+#[derive(Default)]
+pub(crate) struct DeleteQueue {
+    queued: Vec<String>,
+    in_flight: usize,
+}
+
 // ── FlushManager ──────────────────────────────────────────────────────
 
 pub(crate) struct FlushManager {
@@ -26,7 +35,7 @@ pub(crate) struct FlushManager {
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     errors: Arc<Mutex<HashMap<u64, String>>>,
     /// Queued remote delete paths. Shared with flush_loop, flushed in batch cycle and shutdown.
-    pending_deletes: Arc<Mutex<Vec<String>>>,
+    pending_deletes: Arc<Mutex<DeleteQueue>>,
     hub_client: Arc<dyn HubOps>,
     /// Ensures shutdown runs exactly once. Subsequent calls are no-ops.
     shutdown_once: Once,
@@ -44,7 +53,7 @@ impl FlushManager {
         max_batch_window: Duration,
     ) -> Self {
         let errors = Arc::new(Mutex::new(HashMap::new()));
-        let pending_deletes = Arc::new(Mutex::new(Vec::new()));
+        let pending_deletes = Arc::new(Mutex::new(DeleteQueue::default()));
 
         let (tx, rx) = mpsc::unbounded_channel::<FlushSignal>();
         let bg_errors = errors.clone();
@@ -85,6 +94,33 @@ impl FlushManager {
         self.errors.lock().expect("flush_errors poisoned").remove(&ino)
     }
 
+    /// Number of inodes whose last flush attempt failed (not consumed).
+    pub(crate) fn error_count(&self) -> usize {
+        self.errors.lock().expect("flush_errors poisoned").len()
+    }
+
+    /// Number of remote deletes not yet committed (queued or in flight).
+    pub(crate) fn pending_delete_count(&self) -> usize {
+        let q = self.pending_deletes.lock().expect("pending_deletes poisoned");
+        q.queued.len() + q.in_flight
+    }
+
+    /// Paths of the queued remote deletes (not those in flight).
+    pub(crate) fn pending_delete_paths(&self) -> Vec<String> {
+        self.pending_deletes
+            .lock()
+            .expect("pending_deletes poisoned")
+            .queued
+            .clone()
+    }
+
+    /// Wake the flush loop to retry queued remote deletes.
+    pub(crate) fn wake_deletes(&self) {
+        if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref() {
+            let _ = tx.send(FlushSignal::WakeDeletes);
+        }
+    }
+
     // ── Remote delete queue ─────────────────────────────────────────
 
     /// Queue a path for batched remote deletion (flushed in next flush_loop cycle).
@@ -92,6 +128,7 @@ impl FlushManager {
         self.pending_deletes
             .lock()
             .expect("pending_deletes poisoned")
+            .queued
             .push(path);
         // Wake flush_loop so it drains pending_deletes even without dirty inodes.
         if let Some(tx) = self.tx.lock().expect("flush_tx poisoned").as_ref() {
@@ -102,16 +139,16 @@ impl FlushManager {
     /// Cancel a queued delete (e.g. when a new file is created at the same path).
     pub(crate) fn cancel_delete(&self, path: &str) {
         let mut q = self.pending_deletes.lock().expect("pending_deletes poisoned");
-        if !q.is_empty() {
-            q.retain(|p| p != path);
+        if !q.queued.is_empty() {
+            q.queued.retain(|p| p != path);
         }
     }
 
     /// Cancel all queued deletes under a directory prefix (e.g. `rm -rf dir && mv newdir dir`).
     pub(crate) fn cancel_delete_prefix(&self, prefix: &str) {
         let mut q = self.pending_deletes.lock().expect("pending_deletes poisoned");
-        if !q.is_empty() {
-            q.retain(|p| !p.starts_with(prefix));
+        if !q.queued.is_empty() {
+            q.queued.retain(|p| !p.starts_with(prefix));
         }
     }
 
@@ -153,13 +190,12 @@ impl FlushManager {
 
             // Take the handle then drop the guard before blocking.
             let handle = self.handle.lock().expect("flush_handle poisoned").take();
-            if let Some(handle) = handle {
-                let abort = handle.abort_handle();
+            if let Some(mut handle) = handle {
                 // Use block_in_place so this is safe even when called from within
                 // the tokio runtime (e.g. NFS shutdown path).
                 run_blocking(|| {
                     runtime.block_on(async {
-                        match tokio::time::timeout(timeout, handle).await {
+                        match tokio::time::timeout(timeout, &mut handle).await {
                             Ok(Ok(())) => {},
                             Ok(Err(err)) if err.is_cancelled() => {},
                             Ok(Err(err)) => error!("Flush task panicked: {}", err),
@@ -168,7 +204,11 @@ impl FlushManager {
                                     "Flush drain exceeded shutdown timeout ({:?}); abandoning ~{} dirty inode(s) so the process can exit and the FUSE connection is torn down. Unflushed data for this mount is lost.",
                                     timeout, dirty_count
                                 );
-                                abort.abort();
+                                handle.abort();
+                                // Let the cancelled task unwind, so a delete
+                                // batch it had in flight is queued again
+                                // before the caller reads what is left.
+                                let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
                             },
                         }
                     });
@@ -209,7 +249,7 @@ async fn flush_loop(
     flush_errors: Arc<Mutex<HashMap<u64, String>>>,
     debounce: Duration,
     max_batch_window: Duration,
-    pending_deletes: Arc<Mutex<Vec<String>>>,
+    pending_deletes: Arc<Mutex<DeleteQueue>>,
 ) {
     loop {
         // Wait for the first signal
@@ -272,27 +312,52 @@ async fn flush_loop(
 /// get re-uploaded, clean renames send their own batch ops. The window is bounded by a
 /// single Hub round-trip (~100ms). Could be fixed with an in-flight set, but not worth
 /// the complexity given the self-healing behavior.
-async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubOps) {
-    let paths: Vec<String> = {
+async fn flush_pending_deletes(queue: &Mutex<DeleteQueue>, hub_client: &dyn HubOps) {
+    let mut batch = {
         let mut pending = queue.lock().expect("pending_deletes poisoned");
-        if pending.is_empty() {
+        if pending.queued.is_empty() {
             return;
         }
-        std::mem::take(&mut *pending)
-    };
-    let count = paths.len();
-    let ops: Vec<BatchOp> = paths.into_iter().map(|path| BatchOp::DeleteFile { path }).collect();
-    info!("Flushing {count} queued remote deletes");
-    if let Err(e) = hub_client.batch_operations(&ops).await {
-        error!("Batch remote delete failed: {}", e);
-        // Re-queue paths from the failed ops for retry.
-        let mut pending = queue.lock().expect("pending_deletes poisoned");
-        for op in ops {
-            if let BatchOp::DeleteFile { path } = op {
-                pending.push(path);
-            }
+        let paths = std::mem::take(&mut pending.queued);
+        pending.in_flight += paths.len();
+        InFlightDeletes {
+            queue,
+            paths,
+            committed: false,
         }
-        warn!("{count} remote delete(s) re-queued for retry");
+    };
+    let count = batch.paths.len();
+    let ops: Vec<BatchOp> = batch
+        .paths
+        .iter()
+        .map(|path| BatchOp::DeleteFile { path: path.clone() })
+        .collect();
+    info!("Flushing {count} queued remote deletes");
+    match hub_client.batch_operations(&ops).await {
+        Ok(()) => batch.committed = true,
+        Err(e) => {
+            error!("Batch remote delete failed: {}", e);
+            warn!("{count} remote delete(s) re-queued for retry");
+        }
+    }
+}
+
+/// A delete batch sent to the Hub. Dropping it before the batch committed
+/// (Hub error, or the flush abandoned at a shutdown deadline) puts its paths
+/// back in the queue, so they are retried or reported as not done.
+struct InFlightDeletes<'a> {
+    queue: &'a Mutex<DeleteQueue>,
+    paths: Vec<String>,
+    committed: bool,
+}
+
+impl Drop for InFlightDeletes<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        pending.in_flight -= self.paths.len();
+        if !self.committed {
+            pending.queued.append(&mut self.paths);
+        }
     }
 }
 

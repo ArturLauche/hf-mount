@@ -5860,6 +5860,92 @@ fn flush_pending_deletes_requeue_on_failure() {
     });
 }
 
+/// Poll `cond` every 20 ms for up to 5 s.
+async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..250 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
+}
+
+/// A delete batch sent to the Hub still counts as pending until the Hub
+/// answers, so a volume flush or an unmount does not see "nothing left".
+#[test]
+fn in_flight_deletes_count_as_pending() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        fm.enqueue_delete("gone.txt".to_string());
+        // The batch has left the queue and is parked at the Hub call.
+        assert!(eventually(|| fm.pending_delete_paths().is_empty()).await);
+        assert_eq!(vfs.pending_uploads().pending_deletes, 1, "in flight is still pending");
+        barrier.wait().await;
+        assert!(eventually(|| vfs.pending_uploads().pending_deletes == 0).await);
+        let logs = hub.take_batch_log();
+        assert!(
+            logs.iter()
+                .flatten()
+                .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "gone.txt"))
+        );
+    });
+}
+
+/// A delete the Hub rejected stays pending, and retrying uploads retries it
+/// without needing another change to wake the flush loop.
+#[test]
+fn rejected_deletes_stay_pending_and_are_retried() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let fm = vfs.flush_manager.as_ref().unwrap();
+        hub.fail_next_batch(1);
+        fm.enqueue_delete("gone.txt".to_string());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(hub.take_batch_log().is_empty(), "first attempt failed");
+        assert_eq!(vfs.pending_uploads().pending_deletes, 1);
+        assert_eq!(vfs.unfinished_deletes(), vec!["gone.txt".to_string()]);
+
+        assert_eq!(vfs.requeue_dirty(), 1);
+        assert!(eventually(|| vfs.pending_uploads().pending_deletes == 0).await);
+        assert!(
+            hub.take_batch_log()
+                .iter()
+                .flatten()
+                .any(|op| matches!(op, BatchOp::DeleteFile { path } if path == "gone.txt"))
+        );
+    });
+}
+
+/// Deletes still rejected at shutdown are left in the queue for the host to
+/// report, not dropped.
+#[test]
+fn shutdown_leaves_rejected_deletes_reportable() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+    hub.fail_next_batch(1000);
+    rt.block_on(async {
+        vfs.flush_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_delete("gone.txt".to_string());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    });
+    vfs.shutdown();
+    assert_eq!(vfs.unfinished_deletes(), vec!["gone.txt".to_string()]);
+    assert_eq!(vfs.pending_uploads().pending_deletes, 1);
+}
+
 // ── Symlinks ────────────────────────────────────────────────────────
 
 #[test]
@@ -5997,6 +6083,10 @@ fn overlay_local_overrides_remote() {
 
 /// Writes via VFS land at the original path in the overlay root dir.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_write_lands_at_original_path() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6038,6 +6128,10 @@ fn overlay_mkdir_creates_local_dir() {
 
 /// In overlay mode, no batch ops are sent to the remote hub.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_no_flush_manager() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6061,6 +6155,10 @@ fn overlay_no_flush_manager() {
 
 /// fsync in overlay mode does not upload to remote.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_fsync_no_upload() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6180,6 +6278,10 @@ fn overlay_open_remote_truncate_eperm() {
 
 /// Data written via VFS is readable back in the same session.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_write_persists_after_reread() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6269,6 +6371,10 @@ fn overlay_unlink_remote_only_eperm() {
 
 /// Unlink of a locally-created file succeeds in overlay mode.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_unlink_local_file_ok() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6315,6 +6421,10 @@ fn overlay_rename_remote_only_eperm() {
 
 /// Rename of a locally-created file moves the on-disk overlay file.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_rename_local_moves_on_disk() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6349,6 +6459,10 @@ fn overlay_rename_local_moves_on_disk() {
 
 /// setattr truncation in overlay mode writes to the correct overlay path.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_setattr_truncate_uses_overlay_path() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6382,6 +6496,7 @@ fn overlay_setattr_truncate_uses_overlay_path() {
 }
 
 /// Overlay create/chmod mode changes persist to disk and survive a directory reload.
+#[cfg(unix)]
 #[test]
 fn overlay_mode_changes_persist_on_disk() {
     use std::os::unix::fs::PermissionsExt;
@@ -6507,6 +6622,7 @@ fn overlay_filters_os_junk() {
 }
 
 /// Symlinks in the overlay directory are skipped during readdir merge.
+#[cfg(unix)]
 #[test]
 fn overlay_skips_symlinks() {
     let hub = MockHub::new();
@@ -6986,6 +7102,125 @@ fn install_commit_hook_on_terminal_channel_does_not_wedge_pending_commits() {
             "hook installed on a terminal channel must not linger in pending_commits"
         );
         vfs.await_pending_commit(ino).await.unwrap();
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+// ── pending upload reporting ────────────────────────────────────────
+
+/// `pending_uploads` reports a written-but-unflushed file, `is_dirty` tracks
+/// it, and both clear once the background flush commits it.
+#[test]
+fn pending_uploads_track_dirty_files_until_flushed() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        assert_eq!(vfs.pending_uploads(), PendingUploads::default());
+        let (attr, fh) = vfs.create(ROOT_INODE, "new.bin", 0o644, 0, 0, None).await.unwrap();
+        write_blocking(&vfs, attr.ino, fh, 0, b"payload").await.unwrap();
+        assert!(vfs.is_dirty(attr.ino));
+        assert_eq!(vfs.pending_uploads().dirty_files, 1);
+        vfs.release(fh).await.unwrap();
+
+        // Debounce is 100 ms in tests; wait for the commit.
+        for _ in 0..100 {
+            if !vfs.is_dirty(attr.ino) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!vfs.is_dirty(attr.ino), "flush never committed");
+        assert_eq!(vfs.pending_uploads(), PendingUploads::default());
+        assert_eq!(vfs.take_flush_error(attr.ino), None);
+    });
+}
+
+/// Read-only mounts never report pending uploads.
+#[test]
+fn pending_uploads_zero_without_flush_manager() {
+    let hub = MockHub::new_repo();
+    let xet = MockXet::new();
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub,
+        xet,
+        TestOpts {
+            read_only: true,
+            ..Default::default()
+        },
+        &rt,
+    );
+    assert_eq!(vfs.pending_uploads(), PendingUploads::default());
+    assert_eq!(vfs.requeue_dirty(), 0);
+}
+
+/// Lazy remote reads at offsets past 4 GiB return the right bytes (the
+/// Windows adapter relies on 64-bit offsets end to end).
+#[test]
+fn lazy_reads_beyond_4gib_return_correct_bytes() {
+    const SIZE: u64 = 5 * 1024 * 1024 * 1024 + 99;
+    let hub = MockHub::new_repo();
+    hub.add_file("huge.bin", SIZE, Some("h_huge"), None);
+    let xet = MockXet::new();
+    xet.add_generated_file("h_huge", SIZE);
+    let rt = new_runtime();
+    let vfs = make_test_vfs(
+        hub,
+        xet,
+        TestOpts {
+            read_only: true,
+            ..Default::default()
+        },
+        &rt,
+    );
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "huge.bin").await.unwrap();
+        assert_eq!(attr.size, SIZE);
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
+        for offset in [
+            0u64,
+            4 * 1024 * 1024 * 1024 - 10,
+            4 * 1024 * 1024 * 1024 + 4096,
+            SIZE - 50,
+        ] {
+            let (data, _) = vfs.read(fh, offset, 100).await.unwrap();
+            assert_eq!(data.len() as u64, 100.min(SIZE - offset));
+            for (i, b) in data.iter().enumerate() {
+                assert_eq!(*b, crate::test_mocks::generated_byte(offset + i as u64));
+            }
+        }
+        let (tail, eof) = vfs.read(fh, SIZE, 10).await.unwrap();
+        assert!(tail.is_empty() && eof);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// After a background commit, a revalidating lookup (HEAD on every lookup)
+/// still resolves the file to the committed content.
+#[test]
+fn committed_file_survives_revalidating_lookup() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    hub.reflect_commits(xet.clone());
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+    rt.block_on(async {
+        let (attr, fh) = vfs.create(ROOT_INODE, "fresh.txt", 0o644, 0, 0, None).await.unwrap();
+        write_blocking(&vfs, attr.ino, fh, 0, b"committed bytes").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        for _ in 0..100 {
+            if !vfs.is_dirty(attr.ino) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!vfs.is_dirty(attr.ino));
+        let again = vfs.lookup(ROOT_INODE, "fresh.txt").await.unwrap();
+        assert_eq!(again.size, 15);
+        let fh = vfs.open(again.ino, false, false, None).await.unwrap();
+        let (data, _) = vfs.read(fh, 0, 64).await.unwrap();
+        assert_eq!(&data[..], b"committed bytes");
         vfs.release(fh).await.unwrap();
     });
 }

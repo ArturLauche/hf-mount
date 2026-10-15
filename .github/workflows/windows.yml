@@ -1,0 +1,297 @@
+name: Windows
+
+# CI for the Windows edition, runnable in any public fork on GitHub-hosted
+# runners (no private runners, registries or secrets). A green run means:
+# Linux/Windows lint + unit tests passed, the WinFsp drive-letter integration
+# tests passed against the real driver on a Windows runner, a public
+# repository was mounted end to end, the desktop UI passed its checks, and
+# the installers were built, installed, started and uninstalled.
+# windows-release.yml reuses this workflow to build release assets.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux lint & unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (no features)
+        run: cargo clippy -- -D warnings
+
+      - name: Clippy (FUSE + NFS)
+        run: cargo clippy --features fuse,nfs -- -D warnings
+
+      - name: Clippy (lib tests)
+        run: cargo clippy --lib --profile test -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --lib --features fuse,nfs
+
+  windows:
+    name: Windows build, tests & WinFsp mount tests
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      - name: Clippy (lib + lib tests)
+        run: |
+          cargo clippy --lib -- -D warnings
+          cargo clippy --lib --profile test -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      # The mount tests run even when an earlier test step failed, so every
+      # run reports both; the job still fails if any step failed.
+      - name: Install WinFsp (pinned, SHA-256 verified)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./scripts/windows/install-winfsp.ps1 -Quiet
+
+      - name: WinFsp drive-letter integration tests
+        timeout-minutes: 20
+        if: ${{ !cancelled() }}
+        run: cargo test --lib -- --ignored --test-threads=1 windows::mount_tests
+
+      - name: Build release CLI
+        if: ${{ !cancelled() }}
+        run: cargo build --release --bin hf-mount
+
+      - name: Package portable CLI
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./scripts/windows/package-cli.ps1 -Exe target/release/hf-mount.exe -OutDir dist
+
+      - name: Upload portable CLI
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-cli-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: CLI smoke tests (argument handling and exit codes)
+        timeout-minutes: 5
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $exe = "target/release/hf-mount.exe"
+          function Expect([int]$code, [string[]]$a) {
+            & $exe @a | Out-Host
+            if ($LASTEXITCODE -ne $code) { throw "hf-mount $a exited $LASTEXITCODE, expected $code" }
+          }
+          Expect 0 @('--version')
+          Expect 0 @('--help')
+          Expect 0 @('--json', 'status')
+          Expect 0 @('--json', 'drives')
+          Expect 0 @('--json', 'doctor')
+          Expect 9 @('stop', 'Q:')
+          Expect 2 @('start', 'repo', '../x', 'H:')
+          Expect 2 @('start', 'repo', 'a/b', 'C:')
+          Expect 2 @('start', 'bucket', 'only-one-segment', 'H:')
+          # A repository that does not exist: anonymous access gets 401 from
+          # the Hub (not found or private) -> auth_required (4).
+          & $exe --json start repo hf-mount-ci/this-repo-does-not-exist-0000 Q: | Out-Host
+          if ($LASTEXITCODE -ne 4 -and $LASTEXITCODE -ne 5) { throw "missing repo exited $LASTEXITCODE" }
+          # The expected non-zero code above must not become the step's result.
+          exit 0
+
+      - name: Live end-to-end mount of a public repository
+        timeout-minutes: 20
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./scripts/windows/smoke-test.ps1 -Exe target/release/hf-mount.exe
+
+      - name: Upload hf-mount logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-logs-windows
+          path: ~\AppData\Local\hf-mount\logs
+          if-no-files-found: ignore
+
+  frontend:
+    name: Desktop UI checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Unit and component tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+
+  desktop:
+    name: Desktop app installers (NSIS + MSI)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> target
+          key: desktop
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build hf-mount.exe (bundled next to the app)
+        shell: pwsh
+        run: |
+          cargo build --release --bin hf-mount
+          New-Item -ItemType Directory -Force desktop/src-tauri/binaries | Out-Null
+          Copy-Item target/release/hf-mount.exe desktop/src-tauri/binaries/hf-mount-x86_64-pc-windows-msvc.exe
+
+      - name: Fetch the official WinFsp installer (SHA-256 verified, unmodified)
+        shell: pwsh
+        run: ./scripts/windows/install-winfsp.ps1 -DownloadTo desktop/src-tauri/resources/winfsp
+
+      - name: License lists for the installer (Rust crates, npm packages)
+        shell: pwsh
+        run: >
+          ./scripts/windows/dependency-licenses.ps1
+          -Manifest desktop/src-tauri/Cargo.toml
+          -NpmLock desktop/package-lock.json
+          -OutDir desktop/src-tauri/resources/licenses
+
+      - name: Clippy (desktop app)
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          npm run build
+          cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Build installers
+        working-directory: desktop
+        run: npx tauri build --ci --config src-tauri/tauri.release.conf.json
+
+      - name: Install, start and uninstall the app
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          ./scripts/windows/desktop-install-test.ps1 -Installer $setup.FullName
+
+      - name: Upload installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-desktop-windows-x64
+          path: |
+            desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+            desktop/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+      - name: Upload app logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-desktop-logs
+          path: ~\AppData\Local\hf-mount\logs
+          if-no-files-found: ignore
+
+  authenticated:
+    name: Opt-in private repository and bucket write test
+    # Runs only where the repository owner configured a test bucket and/or a
+    # private repository (Settings > Variables) and the HF_TOKEN secret; it is
+    # skipped for pull requests from forks, which get no secrets. The bucket test only
+    # touches a new folder it creates and removes.
+    if: >-
+      ${{ (vars.HF_MOUNT_TEST_BUCKET != '' || vars.HF_MOUNT_TEST_PRIVATE_REPO != '')
+      && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: windows
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: hf-mount-cli-windows-x64
+          path: cli
+
+      - name: Unpack CLI and install WinFsp
+        shell: pwsh
+        run: |
+          Expand-Archive -Path (Get-ChildItem cli/*.zip | Select-Object -First 1).FullName -DestinationPath cli/unpacked
+          ./scripts/windows/install-winfsp.ps1 -Quiet
+
+      - name: Private repository and bucket round trip
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TEST_BUCKET: ${{ vars.HF_MOUNT_TEST_BUCKET }}
+          TEST_PRIVATE_REPO: ${{ vars.HF_MOUNT_TEST_PRIVATE_REPO }}
+        run: |
+          $exe = (Get-ChildItem -Recurse cli/unpacked -Filter hf-mount.exe | Select-Object -First 1).FullName
+          $testArgs = @{ Exe = $exe }
+          if ($env:TEST_BUCKET) { $testArgs.Bucket = $env:TEST_BUCKET }
+          if ($env:TEST_PRIVATE_REPO) { $testArgs.PrivateRepo = $env:TEST_PRIVATE_REPO }
+          ./scripts/windows/authenticated-test.ps1 @testArgs

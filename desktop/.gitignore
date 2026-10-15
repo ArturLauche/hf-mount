@@ -1,0 +1,7 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/resources/winfsp/
+src-tauri/gen/
+src-tauri/resources/licenses/

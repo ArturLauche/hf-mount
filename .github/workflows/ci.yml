@@ -21,6 +21,11 @@ permissions: {}
 
 jobs:
   lint-test:
+    # These jobs need Hugging Face's private runner group, internal registries
+    # and secrets; in forks they would queue forever. Every other job needs
+    # this one, so they are skipped too. Forks get Linux unit tests from
+    # windows.yml instead.
+    if: github.repository == 'huggingface/hf-mount'
     permissions:
       contents: read
     name: Lint & Unit Tests

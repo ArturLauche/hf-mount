@@ -50,6 +50,9 @@ pub struct MockHub {
     follow_connect_failures: Mutex<VecDeque<u16>>,
     /// `(cursor, since)` of every follow_events connect, in order.
     follow_connects: Mutex<Vec<(Option<String>, Option<String>)>>,
+    /// When set, committed batch operations update the mock tree and HEAD
+    /// responses like the real Hub (sizes come from this mock CAS).
+    commit_sink: Mutex<Option<Arc<MockXet>>>,
 }
 
 #[allow(dead_code)]
@@ -75,7 +78,14 @@ impl MockHub {
             follow_script: Arc::new(Mutex::new(VecDeque::new())),
             follow_connect_failures: Mutex::new(VecDeque::new()),
             follow_connects: Mutex::new(Vec::new()),
+            commit_sink: Mutex::new(None),
         })
+    }
+
+    /// Make committed `batch_operations` visible to later listings and HEADs,
+    /// as on the real Hub. Off by default (most tests assert on the log only).
+    pub fn reflect_commits(&self, xet: Arc<MockXet>) {
+        *self.commit_sink.lock().unwrap() = Some(xet);
     }
 
     pub fn new() -> Arc<Self> {
@@ -307,6 +317,40 @@ impl HubOps for MockHub {
             return Err(Error::hub("mock batch_operations failure"));
         }
         self.batch_log.lock().unwrap().push(ops.to_vec());
+        let sink = self.commit_sink.lock().unwrap().clone();
+        if let Some(xet) = sink {
+            let mut tree = self.tree.lock().unwrap();
+            let mut heads = self.head_responses.lock().unwrap();
+            for op in ops {
+                match op {
+                    BatchOp::AddFile { path, xet_hash, .. } => {
+                        let size = xet.content_len(xet_hash);
+                        tree.retain(|e| &e.path != path);
+                        tree.push(TreeEntry {
+                            path: path.clone(),
+                            entry_type: "file".to_string(),
+                            size: Some(size),
+                            xet_hash: Some(xet_hash.clone()),
+                            oid: None,
+                            mtime: None,
+                        });
+                        heads.insert(
+                            path.clone(),
+                            Some(HeadFileInfo {
+                                xet_hash: Some(xet_hash.clone()),
+                                etag: None,
+                                size: Some(size),
+                                last_modified: None,
+                            }),
+                        );
+                    }
+                    BatchOp::DeleteFile { path } => {
+                        tree.retain(|e| &e.path != path);
+                        heads.remove(path);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -388,6 +432,9 @@ impl FollowStreamOps for MockFollowStream {
 
 pub struct MockXet {
     files: Mutex<HashMap<String, Vec<u8>>>,
+    /// Files whose bytes are computed from their offset (see
+    /// `generated_byte`), so tests can serve multi-GiB files without memory.
+    generated: Mutex<HashMap<String, u64>>,
     pub next_hash: AtomicU64,
     writer_create_fail: AtomicBool,
     upload_fail: AtomicBool,
@@ -422,6 +469,7 @@ impl MockXet {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             files: Mutex::new(HashMap::new()),
+            generated: Mutex::new(HashMap::new()),
             next_hash: AtomicU64::new(1),
             writer_create_fail: AtomicBool::new(false),
             upload_fail: AtomicBool::new(false),
@@ -451,6 +499,24 @@ impl MockXet {
 
     pub fn add_file(&self, hash: &str, content: &[u8]) {
         self.files.lock().unwrap().insert(hash.to_string(), content.to_vec());
+    }
+
+    /// Size of the content stored under `hash` (0 if unknown).
+    pub fn content_len(&self, hash: &str) -> u64 {
+        if let Some(size) = self.generated.lock().unwrap().get(hash) {
+            return *size;
+        }
+        self.files
+            .lock()
+            .unwrap()
+            .get(hash)
+            .map(|c| c.len() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Register a file of `size` bytes whose content is `generated_byte(offset)`.
+    pub fn add_generated_file(&self, hash: &str, size: u64) {
+        self.generated.lock().unwrap().insert(hash.to_string(), size);
     }
 
     pub fn fail_next_writer_create(&self) {
@@ -573,6 +639,12 @@ impl XetOps for MockXet {
                 chunk_size: 4096,
             }));
         }
+        if let Some(&size) = self.generated.lock().unwrap().get(file_info.hash()) {
+            return Ok(Box::new(GeneratedDownloadStream {
+                offset,
+                end: end.unwrap_or(size).min(size),
+            }));
+        }
         let files = self.files.lock().unwrap();
         let content = files.get(file_info.hash()).cloned().unwrap_or_default();
         let bounded_end = end.map(|e| e as usize).unwrap_or(content.len());
@@ -637,6 +709,32 @@ impl DownloadStreamOps for MockDownloadStream {
         let chunk = Bytes::copy_from_slice(&self.data[self.offset..chunk_end]);
         self.offset = chunk_end;
         Ok(Some(chunk))
+    }
+}
+
+/// Content of a generated mock file at `offset`: deterministic, position
+/// dependent (a misplaced read is detected) and not periodic in 4 GiB.
+pub fn generated_byte(offset: u64) -> u8 {
+    let x = offset.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (offset >> 29);
+    (x >> 56) as u8 ^ (offset as u8)
+}
+
+/// Serves `generated_byte` content for `[offset, end)`.
+pub struct GeneratedDownloadStream {
+    offset: u64,
+    end: u64,
+}
+
+#[async_trait::async_trait]
+impl DownloadStreamOps for GeneratedDownloadStream {
+    async fn next(&mut self) -> Result<Option<Bytes>> {
+        if self.offset >= self.end {
+            return Ok(None);
+        }
+        let chunk_end = (self.offset + 65_536).min(self.end);
+        let chunk: Vec<u8> = (self.offset..chunk_end).map(generated_byte).collect();
+        self.offset = chunk_end;
+        Ok(Some(Bytes::from(chunk)))
     }
 }
 
@@ -717,6 +815,24 @@ fn fresh_test_dir(prefix: &str) -> std::path::PathBuf {
     }
 }
 
+/// Open a directory handle for `OverlayBacking`. Windows only hands out
+/// directory handles to opens with `FILE_FLAG_BACKUP_SEMANTICS`.
+fn open_dir(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
 /// Build a VirtualFs for testing. Must be called from a sync context
 /// (not inside #[tokio::test]) because VirtualFs::new() calls block_on internally.
 pub fn make_test_vfs(
@@ -729,7 +845,7 @@ pub fn make_test_vfs(
 
     let overlay_backing = if opts.overlay {
         let overlay_root = fresh_test_dir("hf_mount_overlay");
-        let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
+        let fd = open_dir(&overlay_root).expect("failed to open overlay root dir");
         Some(OverlayBacking::new(fd))
     } else {
         None
@@ -789,7 +905,7 @@ pub fn make_overlay_test_vfs_with_root(
         .build()
         .unwrap();
     let cache_dir = fresh_test_dir("hf_mount_test");
-    let fd = std::fs::File::open(&overlay_root).expect("failed to open overlay root dir");
+    let fd = open_dir(&overlay_root).expect("failed to open overlay root dir");
     let staging_dir = Some(StagingDir::new(&cache_dir, 0));
     let overlay_backing = Some(OverlayBacking::new(fd));
 
