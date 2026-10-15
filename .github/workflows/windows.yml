@@ -84,3 +84,43 @@ jobs:
       - name: WinFsp drive-letter integration tests
         if: ${{ !cancelled() }}
         run: cargo test --lib -- --ignored --test-threads=1 windows::mount_tests
+
+      - name: Build release CLI
+        if: ${{ !cancelled() }}
+        run: cargo build --release --bin hf-mount
+
+      - name: CLI smoke tests (argument handling and exit codes)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $exe = "target/release/hf-mount.exe"
+          function Expect([int]$code, [string[]]$a) {
+            & $exe @a | Out-Host
+            if ($LASTEXITCODE -ne $code) { throw "hf-mount $a exited $LASTEXITCODE, expected $code" }
+          }
+          Expect 0 @('--version')
+          Expect 0 @('--help')
+          Expect 0 @('--json', 'status')
+          Expect 0 @('--json', 'drives')
+          Expect 0 @('--json', 'doctor')
+          Expect 9 @('stop', 'Q:')
+          Expect 2 @('start', 'repo', '../x', 'H:')
+          Expect 2 @('start', 'repo', 'a/b', 'C:')
+          Expect 2 @('start', 'bucket', 'only-one-segment', 'H:')
+          # A repository that does not exist: anonymous access gets 401 from
+          # the Hub (not found or private) -> auth_required (4).
+          & $exe --json start repo hf-mount-ci/this-repo-does-not-exist-0000 Q: | Out-Host
+          if ($LASTEXITCODE -ne 4 -and $LASTEXITCODE -ne 5) { throw "missing repo exited $LASTEXITCODE" }
+
+      - name: Live end-to-end mount of a public repository
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./scripts/windows/smoke-test.ps1 -Exe target/release/hf-mount.exe
+
+      - name: Upload hf-mount logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-logs-windows
+          path: ~\AppData\Local\hf-mount\logs
+          if-no-files-found: ignore

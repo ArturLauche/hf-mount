@@ -5997,6 +5997,10 @@ fn overlay_local_overrides_remote() {
 
 /// Writes via VFS land at the original path in the overlay root dir.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_write_lands_at_original_path() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6038,6 +6042,10 @@ fn overlay_mkdir_creates_local_dir() {
 
 /// In overlay mode, no batch ops are sent to the remote hub.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_no_flush_manager() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6061,6 +6069,10 @@ fn overlay_no_flush_manager() {
 
 /// fsync in overlay mode does not upload to remote.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_fsync_no_upload() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6180,6 +6192,10 @@ fn overlay_open_remote_truncate_eperm() {
 
 /// Data written via VFS is readable back in the same session.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_write_persists_after_reread() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6269,6 +6285,10 @@ fn overlay_unlink_remote_only_eperm() {
 
 /// Unlink of a locally-created file succeeds in overlay mode.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_unlink_local_file_ok() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6315,6 +6335,10 @@ fn overlay_rename_remote_only_eperm() {
 
 /// Rename of a locally-created file moves the on-disk overlay file.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_rename_local_moves_on_disk() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -6349,6 +6373,10 @@ fn overlay_rename_local_moves_on_disk() {
 
 /// setattr truncation in overlay mode writes to the correct overlay path.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "overlay mode is not offered on Windows; cap-std file creation in the overlay root fails there"
+)]
 fn overlay_setattr_truncate_uses_overlay_path() {
     let hub = MockHub::new();
     let xet = MockXet::new();
@@ -7079,6 +7107,34 @@ fn lazy_reads_beyond_4gib_return_correct_bytes() {
         }
         let (tail, eof) = vfs.read(fh, SIZE, 10).await.unwrap();
         assert!(tail.is_empty() && eof);
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// After a background commit, a revalidating lookup (HEAD on every lookup)
+/// still resolves the file to the committed content.
+#[test]
+fn committed_file_survives_revalidating_lookup() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    hub.reflect_commits(xet.clone());
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+    rt.block_on(async {
+        let (attr, fh) = vfs.create(ROOT_INODE, "fresh.txt", 0o644, 0, 0, None).await.unwrap();
+        write_blocking(&vfs, attr.ino, fh, 0, b"committed bytes").await.unwrap();
+        vfs.release(fh).await.unwrap();
+        for _ in 0..100 {
+            if !vfs.is_dirty(attr.ino) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!vfs.is_dirty(attr.ino));
+        let again = vfs.lookup(ROOT_INODE, "fresh.txt").await.unwrap();
+        assert_eq!(again.size, 15);
+        let fh = vfs.open(again.ino, false, false, None).await.unwrap();
+        let (data, _) = vfs.read(fh, 0, 64).await.unwrap();
+        assert_eq!(&data[..], b"committed bytes");
         vfs.release(fh).await.unwrap();
     });
 }

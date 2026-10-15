@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod config;
 pub mod errors;
+pub mod logging;
 pub mod protocol;
 pub mod redact;
 pub mod registry;

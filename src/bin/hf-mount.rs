@@ -1,7 +1,16 @@
+#[cfg(unix)]
 use std::path::PathBuf;
 
+#[cfg(unix)]
 use clap::Parser;
 
+/// Windows: native WinFsp drives managed by a per-user supervisor.
+#[cfg(windows)]
+fn main() {
+    std::process::exit(hf_mount::windows::cli::main());
+}
+
+#[cfg(unix)]
 #[derive(Parser)]
 #[command(about = "Mount Hugging Face Buckets and repos as local filesystems", version)]
 struct Cli {
@@ -9,6 +18,7 @@ struct Cli {
     command: Command,
 }
 
+#[cfg(unix)]
 #[derive(clap::Subcommand)]
 enum Command {
     /// Start a mount as a background daemon
@@ -30,6 +40,7 @@ enum Command {
     Status,
 }
 
+#[cfg(unix)]
 fn main() {
     let cli = Cli::parse();
 
@@ -110,6 +121,7 @@ fn main() {
 
 /// Replace the current process with the backend binary via execvp.
 /// Passes the ready-notification fd via the HF_MOUNT_DAEMON_FD env var.
+#[cfg(unix)]
 fn exec_backend(backend: &std::path::Path, args: &[String], guard: &hf_mount::daemon::DaemonGuard) -> std::io::Error {
     use std::os::unix::process::CommandExt;
 

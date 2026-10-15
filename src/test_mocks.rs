@@ -50,6 +50,9 @@ pub struct MockHub {
     follow_connect_failures: Mutex<VecDeque<u16>>,
     /// `(cursor, since)` of every follow_events connect, in order.
     follow_connects: Mutex<Vec<(Option<String>, Option<String>)>>,
+    /// When set, committed batch operations update the mock tree and HEAD
+    /// responses like the real Hub (sizes come from this mock CAS).
+    commit_sink: Mutex<Option<Arc<MockXet>>>,
 }
 
 #[allow(dead_code)]
@@ -75,7 +78,14 @@ impl MockHub {
             follow_script: Arc::new(Mutex::new(VecDeque::new())),
             follow_connect_failures: Mutex::new(VecDeque::new()),
             follow_connects: Mutex::new(Vec::new()),
+            commit_sink: Mutex::new(None),
         })
+    }
+
+    /// Make committed `batch_operations` visible to later listings and HEADs,
+    /// as on the real Hub. Off by default (most tests assert on the log only).
+    pub fn reflect_commits(&self, xet: Arc<MockXet>) {
+        *self.commit_sink.lock().unwrap() = Some(xet);
     }
 
     pub fn new() -> Arc<Self> {
@@ -307,6 +317,40 @@ impl HubOps for MockHub {
             return Err(Error::hub("mock batch_operations failure"));
         }
         self.batch_log.lock().unwrap().push(ops.to_vec());
+        let sink = self.commit_sink.lock().unwrap().clone();
+        if let Some(xet) = sink {
+            let mut tree = self.tree.lock().unwrap();
+            let mut heads = self.head_responses.lock().unwrap();
+            for op in ops {
+                match op {
+                    BatchOp::AddFile { path, xet_hash, .. } => {
+                        let size = xet.content_len(xet_hash);
+                        tree.retain(|e| &e.path != path);
+                        tree.push(TreeEntry {
+                            path: path.clone(),
+                            entry_type: "file".to_string(),
+                            size: Some(size),
+                            xet_hash: Some(xet_hash.clone()),
+                            oid: None,
+                            mtime: None,
+                        });
+                        heads.insert(
+                            path.clone(),
+                            Some(HeadFileInfo {
+                                xet_hash: Some(xet_hash.clone()),
+                                etag: None,
+                                size: Some(size),
+                                last_modified: None,
+                            }),
+                        );
+                    }
+                    BatchOp::DeleteFile { path } => {
+                        tree.retain(|e| &e.path != path);
+                        heads.remove(path);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -455,6 +499,19 @@ impl MockXet {
 
     pub fn add_file(&self, hash: &str, content: &[u8]) {
         self.files.lock().unwrap().insert(hash.to_string(), content.to_vec());
+    }
+
+    /// Size of the content stored under `hash` (0 if unknown).
+    pub fn content_len(&self, hash: &str) -> u64 {
+        if let Some(size) = self.generated.lock().unwrap().get(hash) {
+            return *size;
+        }
+        self.files
+            .lock()
+            .unwrap()
+            .get(hash)
+            .map(|c| c.len() as u64)
+            .unwrap_or(0)
     }
 
     /// Register a file of `size` bytes whose content is `generated_byte(offset)`.

@@ -107,6 +107,9 @@ pub fn validate_name_segment(segment: &str, what: &str) -> Result<(), SpecError>
     if segment.is_empty() {
         return Err(err(format!("{what} must not be empty")));
     }
+    if segment == "." || segment == ".." {
+        return Err(err("ids must not contain '.' or '..' segments"));
+    }
     if segment.len() > 96 {
         return Err(err(format!("{what} {segment:?} is longer than 96 characters")));
     }

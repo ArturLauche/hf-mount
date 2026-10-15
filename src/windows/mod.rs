@@ -4,7 +4,15 @@
 //! Platform-independent pieces (name rules, NTSTATUS mapping, ABI structs)
 //! live in [`crate::winfs`] so they are tested on every platform.
 
+pub mod cli;
+pub mod client;
+mod console;
+pub mod credman;
 pub mod drives;
+pub mod host;
+pub mod mounter;
+pub mod pipe;
+pub mod process;
 pub mod security;
 pub mod util;
 pub mod winfsp;

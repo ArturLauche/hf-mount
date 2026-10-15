@@ -180,7 +180,7 @@ fn repo_enumerates_and_reads_exact_bytes() {
 
     let meta = std::fs::metadata(t.path("config.json")).unwrap();
     assert!(meta.is_file());
-    assert_eq!(meta.len(), 38);
+    assert_eq!(meta.len(), br#"{"model_type": "gpt2", "n_layer": 12}"#.len() as u64);
     assert!(meta.permissions().readonly());
     assert!(std::fs::metadata(t.path("data")).unwrap().is_dir());
 
@@ -536,6 +536,7 @@ fn writable_bucket_create_modify_rename_delete() {
     let xet = MockXet::new();
     hub.add_file("existing.txt", 8, Some("h_existing"), None);
     xet.add_file("h_existing", b"original");
+    hub.reflect_commits(xet.clone());
     let t = mount(
         hub.clone(),
         xet.clone(),
