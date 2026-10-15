@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 use super::drives;
 use super::winfsp_fs::{MountConfig, MountError, WinFspMount};
-use crate::manager::config::{Settings, recovered_dir};
+use crate::manager::config::{Settings, load_settings, recovered_dir};
 use crate::manager::errors::classify_setup_error;
 use crate::manager::protocol::{Credential, ErrorCode, ErrorInfo, MountStats, UnmountReport};
 use crate::manager::registry::{MountHandle, Mounter};
@@ -44,6 +44,7 @@ fn default_options() -> MountOptions {
 
 pub struct WinFspMounter {
     runtime: tokio::runtime::Handle,
+    /// Settings at supervisor start; used when the file cannot be re-read.
     settings: Settings,
 }
 
@@ -52,13 +53,27 @@ impl WinFspMounter {
         Self { runtime, settings }
     }
 
-    fn options_for(&self, spec: &MountSpec, credential: Option<&Credential>, cache_dir: PathBuf) -> MountOptions {
+    /// Settings are re-read for every mount, so changes made in the app or
+    /// by hand apply to the next mount without restarting the supervisor.
+    fn current_settings(&self) -> Settings {
+        load_settings().unwrap_or_else(|e| {
+            warn!("settings unreadable, using the values from startup: {e}");
+            self.settings.clone()
+        })
+    }
+
+    fn options_for(
+        settings: &Settings,
+        spec: &MountSpec,
+        credential: Option<&Credential>,
+        cache_dir: PathBuf,
+    ) -> MountOptions {
         let mut o = default_options();
         if let Some(endpoint) = spec
             .tuning
             .hub_endpoint
             .clone()
-            .or_else(|| self.settings.hub_endpoint.clone())
+            .or_else(|| settings.hub_endpoint.clone())
         {
             o.hub_endpoint = endpoint;
         }
@@ -68,14 +83,14 @@ impl WinFspMounter {
             None => {}
         }
         o.cache_dir = cache_dir;
-        o.cache_size = spec.tuning.cache_size_bytes.unwrap_or(self.settings.cache_size_bytes);
+        o.cache_size = spec.tuning.cache_size_bytes.unwrap_or(settings.cache_size_bytes);
         o.no_disk_cache = spec.tuning.no_disk_cache;
         o.read_only = spec.read_only;
-        o.metadata_ttl_ms = spec.tuning.metadata_ttl_ms.unwrap_or(self.settings.metadata_ttl_ms);
+        o.metadata_ttl_ms = spec.tuning.metadata_ttl_ms.unwrap_or(settings.metadata_ttl_ms);
         if let Some(poll) = spec.tuning.poll_interval_secs {
             o.poll_interval_secs = poll;
         }
-        o.flush_shutdown_timeout_ms = self.settings.upload_wait_secs.saturating_mul(1000);
+        o.flush_shutdown_timeout_ms = settings.upload_wait_secs.saturating_mul(1000);
         o
     }
 }
@@ -130,11 +145,8 @@ impl Mounter for WinFspMounter {
         // Fail fast on a missing driver, before any network round trip.
         super::winfsp::api().map_err(|e| classify_mount_error(&MountError::Driver(e)))?;
 
-        let cache_root = spec
-            .tuning
-            .cache_dir
-            .clone()
-            .unwrap_or_else(|| self.settings.cache_root());
+        let settings = self.current_settings();
+        let cache_root = spec.tuning.cache_dir.clone().unwrap_or_else(|| settings.cache_root());
         let (cache_dir, cache_lock) = lock_cache_dir(&cache_root.join(spec.cache_key())).map_err(|e| {
             ErrorInfo::new(
                 ErrorCode::Internal,
@@ -142,7 +154,7 @@ impl Mounter for WinFspMounter {
             )
             .with_hint("check that the cache directory is writable")
         })?;
-        let options = self.options_for(spec, credential, cache_dir.clone());
+        let options = Self::options_for(&settings, spec, credential, cache_dir.clone());
         let mount_point = PathBuf::from(&spec.target);
         let source = if spec.source_type.is_repo() {
             Source::Repo {

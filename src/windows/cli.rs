@@ -88,6 +88,14 @@ enum Command {
     /// Run the background mount supervisor (started automatically).
     #[command(hide = true)]
     Supervise,
+    /// Unmount everything and stop the background supervisor (used by the
+    /// uninstaller and updates, which must replace hf-mount.exe).
+    #[command(hide = true)]
+    Shutdown {
+        /// Seconds to wait for the supervisor to finish uploads and exit.
+        #[arg(long, default_value_t = 600)]
+        wait_secs: u64,
+    },
 }
 
 #[derive(Args)]
@@ -282,6 +290,7 @@ pub fn main() -> i32 {
         Command::Drives => drives_cmd(&out),
         Command::Activity { limit } => activity(&out, limit),
         Command::RetryUploads { target } => retry_uploads(&out, &target),
+        Command::Shutdown { wait_secs } => shutdown(&out, wait_secs),
     };
     match result {
         Ok(code) => code,
@@ -894,6 +903,47 @@ fn doctor(out: &Out) -> Result<i32, ErrorInfo> {
     } else {
         ErrorCode::DriverMissing.exit_code()
     })
+}
+
+fn shutdown(out: &Out, wait_secs: u64) -> Result<i32, ErrorInfo> {
+    let identity = identity()?;
+    let name = identity.supervisor_pipe();
+    let rt = runtime();
+    let asked = rt.block_on(async {
+        match Connection::open(&name, &identity).await {
+            Ok(mut conn) => conn.call(&Request::Shutdown).await.map(|_| true),
+            Err(ConnectError::NotRunning) => Ok(false),
+            Err(e) => Err(ErrorInfo::from(e)),
+        }
+    })?;
+    if asked {
+        if !out.json {
+            eprintln!("Stopping the hf-mount supervisor (unmounting drives, finishing uploads)…");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+        while super::pipe::pipe_exists(&name) {
+            if std::time::Instant::now() > deadline {
+                return Err(ErrorInfo::new(
+                    ErrorCode::Timeout,
+                    "the supervisor is still finishing uploads; try again later",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+    if out.json {
+        out.json(json!({"ok": true, "was_running": asked}));
+    } else {
+        println!(
+            "{}",
+            if asked {
+                "Supervisor stopped."
+            } else {
+                "The supervisor was not running."
+            }
+        );
+    }
+    Ok(0)
 }
 
 fn drives_cmd(out: &Out) -> Result<i32, ErrorInfo> {

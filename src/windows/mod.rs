@@ -11,6 +11,7 @@ pub mod credman;
 pub mod drives;
 pub mod host;
 pub mod mounter;
+pub mod ops;
 pub mod pipe;
 pub mod process;
 pub mod security;
