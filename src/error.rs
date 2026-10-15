@@ -149,6 +149,38 @@ pub fn is_transient_http(err: &reqwest::Error) -> bool {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Errno for a local I/O error, as `VirtualFs` reports it. On Unix this is
+/// the OS errno itself; on Windows `raw_os_error` is a Win32 code, so it is
+/// translated from the error kind instead (unknown kinds become EIO).
+pub fn io_errno(err: &std::io::Error) -> i32 {
+    #[cfg(unix)]
+    {
+        err.raw_os_error().unwrap_or(libc::EIO)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::ErrorKind;
+        match err.kind() {
+            ErrorKind::NotFound => libc::ENOENT,
+            ErrorKind::PermissionDenied => libc::EACCES,
+            ErrorKind::AlreadyExists => libc::EEXIST,
+            ErrorKind::InvalidInput | ErrorKind::InvalidFilename => libc::EINVAL,
+            ErrorKind::StorageFull | ErrorKind::QuotaExceeded => libc::ENOSPC,
+            ErrorKind::FileTooLarge => libc::EFBIG,
+            ErrorKind::DirectoryNotEmpty => libc::ENOTEMPTY,
+            ErrorKind::NotADirectory => libc::ENOTDIR,
+            ErrorKind::IsADirectory => libc::EISDIR,
+            ErrorKind::ReadOnlyFilesystem => libc::EROFS,
+            ErrorKind::ResourceBusy => libc::EBUSY,
+            ErrorKind::TimedOut => libc::ETIMEDOUT,
+            ErrorKind::WouldBlock => libc::EAGAIN,
+            ErrorKind::Unsupported => libc::ENOTSUP,
+            ErrorKind::OutOfMemory => libc::ENOMEM,
+            _ => libc::EIO,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

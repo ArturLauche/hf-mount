@@ -1,4 +1,5 @@
 pub mod cached_xet_client;
+#[cfg(unix)]
 pub mod daemon;
 pub mod error;
 pub mod file_cache;

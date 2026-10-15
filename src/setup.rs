@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -319,7 +320,106 @@ pub struct MountSetup {
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
     pub fuse_owner_only: bool,
+    /// Source as resolved by the Hub (repo aliases expanded), for status
+    /// reporting.
+    pub source: SourceKind,
+    /// Subfolder within the source that is mounted ("" for the whole source).
+    pub path_prefix: String,
 }
+
+/// Kernel interface serving a mount. Selects the few backend-specific
+/// defaults `build` applies on top of the user's options.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Fuse,
+    Nfs,
+    /// Native Windows volume through WinFsp.
+    WinFsp,
+}
+
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Fuse => "fuse",
+            Backend::Nfs => "nfs",
+            Backend::WinFsp => "winfsp",
+        }
+    }
+
+    /// Append-only streaming writes need the open → sequential write → close
+    /// lifecycle FUSE provides. NFS has no open/close RPC, and the Windows
+    /// cache manager issues lazy, out-of-order paging writes (often after the
+    /// handle is closed, and after pre-sizing the file), so both use staging
+    /// files + async flush for writable mounts.
+    fn forces_advanced_writes(self) -> bool {
+        !matches!(self, Backend::Fuse)
+    }
+
+    /// The LRU evictor relies on FUSE `forget` / `inval_entry` to know the
+    /// kernel dropped an inode; other backends must keep every inode.
+    fn supports_inode_eviction(self) -> bool {
+        matches!(self, Backend::Fuse)
+    }
+
+    /// FUSE/NFS mount on an existing local directory; WinFsp creates the
+    /// drive letter (or directory junction) itself and requires it to be absent.
+    fn mounts_on_existing_dir(self) -> bool {
+        !matches!(self, Backend::WinFsp)
+    }
+}
+
+/// Why `try_build_with_runtime` could not set a mount up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupErrorKind {
+    /// The bucket/repo identifier or subfolder is malformed.
+    InvalidSource,
+    /// Mutually exclusive or unsupported options.
+    InvalidOptions,
+    /// The Hub rejected or failed a request (see `hub_status`).
+    Hub,
+    /// The Xet storage client could not be created.
+    Storage,
+    /// Local cache / mount point I/O failed.
+    LocalIo,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetupError {
+    pub kind: SetupErrorKind,
+    pub message: String,
+    /// HTTP status of the failing Hub request, when there was one.
+    pub hub_status: Option<u16>,
+    /// The last failure was transient (network, rate limit, 5xx).
+    pub transient: bool,
+}
+
+impl SetupError {
+    fn new(kind: SetupErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            hub_status: None,
+            transient: false,
+        }
+    }
+
+    fn hub(context: &str, err: &crate::error::Error) -> Self {
+        Self {
+            kind: SetupErrorKind::Hub,
+            message: format!("{context}: {err}"),
+            hub_status: err.status(),
+            transient: err.is_transient(),
+        }
+    }
+}
+
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SetupError {}
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
 
@@ -370,6 +470,11 @@ fn xet_env_defaults(upload_cap: &str) -> Vec<(&'static str, &str)> {
 /// Initialize tracing and xet-core env vars.
 /// No threads are spawned. Safe to fork() after this returns.
 pub fn init_tracing(daemon: bool) {
+    init_tracing_subscriber(daemon);
+    apply_xet_env_defaults();
+}
+
+fn init_tracing_subscriber(daemon: bool) {
     // Use RUST_LOG if set, otherwise default to hf_mount=info.
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::from_default_env()
@@ -384,7 +489,12 @@ pub fn init_tracing(daemon: bool) {
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).with_ansi(ansi).init();
     }
+}
 
+/// Default the xet-core tuning env vars hf-mount relies on (see
+/// `xet_env_defaults`), without overriding values the user set. Must run
+/// before any thread is spawned (it calls `set_var`).
+pub fn apply_xet_env_defaults() {
     let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
     for (k, v) in xet_env_defaults(&upload_cap) {
         // xet-runtime consults HF_XET_FIXED_UPLOAD_CONCURRENCY only when the
@@ -436,9 +546,25 @@ pub fn build_with_runtime(
     is_nfs: bool,
     runtime: tokio::runtime::Handle,
 ) -> MountSetup {
+    let backend = if is_nfs { Backend::Nfs } else { Backend::Fuse };
+    try_build_with_runtime(source, options, backend, runtime, STARTUP_RETRY_DEADLINE).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Fallible core of `build_with_runtime`, for hosts that must report a failed
+/// mount instead of exiting (the Windows mount supervisor). Transient Hub
+/// failures during startup are retried for up to `startup_deadline`.
+pub fn try_build_with_runtime(
+    source: Source,
+    options: MountOptions,
+    backend: Backend,
+    runtime: tokio::runtime::Handle,
+    startup_deadline: Duration,
+) -> Result<MountSetup, SetupError> {
+    use SetupErrorKind::*;
     let (mount_point, source_kind, path_prefix) = match source {
         Source::Bucket { bucket_id, mount_point } => {
-            let (id, prefix) = split_path_prefix(&bucket_id).unwrap_or_else(|e| panic!("invalid bucket path: {e}"));
+            let (id, prefix) = split_path_prefix(&bucket_id)
+                .map_err(|e| SetupError::new(InvalidSource, format!("invalid bucket path: {e}")))?;
             (
                 mount_point,
                 SourceKind::Bucket {
@@ -453,7 +579,8 @@ pub fn build_with_runtime(
             revision,
         } => {
             let (repo_type, rest) = parse_repo_id(&repo_id);
-            let (id, prefix) = split_path_prefix(&rest).unwrap_or_else(|e| panic!("invalid repo path: {e}"));
+            let (id, prefix) = split_path_prefix(&rest)
+                .map_err(|e| SetupError::new(InvalidSource, format!("invalid repo path: {e}")))?;
             (
                 mount_point,
                 SourceKind::Repo {
@@ -466,26 +593,34 @@ pub fn build_with_runtime(
         }
     };
 
-    let backend = if is_nfs { "nfs" } else { "fuse" };
-    let hub_client = runtime.block_on(async {
-        retry_startup("Hub client init", || {
-            HubApiClient::from_source(
-                &options.hub_endpoint,
-                options.hf_token.as_deref(),
-                options.token_file.clone(),
-                source_kind.clone(),
-                path_prefix.clone(),
-                backend,
-            )
+    if options.overlay && !backend.mounts_on_existing_dir() {
+        return Err(SetupError::new(
+            InvalidOptions,
+            "--overlay is not supported by the Windows (WinFsp) backend",
+        ));
+    }
+
+    let hub_client = runtime
+        .block_on(async {
+            retry_startup("Hub client init", startup_deadline, || {
+                HubApiClient::from_source(
+                    &options.hub_endpoint,
+                    options.hf_token.as_deref(),
+                    options.token_file.clone(),
+                    source_kind.clone(),
+                    path_prefix.clone(),
+                    backend.name(),
+                )
+            })
+            .await
         })
-        .await
-        .unwrap_or_else(|e| panic!("Failed to initialize Hub client: {e}"))
-    });
+        .map_err(|e| SetupError::hub("Failed to initialize Hub client", &e))?;
 
     if options.overlay && options.read_only {
-        panic!(
-            "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead."
-        );
+        return Err(SetupError::new(
+            InvalidOptions,
+            "--overlay with --read-only is pointless: overlay enables local writes, --read-only disables them. Use --read-only alone instead.",
+        ));
     }
 
     let read_only = (options.read_only || hub_client.is_repo()) && !options.overlay;
@@ -511,7 +646,8 @@ pub fn build_with_runtime(
     // Overlay: local writes allowed, but no remote write token/upload.
     let remote_read_only = read_only || options.overlay;
     let refresher = hub_client.token_refresher(remote_read_only);
-    let xet_ctx = XetContext::default().expect("Failed to create XetContext");
+    let xet_ctx =
+        XetContext::default().map_err(|e| SetupError::new(Storage, format!("Failed to create XetContext: {e:?}")))?;
     // The memory ceiling of the write path depends on the upload-concurrency
     // cap set via env in `apply_xet_env_defaults`. The env names are owned by
     // xet-core: if one is ever renamed upstream, the cap silently stops
@@ -525,11 +661,15 @@ pub fn build_with_runtime(
             xet_ctx.config.client.ac_max_upload_concurrency
         );
     }
-    let cas_config = build_cas_config(&xet_ctx, &runtime, &refresher);
+    let cas_config = build_cas_config(&xet_ctx, &runtime, &refresher, startup_deadline)?;
 
     // Ensure cache directory exists and is writable (needed for staging even without chunk cache).
-    std::fs::create_dir_all(&options.cache_dir)
-        .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", options.cache_dir));
+    std::fs::create_dir_all(&options.cache_dir).map_err(|e| {
+        SetupError::new(
+            LocalIo,
+            format!("Failed to create cache dir {:?}: {e}", options.cache_dir),
+        )
+    })?;
 
     // The chunk cache and the whole-file cache are mutually exclusive: when
     // `cache_mode=file` we explicitly disable xet-core's chunk_cache so we
@@ -541,7 +681,10 @@ pub fn build_with_runtime(
         );
     }
     let file_cache = if options.cache_mode == CacheMode::File && !options.no_disk_cache {
-        Some(FileCache::new(&options.cache_dir, options.cache_size).expect("Failed to create file cache"))
+        Some(
+            FileCache::new(&options.cache_dir, options.cache_size)
+                .map_err(|e| SetupError::new(LocalIo, format!("Failed to create file cache: {e:?}")))?,
+        )
     } else {
         None
     };
@@ -551,12 +694,15 @@ pub fn build_with_runtime(
     } else {
         let xorbs_dir = options.cache_dir.join("xorbs");
         std::fs::create_dir_all(&xorbs_dir)
-            .unwrap_or_else(|e| panic!("Failed to create xorbs dir {:?}: {e}", xorbs_dir));
+            .map_err(|e| SetupError::new(LocalIo, format!("Failed to create xorbs dir {:?}: {e}", xorbs_dir)))?;
         let config = CacheConfig {
             cache_directory: xorbs_dir,
             cache_size: options.cache_size,
         };
-        Some(get_cache(&xet_ctx.config, &config).expect("Failed to create chunk cache"))
+        Some(
+            get_cache(&xet_ctx.config, &config)
+                .map_err(|e| SetupError::new(LocalIo, format!("Failed to create chunk cache: {e:?}")))?,
+        )
     };
 
     let raw_client = runtime
@@ -565,13 +711,14 @@ pub fn build_with_runtime(
             &uuid::Uuid::new_v4().to_string(),
             false,
         ))
-        .expect("Failed to create storage client");
+        .map_err(|e| SetupError::new(Storage, format!("Failed to create storage client: {e:?}")))?;
     let cached_client = CachedXetClient::new(raw_client);
     let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if remote_read_only { None } else { Some(cas_config) };
     let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
 
-    let advanced_writes = options.advanced_writes || options.overlay || (is_nfs && !read_only);
+    let advanced_writes =
+        options.advanced_writes || options.overlay || (backend.forces_advanced_writes() && !read_only);
 
     // A previous FUSE daemon may have died (OOM kill, crash) leaving a dead
     // mount at the mount point: every stat() on it returns ENOTCONN, which
@@ -579,18 +726,27 @@ pub fn build_with_runtime(
     // mount itself, crash-looping the restarted container until someone
     // cleans the corpse up. Detach it so a fresh session can mount over a
     // clean path. Must run before the overlay pre-mount fd is opened.
-    detach_dead_mount(&mount_point);
+    #[cfg(unix)]
+    if backend.mounts_on_existing_dir() {
+        detach_dead_mount(&mount_point);
+    }
 
     // Overlay: open a pre-mount fd to the mount point directory. The fd is
     // held by OverlayBacking so overlay-local filesystem ops can stay rooted
     // at the covered directory after mount.
     let overlay_fd = if options.overlay {
-        std::fs::create_dir_all(&mount_point)
-            .unwrap_or_else(|e| panic!("Failed to create mount point {:?} for overlay: {e}", mount_point));
-        Some(
-            std::fs::File::open(&mount_point)
-                .unwrap_or_else(|e| panic!("Failed to open mount point {:?} for overlay: {e}", mount_point)),
-        )
+        std::fs::create_dir_all(&mount_point).map_err(|e| {
+            SetupError::new(
+                LocalIo,
+                format!("Failed to create mount point {:?} for overlay: {e}", mount_point),
+            )
+        })?;
+        Some(std::fs::File::open(&mount_point).map_err(|e| {
+            SetupError::new(
+                LocalIo,
+                format!("Failed to open mount point {:?} for overlay: {e}", mount_point),
+            )
+        })?)
     } else {
         None
     };
@@ -605,22 +761,26 @@ pub fn build_with_runtime(
         None
     };
 
-    let uid = options.uid.unwrap_or_else(|| unsafe { libc::getuid() });
-    let gid = options.gid.unwrap_or_else(|| unsafe { libc::getgid() });
+    let uid = options.uid.unwrap_or_else(current_uid);
+    let gid = options.gid.unwrap_or_else(current_gid);
 
     // Ignore EEXIST: the directory may already exist from a previous (possibly
     // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
-    if let Err(e) = std::fs::create_dir_all(&mount_point)
+    if backend.mounts_on_existing_dir()
+        && let Err(e) = std::fs::create_dir_all(&mount_point)
         && e.raw_os_error() != Some(libc::EEXIST)
     {
-        panic!("Failed to create mount point {:?}: {e}", mount_point);
+        return Err(SetupError::new(
+            LocalIo,
+            format!("Failed to create mount point {:?}: {e}", mount_point),
+        ));
     }
 
-    if is_nfs && options.direct_io {
-        info!("--direct-io is ignored for NFS mounts (no NFS equivalent)");
+    if backend != Backend::Fuse && options.direct_io {
+        info!("--direct-io is ignored for {} mounts", backend.name());
     }
 
-    let backend_name = if is_nfs { "nfs" } else { "fuse" };
+    let backend_name = backend.name();
     let subfolder_info = if hub_client.path_prefix().is_empty() {
         String::new()
     } else {
@@ -673,6 +833,8 @@ pub fn build_with_runtime(
     );
 
     let metadata_ttl = std::time::Duration::from_millis(options.metadata_ttl_ms);
+    let hub_client_source = hub_client.source().clone();
+    let resolved_prefix = hub_client.path_prefix().to_string();
 
     let virtual_fs = VirtualFs::new(
         runtime.clone(),
@@ -695,7 +857,7 @@ pub fn build_with_runtime(
             negative_ttl: std::time::Duration::from_millis(options.negative_ttl_ms),
             serve_lookup_from_cache: !options.metadata_ttl_minimal,
             filter_os_files: !options.no_filter_os_files,
-            direct_io: options.direct_io && !is_nfs,
+            direct_io: options.direct_io && backend == Backend::Fuse,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
             flush_shutdown_timeout: std::time::Duration::from_millis(options.flush_shutdown_timeout_ms),
@@ -704,12 +866,17 @@ pub fn build_with_runtime(
             // inode the client still holds would surface as NFS3ERR_STALE on
             // its next RPC. The eviction safety hooks (forget / inval_entry)
             // only exist on the FUSE side, so force the limit off here.
-            inode_soft_limit: if is_nfs { 0 } else { options.inode_soft_limit },
+            inode_soft_limit: if backend.supports_inode_eviction() {
+                options.inode_soft_limit
+            } else {
+                0
+            },
             lru_sweep_interval: std::time::Duration::from_millis(options.lru_sweep_interval_ms),
         },
     );
 
-    MountSetup {
+    let resolved_source = hub_client_source;
+    Ok(MountSetup {
         runtime,
         _owned_runtime: None,
         virtual_fs,
@@ -721,7 +888,31 @@ pub fn build_with_runtime(
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
         fuse_owner_only: options.fuse_owner_only,
-    }
+        source: resolved_source,
+        path_prefix: resolved_prefix,
+    })
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(unix)]
+fn current_gid() -> u32 {
+    unsafe { libc::getgid() }
+}
+
+/// Windows has no POSIX ids; the WinFsp adapter reports ownership through a
+/// security descriptor instead.
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
+#[cfg(not(unix))]
+fn current_gid() -> u32 {
+    0
 }
 
 // ── Combined entry point (foreground binaries) ──────────────────────
@@ -735,8 +926,13 @@ pub fn setup(is_nfs: bool) -> MountSetup {
     build(args.source, args.options, is_nfs)
 }
 
+/// No per-process descriptor limit to raise on this platform.
+#[cfg(not(unix))]
+pub fn raise_fd_limit() {}
+
 /// Try to raise the soft file descriptor limit to avoid "Too many open files"
 /// errors during large batch operations. Most FUSE/NFS filesystems do this.
+#[cfg(unix)]
 pub fn raise_fd_limit() {
     const TARGET_NOFILE: u64 = 65536;
     let mut rlim = libc::rlimit {
@@ -758,6 +954,7 @@ pub fn raise_fd_limit() {
 /// ENOTCONN or EIO (the "corrupted mount" errnos k8s mount-utils also keys
 /// on). Detaching is safe for consumers: bind mounts made from this path
 /// reference the superblock directly and keep working.
+#[cfg(unix)]
 fn detach_dead_mount(path: &Path) {
     let Err(e) = std::fs::metadata(path) else { return };
     if !matches!(e.raw_os_error(), Some(libc::ENOTCONN) | Some(libc::EIO)) {
@@ -808,7 +1005,7 @@ fn hf_mount_mounted_at(path: &Path) -> bool {
 /// ancestor is a symlink. The mount point itself stats with an error, so
 /// only its parent is canonicalized. `None` (fail closed) when the last
 /// component is not a plain name or the parent cannot be resolved.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn resolve_mount_path(path: &Path) -> Option<PathBuf> {
     let absolute: PathBuf = std::path::absolute(path).ok()?.components().collect();
     let name = absolute.file_name()?;
@@ -818,7 +1015,7 @@ fn resolve_mount_path(path: &Path) -> Option<PathBuf> {
 
 /// No mount table to consult off Linux: fail closed (the dead-mount recovery
 /// is a Kubernetes concern; macOS is a development platform).
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn hf_mount_mounted_at(_path: &Path) -> bool {
     false
 }
@@ -874,7 +1071,7 @@ fn mountinfo_has_hf_mount(mountinfo: &str, target: &Path) -> bool {
 /// so the startup retries don't feed the storm they are waiting out.
 const STARTUP_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 
-async fn retry_startup<T, Fut>(what: &str, attempt: impl Fn() -> Fut) -> crate::error::Result<T>
+async fn retry_startup<T, Fut>(what: &str, deadline: Duration, attempt: impl Fn() -> Fut) -> crate::error::Result<T>
 where
     Fut: std::future::Future<Output = crate::error::Result<T>>,
 {
@@ -883,10 +1080,10 @@ where
     loop {
         // An attempt is itself several requests with internal retries; bound
         // it too, or the last one can overrun the deadline by minutes.
-        let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+        let remaining = deadline.saturating_sub(start.elapsed());
         let Ok(result) = tokio::time::timeout(remaining, attempt()).await else {
             return Err(crate::error::Error::hub(format!(
-                "{what}: still failing after {STARTUP_RETRY_DEADLINE:?} of transient errors"
+                "{what}: still failing after {deadline:?} of transient errors"
             )));
         };
         let e = match result {
@@ -903,7 +1100,7 @@ where
             .retry_after()
             .unwrap_or_else(|| crate::hub_api::retry_delay(attempt_no))
             .min(crate::hub_api::MAX_RETRY_DELAY);
-        let remaining = STARTUP_RETRY_DEADLINE.saturating_sub(start.elapsed());
+        let remaining = deadline.saturating_sub(start.elapsed());
         if delay >= remaining {
             return Err(e);
         }
@@ -916,25 +1113,33 @@ fn build_cas_config(
     ctx: &XetContext,
     runtime: &tokio::runtime::Handle,
     refresher: &Arc<HubTokenRefresher>,
-) -> Arc<TranslatorConfig> {
+    startup_deadline: Duration,
+) -> Result<Arc<TranslatorConfig>, SetupError> {
     let jwt = runtime
-        .block_on(retry_startup("storage token", || refresher.fetch_initial()))
-        .unwrap_or_else(|e| panic!("Failed to get storage token: {e}"));
+        .block_on(retry_startup("storage token", startup_deadline, || {
+            refresher.fetch_initial()
+        }))
+        .map_err(|e| SetupError::hub("Failed to get storage token", &e))?;
     info!("Got storage token for endpoint: {}", jwt.cas_url);
-    Arc::new(
-        default_config(
-            ctx,
-            jwt.cas_url,
-            Some((jwt.access_token, jwt.exp)),
-            Some(refresher.clone()),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("Failed to build TranslatorConfig: {e}")),
+    let config = default_config(
+        ctx,
+        jwt.cas_url,
+        Some((jwt.access_token, jwt.exp)),
+        Some(refresher.clone()),
+        None,
     )
+    .map_err(|e| {
+        SetupError::new(
+            SetupErrorKind::Storage,
+            format!("Failed to build TranslatorConfig: {e}"),
+        )
+    })?;
+    Ok(Arc::new(config))
 }
 
 /// Trigger FUSE unmount. Returns `true` on success. Uses libc as primary
 /// method (no external process dependency), then falls back to fusermount/umount.
+#[cfg(unix)]
 pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
     use std::ffi::CString;
 
@@ -1021,6 +1226,7 @@ mod tests {
         assert!(mountinfo_has_hf_mount(mountinfo, Path::new("/mnt/covered")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_mount_path_follows_ancestor_symlinks_like_the_kernel() {
         let tmp = tempfile::tempdir().unwrap();
