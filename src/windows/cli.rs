@@ -401,11 +401,10 @@ fn start(out: &Out, args: StartArgs) -> Result<i32, ErrorInfo> {
             host::ForegroundEvent::Failed(Response::Error { error }) => {
                 Out { json }.fail(error);
             }
-            host::ForegroundEvent::Stopping(reason) => {
-                if !json {
-                    eprintln!("Unmounting ({reason}); waiting for pending uploads…");
-                }
+            host::ForegroundEvent::Stopping(reason) if !json => {
+                eprintln!("Unmounting ({reason}); waiting for pending uploads…");
             }
+            host::ForegroundEvent::Stopping(_) => {}
             host::ForegroundEvent::Stopped(reports) => {
                 if json {
                     println!("{}", json!({"ok": true, "event": "unmounted", "reports": reports}));

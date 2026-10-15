@@ -25,6 +25,7 @@ jobs:
   linux:
     name: Linux lint & unit tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -57,6 +58,7 @@ jobs:
   windows:
     name: Windows build, tests & WinFsp mount tests
     runs-on: windows-2025
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -82,6 +84,7 @@ jobs:
         run: ./scripts/windows/install-winfsp.ps1 -Quiet
 
       - name: WinFsp drive-letter integration tests
+        timeout-minutes: 20
         if: ${{ !cancelled() }}
         run: cargo test --lib -- --ignored --test-threads=1 windows::mount_tests
 
@@ -90,6 +93,7 @@ jobs:
         run: cargo build --release --bin hf-mount
 
       - name: CLI smoke tests (argument handling and exit codes)
+        timeout-minutes: 5
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
@@ -113,6 +117,7 @@ jobs:
           if ($LASTEXITCODE -ne 4 -and $LASTEXITCODE -ne 5) { throw "missing repo exited $LASTEXITCODE" }
 
       - name: Live end-to-end mount of a public repository
+        timeout-minutes: 20
         if: ${{ !cancelled() }}
         shell: pwsh
         run: ./scripts/windows/smoke-test.ps1 -Exe target/release/hf-mount.exe

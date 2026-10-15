@@ -189,21 +189,21 @@ fn repo_enumerates_and_reads_exact_bytes() {
     for name in ["README.md", "config.json", "data"] {
         assert!(cmd.lines().any(|l| l.trim() == name), "cmd dir missing {name}: {cmd}");
     }
-    let ps = shell(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "(Get-FileHash -Algorithm SHA256 -LiteralPath '{}').Hash",
-                t.path("README.md").display()
-            ),
-        ],
-    );
-    assert_eq!(ps.trim(), sha256_hex(b"# hf-mount\nhello from the Hub\n"));
+    // ...and read it: certutil (in System32 on every Windows) hashes the file
+    // through its own handle. Its output is "SHA256 hash of <path>:", the hex
+    // digest, then a status line.
+    let readme = t.path("README.md");
+    let certutil = shell("certutil", &["-hashfile", &readme.display().to_string(), "SHA256"]);
+    let digest = certutil
+        .lines()
+        .nth(1)
+        .unwrap_or_default()
+        .replace(' ', "")
+        .to_ascii_uppercase();
+    assert_eq!(digest, sha256_hex(b"# hf-mount\nhello from the Hub\n"), "certutil said: {certutil}");
 }
 
-/// Minimal SHA-256 for the PowerShell cross-check (avoids a dev-dependency).
+/// Minimal SHA-256 for the cross-process check (avoids a dev-dependency).
 fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98,
