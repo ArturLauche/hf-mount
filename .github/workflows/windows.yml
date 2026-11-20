@@ -16,8 +16,10 @@ on:
   workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  # Use the PR merge ref (unique across forks) or the pushed branch. A tag or
+  # manual run gets its own group, and a caller has a different workflow ref.
+  group: windows-build-${{ github.workflow_ref }}-${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch')) && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch') }}
 
 permissions:
   contents: read
@@ -32,12 +34,16 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || github.event_name == 'workflow_dispatch' }}
 
       - name: Install system deps
         run: |
@@ -48,37 +54,46 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy (no features)
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked -- -D warnings
 
       - name: Clippy (FUSE + NFS)
-        run: cargo clippy --features fuse,nfs -- -D warnings
+        run: cargo clippy --locked --features fuse,nfs -- -D warnings
 
       - name: Clippy (lib tests)
-        run: cargo clippy --lib --profile test -- -D warnings
+        run: cargo clippy --locked --lib --profile test -- -D warnings
 
       - name: Unit tests
-        run: cargo test --lib --features fuse,nfs
+        run: cargo test --locked --lib --features fuse,nfs
 
   windows:
     name: Windows build, tests & WinFsp mount tests
     runs-on: windows-2025
     timeout-minutes: 90
+    env:
+      # Keep file/line information for test failures with smaller debug artifacts.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || github.event_name == 'workflow_dispatch' }}
 
       - name: Clippy (lib + lib tests)
         run: |
-          cargo clippy --lib -- -D warnings
-          cargo clippy --lib --profile test -- -D warnings
+          cargo clippy --locked --lib -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --lib --profile test -- -D warnings
 
       - name: Unit tests
-        run: cargo test --lib
+        run: cargo test --locked --lib
 
       # The mount tests run even when an earlier test step failed, so every
       # run reports both; the job still fails if any step failed.
@@ -90,24 +105,65 @@ jobs:
       - name: WinFsp drive-letter integration tests
         timeout-minutes: 20
         if: ${{ !cancelled() }}
-        run: cargo test --lib -- --ignored --test-threads=1 windows::mount_tests
+        run: cargo test --locked --lib -- --ignored --test-threads=1 windows::mount_tests
+
+      - name: Upload WinFsp test logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-logs-windows-tests
+          path: ~\AppData\Local\hf-mount\logs
+          if-no-files-found: ignore
+
+  cli:
+    name: Windows portable CLI and smoke tests
+    runs-on: windows-2025
+    timeout-minutes: 45
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        id: rust-cache
+        with:
+          cache-bin: false
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || github.event_name == 'workflow_dispatch' }}
 
       - name: Build release CLI
-        if: ${{ !cancelled() }}
-        run: cargo build --release --bin hf-mount
+        id: build
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          $timer = [Diagnostics.Stopwatch]::StartNew()
+          cargo build --locked --release --bin hf-mount
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-Item target/release/hf-mount.exe
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe.FullName).Hash
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "### Windows CLI" >> $env:GITHUB_STEP_SUMMARY
+          "- Cargo build: $($timer.Elapsed.ToString('mm\:ss')) (exact Rust cache hit: $env:CACHE_HIT)" >> $env:GITHUB_STEP_SUMMARY
+          "- hf-mount.exe: $($exe.Length) bytes, SHA-256 $hash" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Package portable CLI
-        if: ${{ !cancelled() }}
-        shell: pwsh
         run: ./scripts/windows/package-cli.ps1 -Exe target/release/hf-mount.exe -OutDir dist
 
       - name: Upload portable CLI
-        if: ${{ !cancelled() }}
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hf-mount-cli-windows-x64
           path: dist/*.zip
+          compression-level: 0
           if-no-files-found: error
+
+      - name: Install WinFsp (pinned, SHA-256 verified)
+        run: ./scripts/windows/install-winfsp.ps1 -Quiet
 
       - name: CLI smoke tests (argument handling and exit codes)
         timeout-minutes: 5
@@ -158,6 +214,8 @@ jobs:
         working-directory: desktop
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -172,26 +230,30 @@ jobs:
         run: npm run lint
       - name: Unit and component tests
         run: npm test
-      - name: Production build
-        run: npm run build
 
-  desktop:
-    name: Desktop app installers (NSIS + MSI)
+  desktop-build:
+    name: Compile Windows desktop app
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 60
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        id: rust-cache
         with:
-          workspaces: |
-            . -> target
-            desktop/src-tauri -> target
-          key: desktop
+          workspaces: desktop/src-tauri -> target
+          cache-bin: false
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || github.event_name == 'workflow_dispatch' }}
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -203,19 +265,10 @@ jobs:
         working-directory: desktop
         run: npm ci
 
-      - name: Build hf-mount.exe (bundled next to the app)
-        shell: pwsh
-        run: |
-          cargo build --release --bin hf-mount
-          New-Item -ItemType Directory -Force desktop/src-tauri/binaries | Out-Null
-          Copy-Item target/release/hf-mount.exe desktop/src-tauri/binaries/hf-mount-x86_64-pc-windows-msvc.exe
-
       - name: Fetch the official WinFsp installer (SHA-256 verified, unmodified)
-        shell: pwsh
         run: ./scripts/windows/install-winfsp.ps1 -DownloadTo desktop/src-tauri/resources/winfsp
 
       - name: License lists for the installer (Rust crates, npm packages)
-        shell: pwsh
         run: >
           ./scripts/windows/dependency-licenses.ps1
           -Manifest desktop/src-tauri/Cargo.toml
@@ -224,20 +277,104 @@ jobs:
 
       - name: Clippy (desktop app)
         working-directory: desktop
-        shell: pwsh
         run: |
-          npm run build
+          $env:TAURI_CONFIG = Get-Content src-tauri/tauri.ci-build.conf.json -Raw
           cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
 
-      - name: Build installers
+      # Tauri's beforeBuildCommand builds the production UI once. The CI override
+      # defers adding the CLI sidecar until bundling, so the two Rust builds overlap.
+      - name: Build Tauri app and production UI
         working-directory: desktop
-        run: npx tauri build --ci --config src-tauri/tauri.release.conf.json
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          $timer = [Diagnostics.Stopwatch]::StartNew()
+          npm run tauri -- build --ci --no-bundle --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.ci-build.conf.json -- --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-Item src-tauri/target/release/hf-mount-desktop.exe
+          "### Windows desktop build" >> $env:GITHUB_STEP_SUMMARY
+          "- Tauri build including frontend: $($timer.Elapsed.ToString('mm\:ss')) (exact Rust cache hit: $env:CACHE_HIT)" >> $env:GITHUB_STEP_SUMMARY
+          "- hf-mount-desktop.exe: $($exe.Length) bytes" >> $env:GITHUB_STEP_SUMMARY
+
+      # Transfer only the app, generated resources and lockfile-installed Tauri
+      # CLI. The packaging runner needs neither a second npm install nor Cargo's target cache.
+      - name: Upload desktop build inputs
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-mount-desktop-build-inputs
+          path: |
+            desktop/src-tauri/target/release/hf-mount-desktop.exe
+            desktop/src-tauri/resources/licenses/
+            desktop/src-tauri/resources/winfsp/
+            desktop/node_modules/@tauri-apps/cli/
+            desktop/node_modules/@tauri-apps/cli-win32-x64-msvc/
+          retention-days: 3
+          if-no-files-found: error
+
+  desktop:
+    name: Desktop app installers (NSIS + MSI)
+    needs: [cli, desktop-build]
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The bundler uses cargo metadata to locate the build output.
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Download desktop build inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.desktop-build.outputs.artifact-id }}
+          path: desktop
+
+      - name: Download portable CLI
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.cli.outputs.artifact-id }}
+          path: cli
+
+      - name: Stage the verified CLI sidecar
+        env:
+          CLI_SHA256: ${{ needs.cli.outputs.sha256 }}
+        run: |
+          $zip = Get-ChildItem cli/*.zip | Select-Object -First 1
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath cli/unpacked
+          $exe = 'cli/unpacked/hf-mount.exe'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash -ne $env:CLI_SHA256) {
+            throw 'Portable CLI does not match the executable built and tested in this run'
+          }
+          New-Item -ItemType Directory -Force desktop/src-tauri/binaries | Out-Null
+          Copy-Item -LiteralPath $exe -Destination desktop/src-tauri/binaries/hf-mount-x86_64-pc-windows-msvc.exe
+
+      - name: Bundle NSIS and MSI installers
+        working-directory: desktop
+        run: |
+          $timer = [Diagnostics.Stopwatch]::StartNew()
+          node node_modules/@tauri-apps/cli/tauri.js bundle --ci --config src-tauri/tauri.release.conf.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $nsis = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe)
+          $msi = @(Get-ChildItem src-tauri/target/release/bundle/msi/*.msi)
+          if ($nsis.Count -ne 1 -or $msi.Count -ne 1) { throw 'Expected exactly one NSIS and one MSI installer' }
+          "### Windows installer packaging" >> $env:GITHUB_STEP_SUMMARY
+          "- Tauri bundle: $($timer.Elapsed.ToString('mm\:ss'))" >> $env:GITHUB_STEP_SUMMARY
+          "- NSIS: $($nsis[0].Length) bytes" >> $env:GITHUB_STEP_SUMMARY
+          "- MSI: $($msi[0].Length) bytes" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Install, start and uninstall the app
-        shell: pwsh
+        env:
+          CLI_SHA256: ${{ needs.cli.outputs.sha256 }}
         run: |
-          $setup = Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
-          ./scripts/windows/desktop-install-test.ps1 -Installer $setup.FullName
+          $setup = Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          ./scripts/windows/desktop-install-test.ps1 -Installer $setup.FullName -CliSha256 $env:CLI_SHA256
 
       - name: Upload installers
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -246,6 +383,7 @@ jobs:
           path: |
             desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
             desktop/src-tauri/target/release/bundle/msi/*.msi
+          compression-level: 0
           if-no-files-found: error
 
       - name: Upload app logs
@@ -266,15 +404,17 @@ jobs:
       ${{ (vars.HF_MOUNT_TEST_BUCKET != '' || vars.HF_MOUNT_TEST_PRIVATE_REPO != '')
       && (github.event_name != 'pull_request'
       || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: windows
+    needs: [windows, cli]
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: hf-mount-cli-windows-x64
+          artifact-ids: ${{ needs.cli.outputs.artifact-id }}
           path: cli
 
       - name: Unpack CLI and install WinFsp
