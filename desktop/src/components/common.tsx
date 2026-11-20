@@ -1,16 +1,10 @@
 import { AlertTriangle, Info, XCircle } from "lucide-react";
 import type { ReactNode } from "react";
+import logoUrl from "../../icon-src/icon.svg";
 import { cn } from "./ui/primitives";
 
-/** The app mark: a drive with an activity light. Monochrome, follows the theme. */
 export function Logo({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 24 24" className={cn("size-6", className)} aria-hidden fill="none">
-      <rect x="2.5" y="6" width="19" height="12" rx="4" className="fill-accent" />
-      <circle cx="17" cy="12" r="1.6" className="fill-accent-fg" />
-      <rect x="6" y="11" width="6.5" height="2" rx="1" className="fill-accent-fg" opacity="0.55" />
-    </svg>
-  );
+  return <img src={logoUrl} alt="" width={24} height={24} className={cn("size-6", className)} />;
 }
 
 export function PageHeader({ title, description, actions }: { title: string; description?: ReactNode; actions?: ReactNode }) {
