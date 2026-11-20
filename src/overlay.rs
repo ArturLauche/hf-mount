@@ -103,16 +103,11 @@ impl OverlayBacking {
             ));
         }
         #[cfg(unix)]
-        {
-            self.dir.set_permissions(target, Permissions::from_mode(mode as u32))
-        }
+        return self.dir.set_permissions(target, Permissions::from_mode(mode as u32));
         #[cfg(not(unix))]
         {
             let _ = mode;
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "overlay chmod is not supported on this platform",
-            ))
+            Ok(())
         }
     }
 
@@ -169,7 +164,7 @@ impl OverlayBacking {
                 #[allow(clippy::unnecessary_cast)]
                 mode: (meta.permissions().mode() & 0o777) as u16,
                 #[cfg(not(unix))]
-                mode: if meta.permissions().readonly() { 0o444 } else { 0o644 },
+                mode: if meta.permissions().readonly() { 0o555 } else { 0o755 },
             });
         }
         Ok(out)

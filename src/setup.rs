@@ -17,6 +17,7 @@ use crate::file_cache::FileCache;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::overlay::OverlayBacking;
 use crate::virtual_fs::{VfsConfig, VirtualFs};
+use crate::window_plans::{WindowPlans, WindowPlansMode};
 use crate::xet::{StagingDir, XetSessions};
 
 /// Name hf-mount registers its FUSE mounts under (fuser `FSName`, i.e. the
@@ -229,22 +230,44 @@ pub struct MountOptions {
     #[arg(long, default_value_t = 16)]
     pub max_threads: usize,
 
-    /// Maximum time (ms) a single remote chunk fetch may stall before the read
-    /// is failed with EIO. Each FUSE `read()` blocks a worker thread on a
-    /// synchronous CAS/CDN fetch; without a ceiling, a stalled fetch (e.g. a
-    /// client-aborted media seek, a hung CDN connection) parks that thread
-    /// forever. After enough stalled reads accumulate, all `max_threads`
-    /// workers are wedged and the whole mount silently stops serving cold
-    /// reads. Bounding the per-chunk wait frees the thread (and cancels the
-    /// in-flight request by dropping the stream) so the mount stays alive.
+    /// Maximum time (ms) a remote fetch may wait for its next chunk of data.
+    /// A fetch that stalls longer (e.g. on a hung CDN connection) is cancelled
+    /// and retried, and after its last attempt the reads that wait for its
+    /// data fail with EIO instead of hanging forever. While other fetches of
+    /// the mount receive data, a fetch waits in line up to four times longer.
     /// 0 disables the timeout (legacy unbounded behaviour).
     #[arg(long, default_value_t = 30_000)]
     pub read_fetch_timeout_ms: u64,
+
+    /// Memory for read-ahead, shared by the files open on the mount, in MiB.
+    /// Files read at once split it, and one file holds at most 512 MiB of
+    /// it. Lower it where the daemon has a tight memory limit (with
+    /// HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT, which bounds the download
+    /// buffers of xet-core).
+    #[arg(long, default_value_t = 1024)]
+    pub read_ahead_mb: u64,
+
+    /// Reconstruction plans from one CAS request per GiB of a file read, instead
+    /// of three per 32 MiB fetch: hf-mount asks for the plan and the chunk layout
+    /// of a 1 GiB window and derives the plans inside it. `check` derives them,
+    /// compares them with the plans CAS returns, logs any difference, and uses
+    /// the CAS plans. Plans stay exact when CAS does not serve chunk layouts.
+    #[arg(long, value_enum, default_value_t = WindowPlansMode::Off)]
+    pub window_plans: WindowPlansMode,
 
     /// Flush debounce delay in milliseconds. After the first dirty file is
     /// enqueued, the flush batch waits this long for more writes before firing.
     #[arg(long, default_value_t = 2_000)]
     pub flush_debounce_ms: u64,
+
+    /// Advanced writes: also flush open dirty files every N milliseconds, so
+    /// a long-lived writer (a training log, an incrementally written
+    /// checkpoint) publishes without closing the file. Each cycle re-uploads
+    /// the whole staging file (CAS dedup keeps the network cost to the new
+    /// chunks) and may publish a partially written file. 0 disables (flush
+    /// on close/fsync only).
+    #[arg(long, default_value_t = 0)]
+    pub flush_interval_ms: u64,
 
     /// Maximum flush batch window in milliseconds. A dirty file will be flushed
     /// within this time regardless of ongoing writes resetting the debounce.
@@ -437,18 +460,33 @@ fn user_fixed_upload_concurrency() -> bool {
     std::env::var("HF_XET_FIXED_UPLOAD_CONCURRENCY").is_ok()
 }
 
+/// Whether the default for `key` must stay unset because the user pinned a
+/// fixed concurrency (`is_set` tells which variables are set). xet-runtime
+/// consults the HF_XET_FIXED_* aliases only when the canonical AC variables
+/// are absent: defaulting the canonical names would silently turn a fixed
+/// concurrency into an adaptive one.
+fn defers_to_fixed_concurrency(key: &str, is_set: impl Fn(&str) -> bool) -> bool {
+    (key.contains("UPLOAD_CONCURRENCY") && is_set("HF_XET_FIXED_UPLOAD_CONCURRENCY"))
+        || (key.contains("DOWNLOAD_CONCURRENCY") && is_set("HF_XET_FIXED_DOWNLOAD_CONCURRENCY"))
+}
+
 /// xet-core settings tuned for interactive FUSE reads (not batch downloads),
 /// applied as env defaults by `init_tracing`. xet-core ignores a value it
 /// cannot parse, so durations need a unit (`30s`, not `30`).
 fn xet_env_defaults(upload_cap: &str) -> Vec<(&'static str, &str)> {
     vec![
         ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "16"),
+        // Let the adaptive controller scale far enough to saturate fast links
+        // under many concurrent readers (xet-core's default cap is 64).
+        ("HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY", "124"),
         ("HF_XET_CLIENT_AC_MIN_BYTES_REQUIRED_FOR_ADJUSTMENT", "4194304"),
         ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "8388608"),
         ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "8388608"),
         ("HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME", "30s"),
         ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "134217728"),
-        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "268435456"),
+        // Downloads in flight across the mount. One fast remote reader alone
+        // keeps up to 256 MiB in flight (virtual_fs/remote_reader.rs).
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "1073741824"),
         // Per-read inactivity timeout for CAS/CDN transfers (resets on every byte
         // received, so slow-but-progressing reads are fine). This governs the
         // DOWNLOAD/reconstruction path (term fetches and whole-file downloads);
@@ -464,6 +502,10 @@ fn xet_env_defaults(upload_cap: &str) -> Vec<(&'static str, &str)> {
         ("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY", upload_cap),
         // Larger ingestion blocks = fewer CDC calls
         ("HF_XET_DATA_INGESTION_BLOCK_SIZE", "16777216"),
+        // Upload sessions await their terminal telemetry document (up to 2 s
+        // by default) in finalize(), which a synchronous close() would pay on
+        // every write. Send it detached instead: the daemon outlives the POST.
+        ("HF_XET_TELEMETRY_FINAL_FLUSH_TIMEOUT", "0s"),
     ]
 }
 
@@ -497,10 +539,7 @@ fn init_tracing_subscriber(daemon: bool) {
 pub fn apply_xet_env_defaults() {
     let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
     for (k, v) in xet_env_defaults(&upload_cap) {
-        // xet-runtime consults HF_XET_FIXED_UPLOAD_CONCURRENCY only when the
-        // canonical AC variables are absent — defaulting the canonical names
-        // would silently turn a user-fixed concurrency into an adaptive one.
-        if k.contains("UPLOAD_CONCURRENCY") && user_fixed_upload_concurrency() {
+        if defers_to_fixed_concurrency(k, |name| std::env::var(name).is_ok()) {
             continue;
         }
         if std::env::var(k).is_err() {
@@ -712,10 +751,19 @@ pub fn try_build_with_runtime(
             false,
         ))
         .map_err(|e| SetupError::new(Storage, format!("Failed to create storage client: {e:?}")))?;
-    let cached_client = CachedXetClient::new(raw_client);
+    let window_plans = (options.window_plans != WindowPlansMode::Off)
+        .then(|| WindowPlans::new(Arc::new(raw_client.clone()), options.window_plans));
+    let cached_client = CachedXetClient::with_window_plans(raw_client, window_plans.clone());
     let download_session = FileDownloadSession::from_client(&xet_ctx, cached_client.clone(), xorb_cache.clone());
     let upload_config = if remote_read_only { None } else { Some(cas_config) };
-    let xet_sessions = XetSessions::new(xet_ctx, download_session, upload_config, cached_client, xorb_cache);
+    let xet_sessions = XetSessions::new(
+        xet_ctx,
+        download_session,
+        upload_config,
+        cached_client,
+        xorb_cache,
+        window_plans,
+    );
 
     let advanced_writes =
         options.advanced_writes || options.overlay || (backend.forces_advanced_writes() && !read_only);
@@ -761,14 +809,15 @@ pub fn try_build_with_runtime(
         None
     };
 
-    let uid = options.uid.unwrap_or_else(current_uid);
-    let gid = options.gid.unwrap_or_else(current_gid);
+    let (default_uid, default_gid) = default_owner();
+    let uid = options.uid.unwrap_or(default_uid);
+    let gid = options.gid.unwrap_or(default_gid);
 
-    // Ignore EEXIST: the directory may already exist from a previous (possibly
-    // stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
+    // Ignore AlreadyExists: the directory may already exist from a previous
+    // (possibly stale) mount. FUSE/NFS will fail at mount time if it's actually busy.
     if backend.mounts_on_existing_dir()
         && let Err(e) = std::fs::create_dir_all(&mount_point)
-        && e.raw_os_error() != Some(libc::EEXIST)
+        && e.kind() != std::io::ErrorKind::AlreadyExists
     {
         return Err(SetupError::new(
             LocalIo,
@@ -778,6 +827,11 @@ pub fn try_build_with_runtime(
 
     if backend != Backend::Fuse && options.direct_io {
         info!("--direct-io is ignored for {} mounts", backend.name());
+    }
+    if options.flush_interval_ms > 0 && (!advanced_writes || options.overlay) {
+        panic!(
+            "--flush-interval-ms requires --advanced-writes and no --overlay: streaming writes commit on close only, overlay writes never reach the Hub"
+        );
     }
 
     let backend_name = backend.name();
@@ -805,8 +859,8 @@ pub fn try_build_with_runtime(
         "Config: advanced_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
          poll_listing_concurrency={} live_follow={} metadata_ttl={}ms negative_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
-         flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms uid={} gid={} dir_mode={:04o} \
-         file_mode={:04o} filter_os_files={}",
+         flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms read_ahead={}MiB uid={} gid={} \
+         dir_mode={:04o} file_mode={:04o} filter_os_files={}",
         advanced_writes,
         options.overlay,
         remote_read_only,
@@ -825,6 +879,7 @@ pub fn try_build_with_runtime(
         options.flush_debounce_ms,
         options.flush_max_batch_window_ms,
         options.read_fetch_timeout_ms,
+        options.read_ahead_mb,
         uid,
         gid,
         options.dir_mode,
@@ -860,8 +915,10 @@ pub fn try_build_with_runtime(
             direct_io: options.direct_io && backend == Backend::Fuse,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+            flush_interval: std::time::Duration::from_millis(options.flush_interval_ms),
             flush_shutdown_timeout: std::time::Duration::from_millis(options.flush_shutdown_timeout_ms),
             read_fetch_timeout: std::time::Duration::from_millis(options.read_fetch_timeout_ms),
+            read_ahead_bytes: options.read_ahead_mb * 1_048_576,
             // NFS clients use inode numbers as stable file IDs; evicting an
             // inode the client still holds would surface as NFS3ERR_STALE on
             // its next RPC. The eviction safety hooks (forget / inval_entry)
@@ -893,28 +950,6 @@ pub fn try_build_with_runtime(
     })
 }
 
-#[cfg(unix)]
-fn current_uid() -> u32 {
-    unsafe { libc::getuid() }
-}
-
-#[cfg(unix)]
-fn current_gid() -> u32 {
-    unsafe { libc::getgid() }
-}
-
-/// Windows has no POSIX ids; the WinFsp adapter reports ownership through a
-/// security descriptor instead.
-#[cfg(not(unix))]
-fn current_uid() -> u32 {
-    0
-}
-
-#[cfg(not(unix))]
-fn current_gid() -> u32 {
-    0
-}
-
 // ── Combined entry point (foreground binaries) ──────────────────────
 
 /// Parse CLI args, build VFS and all dependencies.
@@ -934,18 +969,21 @@ pub fn raise_fd_limit() {}
 /// errors during large batch operations. Most FUSE/NFS filesystems do this.
 #[cfg(unix)]
 pub fn raise_fd_limit() {
-    const TARGET_NOFILE: u64 = 65536;
-    let mut rlim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: rlim is a plain C struct, getrlimit/setrlimit are standard POSIX.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 || rlim.rlim_cur >= TARGET_NOFILE {
-        return;
-    }
-    rlim.rlim_cur = TARGET_NOFILE.min(rlim.rlim_max);
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
-        eprintln!("warning: failed to raise file descriptor limit to {TARGET_NOFILE}");
+    #[cfg(unix)]
+    {
+        const TARGET_NOFILE: u64 = 65536;
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: rlim is a plain C struct, getrlimit/setrlimit are standard POSIX.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 || rlim.rlim_cur >= TARGET_NOFILE {
+            return;
+        }
+        rlim.rlim_cur = TARGET_NOFILE.min(rlim.rlim_max);
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
+            eprintln!("warning: failed to raise file descriptor limit to {TARGET_NOFILE}");
+        }
     }
 }
 
@@ -1109,6 +1147,20 @@ where
     }
 }
 
+/// The owner reported for files when `--uid`/`--gid` are not set.
+#[cfg(unix)]
+fn default_owner() -> (u32, u32) {
+    // SAFETY: getuid and getgid are thread-safe POSIX calls with no preconditions.
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+/// The anonymous id the Windows NFS client mounts with (its default -2), so
+/// files are owned by the client that writes them.
+#[cfg(not(unix))]
+fn default_owner() -> (u32, u32) {
+    (u32::MAX - 1, u32::MAX - 1)
+}
+
 fn build_cas_config(
     ctx: &XetContext,
     runtime: &tokio::runtime::Handle,
@@ -1188,7 +1240,10 @@ pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{XET_UPLOAD_CONCURRENCY_CAP, mountinfo_has_hf_mount, parse_mode, validate_revision, xet_env_defaults};
+    use super::{
+        XET_UPLOAD_CONCURRENCY_CAP, defers_to_fixed_concurrency, mountinfo_has_hf_mount, parse_mode, validate_revision,
+        xet_env_defaults,
+    };
     use std::path::Path;
     use xet_runtime::config::XetConfig;
 
@@ -1317,5 +1372,31 @@ mod tests {
             })
             .collect();
         assert!(rejected.is_empty(), "rejected by xet-core: {rejected:#?}");
+    }
+
+    /// A fixed download (or upload) concurrency set by the user keeps the
+    /// adaptive defaults of that direction unset, and only of that direction.
+    #[test]
+    fn fixed_concurrency_keeps_its_direction_defaults_unset() {
+        let upload_cap = XET_UPLOAD_CONCURRENCY_CAP.to_string();
+        for fixed in ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY", "HF_XET_FIXED_UPLOAD_CONCURRENCY"] {
+            let direction = if fixed.contains("DOWNLOAD") {
+                "DOWNLOAD"
+            } else {
+                "UPLOAD"
+            };
+            for (key, _) in xet_env_defaults(&upload_cap) {
+                let deferred = defers_to_fixed_concurrency(key, |name| name == fixed);
+                assert_eq!(
+                    deferred,
+                    key.contains(&format!("{direction}_CONCURRENCY")),
+                    "{fixed} and {key}"
+                );
+            }
+        }
+        assert!(!defers_to_fixed_concurrency(
+            "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+            |_| false
+        ));
     }
 }

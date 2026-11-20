@@ -1,10 +1,22 @@
 pub mod cached_xet_client;
 #[cfg(unix)]
 pub mod daemon;
+#[cfg(not(unix))]
+pub mod daemon {
+    //! Windows stub: only the surface used by hf-mount-nfs. The full daemon
+    //! controller (hf-mount) is Unix-only and not built on Windows.
+    pub struct DaemonGuard;
+    impl DaemonGuard {
+        pub fn from_env() -> Option<Self> {
+            None
+        }
+        pub fn notify_ready(&mut self) {}
+    }
+}
 pub mod error;
 pub mod file_cache;
 pub mod follow;
-#[cfg(feature = "fuse")]
+#[cfg(all(unix, feature = "fuse"))]
 pub mod fuse;
 pub mod hub_api;
 pub mod manager;
@@ -13,6 +25,7 @@ pub mod nfs;
 pub mod overlay;
 pub mod setup;
 pub mod virtual_fs;
+pub mod window_plans;
 #[cfg(windows)]
 pub mod windows;
 pub mod winfs;

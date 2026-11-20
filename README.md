@@ -60,22 +60,38 @@ The NFS backend has no system dependencies. For FUSE:
 
 **macOS**: install [macFUSE](https://osxfuse.github.io/) (`brew install macfuse`, requires reboot on first install)
 
+**Windows**: NFS backend only (FUSE is Unix-only). Enable the "Client for NFS" feature:
+
+```powershell
+# Windows Server
+Install-WindowsFeature -Name NFS-Client
+
+# Windows 10 / 11
+Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly,ClientForNFS-Infrastructure -All
+```
+
+`hf-mount-nfs.exe` must run as Administrator: it binds the privileged portmapper port 111, which the Windows NFS client always queries. Each mount point listens on a loopback address of its own (`\\127.x.y.z\!`), derived from the mount point, so a remount reaches the same server address.
+
+The Windows client mounts anonymously, so files are owned by its anonymous id (`4294967294`, the Client for NFS default) unless `--uid`/`--gid` say otherwise.
+
+A drive mounted from an elevated shell is only visible to elevated processes, so Explorer and non-admin apps do not see it. On Windows 11, a user reported that this works: start the server from the elevated shell with `HF_MOUNT_SKIP_AUTO_MOUNT=1` (it then logs the `mount.exe` command and skips it), and run that `mount.exe` command from a non-elevated shell.
+
 ### Build from source
 
 Requires Rust 1.89+.
 
 ```bash
-# NFS only (no system deps, works everywhere)
+# NFS only (no system deps, works everywhere including Windows)
 cargo build --release --features nfs
 
-# FUSE (requires macFUSE on macOS, fuse3 on Linux)
+# FUSE (requires macFUSE on macOS, fuse3 on Linux; not available on Windows)
 cargo build --release --features fuse
 
 # All backends
 cargo build --release --features fuse,nfs
 ```
 
-Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`
+Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/release/hf-mount-fuse`. On Windows only `hf-mount-nfs.exe` is produced.
 
 ## Windows
 
@@ -301,11 +317,13 @@ The same `FUSE_NOTIFY_INVAL_INODE` writev can also wedge at **runtime** (not jus
 | `--poll-listing-concurrency` | `4` | Max concurrent tree-listing requests per poll round. Main knob to throttle load on the Hub `/api` endpoint; lower it in shared environments where many mounts poll in parallel. |
 | `--live-follow` | `true` | Subscribe to the Hub's bucket live-follow event stream (SSE): remote changes are applied to loaded directories as they happen, and the periodic poll fan-out is skipped while the stream is healthy. Falls back to interval polling automatically when the Hub doesn't serve the feed (older deployments, repo mounts). Works with `--poll-interval-secs 0` too (no fallback then). Disable with `--live-follow=false`. |
 | `--max-threads` | `16` | Maximum FUSE worker threads (Linux only) |
+| `--read-ahead-mb` | `1024` | Memory for read-ahead, shared by the files open on the mount (MiB). Files read at once split it, and one file holds at most 512 MiB of it. Lower it where the daemon has a tight memory limit, together with `HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT` (xet-core download buffers, 1 GiB by default). |
 | `--metadata-ttl-ms` | `10000` | How long file metadata is cached before re-checking (ms) |
 | `--metadata-ttl-minimal` | `false` | Re-check on every access (maximum freshness, lower throughput) |
 | `--negative-ttl-ms` | `1000` | How long a lookup miss (ENOENT) is remembered before re-probing the Hub. Caps HEAD traffic for missing paths; also the longest a remotely-added file stays hidden from a client that probed it before it existed. |
 | `--flush-debounce-ms` | `2000` | Advanced writes: flush debounce delay (ms) |
 | `--flush-max-batch-window-ms` | `30000` | Advanced writes: max flush batch window (ms) |
+| `--flush-interval-ms` | `0` | Advanced writes: also flush open dirty files every N ms, so long-lived writers (logs, incremental checkpoints) publish without closing. Readers may see a partially written file. `0` = flush on close/fsync only. |
 | `--flush-shutdown-timeout-ms` | `45000` | Advanced writes: max time the SIGTERM flush drain may run before abandoning unflushed data to guarantee exit. Must be < the pod's `terminationGracePeriodSeconds`, or a slow Hub/CAS backend keeps the FUSE connection alive past grace and strands the pod. |
 | `--no-disk-cache` | `false` | Disable local chunk cache (every read fetches from HF) |
 | `--direct-io` | `false` | Bypass the kernel page cache (FOPEN_DIRECT_IO); every read goes through the FUSE handler. For benchmarking; not recommended in production (disables efficient mmap caching). |
@@ -416,7 +434,7 @@ A lookup of a path that does not exist yet probes the Hub directly, so a file ad
 
 hf-mount sits between your application and the Hugging Face Hub. It presents a standard filesystem interface (FUSE or NFS) and translates file operations into Hub API calls and storage fetches.
 
-Reads go through an adaptive prefetch buffer that starts small and grows with sequential access. Writes are uploaded to HF storage and committed via the Hub API. A background poll loop keeps the local view in sync with remote changes.
+Reads fetch remote data in blocks, several ranges at a time, with a read-ahead window that grows for each sequential stream, so parallel readers of one file (such as memory-mapped model loaders) do not wait on each other. Writes are uploaded to HF storage and committed via the Hub API. A background poll loop keeps the local view in sync with remote changes.
 
 Built on [xet-core](https://github.com/huggingface/xet-core) for content-addressed storage and efficient file transfers, and [fuser](https://github.com/cberner/fuser) for the FUSE implementation.
 
