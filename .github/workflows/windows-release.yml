@@ -18,7 +18,8 @@ jobs:
     name: Build and test
     uses: ./.github/workflows/windows.yml
     # The opt-in authenticated test runs only if the owner configured it.
-    secrets: inherit
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   publish:
     name: Publish release
@@ -66,7 +67,7 @@ jobs:
           mv -- "${nsis[0]}" "$setup"
           mv -- "${msi[0]}" "$package"
           rmdir nsis msi
-          sha256sum -- "${cli[0]}" "$setup" "$package" | sort -k2 > SHA256SUMS.txt
+          sha256sum -- "${cli[0]}" "$setup" "$package" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create release

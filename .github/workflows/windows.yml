@@ -14,6 +14,10 @@ on:
     branches: [main]
   workflow_dispatch:
   workflow_call:
+    secrets:
+      HF_TOKEN:
+        description: Token for the opt-in private repository and bucket smoke tests
+        required: false
     outputs:
       cli-artifact-id:
         description: Portable Windows CLI archive
