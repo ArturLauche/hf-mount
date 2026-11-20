@@ -14,6 +14,13 @@ on:
     branches: [main]
   workflow_dispatch:
   workflow_call:
+    outputs:
+      cli-artifact-id:
+        description: Portable Windows CLI archive
+        value: ${{ jobs.cli.outputs.artifact-id }}
+      desktop-artifact-id:
+        description: Windows NSIS and MSI installers
+        value: ${{ jobs.desktop.outputs.artifact-id }}
 
 concurrency:
   # Use the PR merge ref (unique across forks) or the pushed branch. A tag or
@@ -111,7 +118,7 @@ jobs:
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hf-mount-logs-windows-tests
+          name: hf-mount-logs-windows
           path: ~\AppData\Local\hf-mount\logs
           if-no-files-found: ignore
 
@@ -201,7 +208,7 @@ jobs:
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hf-mount-logs-windows
+          name: hf-mount-logs-windows-cli
           path: ~\AppData\Local\hf-mount\logs
           if-no-files-found: ignore
 
@@ -309,7 +316,7 @@ jobs:
             desktop/src-tauri/resources/winfsp/
             desktop/node_modules/@tauri-apps/cli/
             desktop/node_modules/@tauri-apps/cli-win32-x64-msvc/
-          retention-days: 3
+          retention-days: 7
           if-no-files-found: error
 
   desktop:
@@ -317,6 +324,8 @@ jobs:
     needs: [cli, desktop-build]
     runs-on: windows-2025
     timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -377,6 +386,7 @@ jobs:
           ./scripts/windows/desktop-install-test.ps1 -Installer $setup.FullName -CliSha256 $env:CLI_SHA256
 
       - name: Upload installers
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hf-mount-desktop-windows-x64
