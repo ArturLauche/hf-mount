@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,11 +16,11 @@ use crate::overlay::OverlayBacking;
 mod flush;
 pub mod inode;
 mod poll;
-mod prefetch;
+mod remote_reader;
 mod staging;
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
-use prefetch::{FetchPlan, PrefetchState};
+use remote_reader::{ReadAheadBudget, RemoteReader};
 use staging::StagingCoordinator;
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -130,16 +130,20 @@ pub struct VfsConfig {
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
+    /// Advanced writes: periodic flush of open dirty files. Zero disables.
+    pub flush_interval: Duration,
     /// Max time the SIGTERM shutdown drain may spend flushing dirty data before
     /// abandoning it to guarantee the process exits within the pod's termination
     /// grace period. Must be < terminationGracePeriodSeconds, otherwise a slow
     /// Hub/CAS backend wedges the FUSE connection and strands the pod.
     pub flush_shutdown_timeout: Duration,
-    /// Upper bound on a single remote chunk fetch during a read. A stalled
-    /// fetch otherwise parks the FUSE worker thread that issued the `read()`
-    /// indefinitely; once all worker threads are parked the mount silently
-    /// wedges. `Duration::ZERO` disables the bound (legacy behaviour).
+    /// Longest wait of a remote fetch for its next chunk of data. A stalled
+    /// fetch is retried, then the reads that wait for it fail with EIO
+    /// instead of hanging. `Duration::ZERO` disables the bound (legacy
+    /// behaviour).
     pub read_fetch_timeout: Duration,
+    /// Read-ahead memory shared by the remote readers of all open handles.
+    pub read_ahead_bytes: u64,
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,
     pub lru_sweep_interval: Duration,
@@ -219,6 +223,10 @@ pub struct VirtualFs {
     shutdown_once: std::sync::Once,
     /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// True while polling or the live-follow feed keeps directory listings in
+    /// sync. When false, a listing is only trusted for `metadata_ttl`: nothing
+    /// else would ever show a remotely added or removed entry.
+    remote_sync: Arc<AtomicBool>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
     /// are detected, allowing the kernel page cache to be used instead of DIRECT_IO.
@@ -252,8 +260,10 @@ pub struct VirtualFs {
     serve_lookup_from_cache: bool,
     /// When true, reject creation of OS junk files (.DS_Store, Thumbs.db, etc.).
     filter_os_files: bool,
-    /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
+    /// When true, remote readers drop blocks once read (forward-only, no re-read cache).
     direct_io: bool,
+    /// Read-ahead memory shared by the remote readers of all open handles.
+    read_ahead_budget: Arc<ReadAheadBudget>,
     /// Optional whole-file cache. When `Some`, opens hit the local copy if the
     /// xet hash is already populated; misses kick a background populate so the
     /// next open is fast. Mutually exclusive with xet-core's chunk cache.
@@ -296,6 +306,7 @@ impl VirtualFs {
                 &runtime,
                 config.flush_debounce,
                 config.flush_max_batch_window,
+                config.flush_interval,
             ))
         } else {
             None
@@ -307,7 +318,9 @@ impl VirtualFs {
         // Spawn the remote change task when either sync mechanism is on:
         // interval polling (interval > 0) or the live-follow feed.
         let invalidator: Invalidator = Arc::new(OnceLock::new());
-        let poll_handle = if config.poll_interval_secs > 0 || config.live_follow {
+        let remote_sync_on = config.poll_interval_secs > 0 || config.live_follow;
+        let remote_sync = Arc::new(AtomicBool::new(remote_sync_on));
+        let poll_handle = if remote_sync_on {
             let bg_hub = hub_client.clone();
             let bg_inodes = inodes.clone();
             let bg_neg_cache = negative_cache.clone();
@@ -316,7 +329,7 @@ impl VirtualFs {
             // Clamp to >= 1 in case a caller (library use) constructs VfsConfig directly.
             let listing_concurrency = config.poll_listing_concurrency.max(1);
 
-            Some(runtime.spawn(Self::poll_remote_changes(
+            let poll = Self::poll_remote_changes(
                 bg_hub,
                 bg_inodes,
                 bg_neg_cache,
@@ -324,7 +337,13 @@ impl VirtualFs {
                 interval,
                 listing_concurrency,
                 config.live_follow,
-            )))
+            );
+            let bg_remote_sync = remote_sync.clone();
+            Some(runtime.spawn(async move {
+                poll.await;
+                // Only returns when the live-follow feed is unusable and polling is disabled.
+                bg_remote_sync.store(false, Ordering::Relaxed);
+            }))
         } else {
             None
         };
@@ -354,6 +373,7 @@ impl VirtualFs {
             pending_commits: Mutex::new(HashMap::new()),
             flush_manager,
             poll_handle: Mutex::new(poll_handle),
+            remote_sync,
             invalidator,
             entry_invalidator,
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -363,6 +383,7 @@ impl VirtualFs {
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
+            read_ahead_budget: ReadAheadBudget::new(config.read_ahead_bytes),
             file_cache,
         });
 
@@ -894,7 +915,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded() => return Ok(false),
+                Some(e) if self.listing_is_fresh(e) => return Ok(false),
                 None => return Err(libc::ENOENT),
                 _ => {}
             }
@@ -909,7 +930,7 @@ impl VirtualFs {
             let inodes = self.inode_table.read().expect("inodes poisoned");
             match inodes.get(parent_ino) {
                 Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if e.children_loaded() => return Ok(false),
+                Some(e) if self.listing_is_fresh(e) => return Ok(false),
                 Some(e) => e.full_path.to_string(),
                 None => return Err(libc::ENOENT),
             }
@@ -929,15 +950,23 @@ impl VirtualFs {
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
         match inodes.get(parent_ino) {
-            Some(e) if e.children_loaded() => return Ok(false),
+            Some(e) if self.listing_is_fresh(e) => return Ok(false),
             Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
             None => return Err(libc::ENOENT),
             _ => {}
         }
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Entries skipped for a rename in flight: the listing stays stale, so
+        // the next lookup after the rename re-lists and sees them.
+        let mut skipped_rename = false;
 
         for entry in entries {
+            // A rename in flight committed this path: its local move inserts it.
+            if inodes.in_rename(&entry.path) {
+                skipped_rename = true;
+                continue;
+            }
             // Convert absolute bucket path to path relative to current directory.
             // e.g. prefix="models" → "models/bert/config.json" → "bert/config.json"
             let rel_path = if prefix.is_empty() {
@@ -1025,12 +1054,14 @@ impl VirtualFs {
                     if in_listing {
                         return false;
                     }
-                    inodes.get(c.ino).is_some_and(|e| !e.is_dirty() && !e.created_locally)
+                    inodes
+                        .get(c.ino)
+                        .is_some_and(|e| !inodes.is_held_locally(e) && !e.created_locally)
                 })
                 .map(|c| c.ino)
                 .collect();
             for ino in stale {
-                if !inodes.has_dirty_or_open_descendants(ino) {
+                if !inodes.has_dirty_or_open_descendants(ino) && !inodes.has_locally_created_descendants(ino) {
                     inodes.remove(ino);
                 }
             }
@@ -1043,7 +1074,9 @@ impl VirtualFs {
             // directory we'd otherwise keep ~50% slack forever. Trim now,
             // since regrowth on rare child mutations is cheap.
             parent.children.shrink_to_fit();
-            parent.children_loaded_at = Some(Instant::now());
+            if !skipped_rename {
+                parent.children_loaded_at = Some(Instant::now());
+            }
             parent.children_from_remote = true;
         }
         Ok(true)
@@ -1092,6 +1125,13 @@ impl VirtualFs {
     /// Check if any open file handle references the given inode.
     fn has_open_handles(&self, ino: u64) -> bool {
         self.inode_table.read().expect("inodes poisoned").has_open_handles(ino)
+    }
+
+    /// Whether the children listing of `entry` can be trusted without listing again.
+    fn listing_is_fresh(&self, entry: &InodeEntry) -> bool {
+        entry.children_loaded_at.is_some_and(|loaded_at| {
+            self.remote_sync.load(Ordering::Relaxed) || loaded_at.elapsed() < self.metadata_ttl
+        })
     }
 
     /// Get or create a per-directory lock for serializing ensure_children_loaded().
@@ -1412,11 +1452,11 @@ impl VirtualFs {
                 return Err(libc::ENOTDIR);
             }
 
-            // Try in-memory first regardless of `children_loaded`: an inode
+            // Try in-memory first regardless of a fresh listing: an inode
             // inserted via the HEAD point-lookup path or still present after
             // a partial eviction can be served without a full re-list.
             //
-            // For directories we still require `children_loaded` to trust the
+            // For directories we still require a fresh listing to trust the
             // cached entry: without the parent listing, we can't tell whether
             // the dir was removed or replaced remotely (files revalidate
             // individually via HEAD, dirs don't).
@@ -1430,17 +1470,17 @@ impl VirtualFs {
                     current_etag: entry.etag.clone(),
                 },
                 // Either a dirty file (local writes win until flushed) or any
-                // entry under a fully-listed parent we can trust as-is.
-                Some(entry) if entry.kind == InodeKind::File || parent_entry.children_loaded() => {
+                // entry under a freshly listed parent we can trust as-is.
+                Some(entry) if entry.kind == InodeKind::File || self.listing_is_fresh(parent_entry) => {
                     FastResult::Hit(self.make_vfs_attr(entry))
                 }
-                // Cached non-file under an unloaded parent: we can't HEAD-probe
-                // a directory to check it still exists (resolve endpoint only
-                // serves files), so defer to the slow path which lists.
+                // Cached non-file under an unloaded or stale parent: we can't
+                // HEAD-probe a directory to check it still exists (resolve
+                // endpoint only serves files), so defer to the slow path which lists.
                 Some(_) => FastResult::NotLoaded,
                 // No cached entry but the parent listing is authoritative →
                 // the name really doesn't exist; populate the negative cache.
-                None if parent_entry.children_loaded() => {
+                None if self.listing_is_fresh(parent_entry) => {
                     let parent_path = &parent_entry.full_path;
                     let full_path = if parent_path.is_empty() {
                         name.to_string()
@@ -1847,6 +1887,12 @@ impl VirtualFs {
         }
         self.schedule_flush(ino);
         Ok(())
+    }
+
+    /// The path of `ino` relative to the mount root ("" for the root).
+    pub fn full_path(&self, ino: u64) -> Option<Arc<str>> {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        inodes.get(ino).map(|entry| entry.full_path.clone())
     }
 
     pub fn getattr(&self, ino: u64) -> VirtualFsResult<VirtualFsAttr> {
@@ -2282,176 +2328,23 @@ impl VirtualFs {
         }
     }
 
-    /// Allocate a lazy file handle backed by a prefetch buffer.
+    /// Allocate a lazy file handle that fetches remote data on demand.
     fn open_lazy(&self, ino: u64, xet_hash: String, size: u64) -> VirtualFsResult<u64> {
-        let prefetch = Arc::new(tokio::sync::Mutex::new(PrefetchState::new(
+        let reader = RemoteReader::new(
             xet_hash,
             size,
+            self.xet_sessions.clone(),
+            self.read_fetch_timeout,
             self.direct_io,
-        )));
+            self.read_ahead_budget.clone(),
+        );
         let file_handle = self.alloc_file_handle();
         self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
         self.open_files
             .write()
             .expect("open_files poisoned")
-            .insert(file_handle, OpenFile::Lazy { ino, prefetch });
+            .insert(file_handle, OpenFile::Lazy { ino, reader });
         Ok(file_handle)
-    }
-
-    /// Fetch data for the prefetch buffer. Uses the persistent stream for sequential
-    /// reads (with automatic (re)start), or opens a temporary stream with retries
-    /// for range/seek access. Returns EIO if all attempts fail.
-    async fn fetch_data(
-        &self,
-        prefetch_state: &mut PrefetchState,
-        cursor: u64,
-        plan: &FetchPlan,
-        file_size: u64,
-    ) -> std::result::Result<(VecDeque<Bytes>, usize), i32> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
-
-        // Take the persistent stream before the loop (sequential reads).
-        // first_stream.take() only returns Some on the first iteration.
-        let mut first_stream = if plan.strategy.is_stream() {
-            prefetch_state.stream.take()
-        } else {
-            None
-        };
-
-        for attempt in 0..MAX_ATTEMPTS {
-            let stream = match first_stream.take() {
-                Some(s) => Some(s),
-                None => match self.xet_sessions.download_stream_boxed(
-                    &file_info,
-                    cursor,
-                    // For range downloads (random reads / seeks), bound the request
-                    // so CAS only returns terms covering the needed bytes.
-                    // For streaming, leave unbounded so the stream can continue.
-                    if plan.strategy == prefetch::FetchStrategy::RangeDownload {
-                        Some(cursor + plan.fetch_size)
-                    } else {
-                        None
-                    },
-                ) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        warn!(
-                            "prefetch: stream open failed: cursor={}, attempt={}/{}: {}",
-                            cursor,
-                            attempt + 1,
-                            MAX_ATTEMPTS,
-                            e,
-                        );
-                        None
-                    }
-                },
-            };
-
-            if let Some(mut stream) = stream {
-                // Read chunks until fetch_size bytes
-                let mut chunks = VecDeque::new();
-                let mut total = 0usize;
-                let mut failed = false;
-                let mut stream_eof = false;
-                while (total as u64) < plan.fetch_size {
-                    // Bound each chunk read. A FUSE `read()` runs on a worker
-                    // thread blocked in `block_on` on this future; if the
-                    // CAS/CDN connection stalls (client-aborted seek, hung
-                    // socket), an unbounded `next()` parks that thread forever.
-                    // Enough stalled reads exhaust all worker threads and the
-                    // mount silently stops serving cold reads. The timeout frees
-                    // the thread, and dropping `stream` on the way out cancels
-                    // the in-flight request.
-                    let next = match self.read_fetch_timeout {
-                        Duration::ZERO => stream.next().await,
-                        timeout => match tokio::time::timeout(timeout, stream.next()).await {
-                            Ok(result) => result,
-                            Err(_elapsed) => {
-                                error!(
-                                    "prefetch: stream read timed out after {:?} at cursor={}, got={}/{}, \
-                                     attempt={}/{}, hash={} — aborting fetch to free the FUSE worker thread",
-                                    timeout,
-                                    cursor,
-                                    total,
-                                    plan.fetch_size,
-                                    attempt + 1,
-                                    MAX_ATTEMPTS,
-                                    prefetch_state.xet_hash,
-                                );
-                                failed = true;
-                                break;
-                            }
-                        },
-                    };
-                    match next {
-                        Ok(Some(chunk)) => {
-                            total += chunk.len();
-                            chunks.push_back(chunk);
-                        }
-                        Ok(None) => {
-                            stream_eof = true;
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "prefetch: stream read error at cursor={}, got={}/{}, attempt={}/{}: {}",
-                                cursor,
-                                total,
-                                plan.fetch_size,
-                                attempt + 1,
-                                MAX_ATTEMPTS,
-                                e,
-                            );
-                            failed = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Early EOF sanity check: only meaningful when we got some data
-                // (zero-data EOF is just a failed attempt, handled by retry below)
-                if stream_eof && total > 0 {
-                    let stream_total = cursor + total as u64;
-                    if stream_total < file_size {
-                        error!(
-                            "prefetch: stream EOF at cursor={} after {} bytes (file_size={}, \
-                             shortfall={}, hash={})",
-                            cursor,
-                            total,
-                            file_size,
-                            file_size - stream_total,
-                            prefetch_state.xet_hash,
-                        );
-                        debug_assert!(
-                            false,
-                            "stream EOF before file_size: got {stream_total}, expected {file_size}"
-                        );
-                    }
-                } else if plan.strategy.is_stream() && !failed {
-                    // Keep stream alive for future sequential reads
-                    prefetch_state.stream = Some(stream);
-                }
-
-                if total > 0 {
-                    debug!(
-                        "prefetch fetch: cursor={}, got={}, window={}",
-                        cursor, total, prefetch_state.window_size,
-                    );
-                    return Ok((chunks, total));
-                }
-            }
-
-            if attempt + 1 < MAX_ATTEMPTS {
-                tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
-            }
-        }
-
-        error!(
-            "prefetch: all {} fetch attempts failed: cursor={}, hash={}",
-            MAX_ATTEMPTS, cursor, prefetch_state.xet_hash,
-        );
-        Err(libc::EIO)
     }
 
     /// Read data from an open file. Returns `(data, eof)`.
@@ -2464,9 +2357,7 @@ impl VirtualFs {
             let files = self.open_files.read().expect("open_files poisoned");
             match files.get(&file_handle) {
                 Some(OpenFile::Local { file, .. }) => ReadTarget::LocalFd(file.clone()),
-                Some(OpenFile::Lazy { prefetch, .. }) => ReadTarget::Remote {
-                    prefetch: prefetch.clone(),
-                },
+                Some(OpenFile::Lazy { reader, .. }) => ReadTarget::Remote(reader.clone()),
                 // write-only, not readable
                 Some(OpenFile::Streaming { .. }) => return Err(libc::EBADF), // write-only, not readable
                 None => return Err(libc::EBADF), // handle already closed (race with release)
@@ -2487,80 +2378,7 @@ impl VirtualFs {
                     }
                 }
             }
-            ReadTarget::Remote { prefetch } => {
-                let mut prefetch_state = prefetch.lock().await;
-
-                let file_size = prefetch_state.file_size;
-
-                // Past EOF
-                if offset >= file_size {
-                    return Ok((Bytes::new(), true));
-                }
-
-                // Maximum bytes we should return (capped at file boundary).
-                let to_read = ((size as u64).min(file_size - offset)) as usize;
-
-                // IMPORTANT: Never return a short read unless at real EOF.
-                // The Linux FUSE kernel module shrinks i_size on short reads
-                // (fuse_read_update_size), which makes subsequent reads return
-                // 0 bytes and truncates the file from the application's view.
-
-                let mut response = BytesMut::with_capacity(to_read);
-                let mut cursor = offset;
-
-                // Fast path: forward buffer has enough data (common case, zero-copy).
-                if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
-                    if data.len() == to_read {
-                        debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
-                        let eof = offset + data.len() as u64 >= file_size;
-                        return Ok((data, eof));
-                    }
-                    cursor += data.len() as u64;
-                    response.extend_from_slice(&data);
-                } else if let Some(data) = prefetch_state.try_serve_seek(offset, size) {
-                    // Seek window: only reachable when forward buffer has no data
-                    // at this offset (backward seek). Zero-copy on full hit.
-                    if data.len() == to_read {
-                        debug!("prefetch hit (seek): offset={}, len={}", offset, data.len());
-                        let eof = offset + data.len() as u64 >= file_size;
-                        return Ok((data, eof));
-                    }
-                    cursor += data.len() as u64;
-                    response.extend_from_slice(&data);
-                }
-
-                // Assembly loop: fetch more data until we have to_read bytes.
-                // Only reached at prefetch window boundaries or cache misses.
-                while response.len() < to_read {
-                    let remaining = (to_read - response.len()) as u32;
-                    let plan = prefetch_state.prepare_fetch(cursor, remaining);
-                    debug!(
-                        "prefetch miss: cursor={}, remaining={}, strategy={:?}, fetch_size={}, \
-                         buf_start={}, file_size={}, has_stream={}",
-                        cursor,
-                        remaining,
-                        plan.strategy,
-                        plan.fetch_size,
-                        prefetch_state.buf_start,
-                        file_size,
-                        prefetch_state.stream.is_some(),
-                    );
-
-                    let (chunks, total) = self.fetch_data(&mut prefetch_state, cursor, &plan, file_size).await?;
-
-                    prefetch_state.store_fetched(cursor, chunks, total);
-
-                    // Drain freshly filled buffer into response
-                    let remaining = (to_read - response.len()) as u32;
-                    if let Some(data) = prefetch_state.try_serve_forward(cursor, remaining) {
-                        cursor += data.len() as u64;
-                        response.extend_from_slice(&data);
-                    }
-                }
-
-                let eof = cursor == file_size;
-                Ok((response.freeze(), eof))
-            }
+            ReadTarget::Remote(reader) => reader.read(offset, size).await,
         }
     }
 
@@ -3878,8 +3696,14 @@ impl VirtualFs {
             self.ensure_children_loaded(dst_ino).await?;
         }
 
-        // Phase 1: validate under read lock, collect everything we need
+        // Phase 1: validate, mark the entries, collect everything we need
         let info = self.rename_validate(parent, name, newparent, newname, no_replace)?;
+        // Held until the entries are moved locally: see `InodeTable::renames`.
+        let _renaming = RenameMark {
+            inode_table: &self.inode_table,
+            old_path: info.old_path.clone(),
+            new_path: info.new_full_path.clone(),
+        };
 
         // POSIX: rename(a, b) where a and b are hard links to the same inode is a no-op.
         // Check before remote sync to avoid spurious backend mutations.
@@ -3956,7 +3780,7 @@ impl VirtualFs {
         }
     }
 
-    /// Phase 1: validate rename under inode read lock, return all info needed for phases 2+3.
+    /// Phase 1: validate rename and register it as in flight, return all info needed for phases 2+3.
     fn rename_validate(
         &self,
         parent: u64,
@@ -3965,7 +3789,10 @@ impl VirtualFs {
         newname: &str,
         no_replace: bool,
     ) -> VirtualFsResult<RenameInfo> {
-        let inodes = self.inode_table.read().expect("inodes poisoned");
+        // A write lock, so that the rename is registered (`InodeTable::renames`)
+        // in the same critical section as the validation: no remote deletion
+        // can drop an entry in between.
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
 
         let src = inodes.lookup_child(parent, name).ok_or(libc::ENOENT)?;
 
@@ -4042,7 +3869,7 @@ impl VirtualFs {
             Vec::new()
         };
 
-        Ok(RenameInfo {
+        let info = RenameInfo {
             ino: src.inode,
             old_path: src.full_path.to_string(),
             kind: src.kind,
@@ -4050,7 +3877,9 @@ impl VirtualFs {
             is_dirty: src.is_dirty(),
             new_full_path,
             descendant_files,
-        })
+        };
+        inodes.add_rename(info.old_path.clone(), info.new_full_path.clone());
+        Ok(info)
     }
 
     /// Phase 2: send batch rename ops to the Hub (add new paths + delete old ones).
@@ -4498,8 +4327,26 @@ struct RenameInfo {
     xet_hash: Option<String>,
     is_dirty: bool,
     new_full_path: String,
-    /// Descendant clean files to rename on the remote (dir renames only).
+    /// Descendant clean files to rename on the remote (dir renames only):
+    /// old path and xet hash.
     descendant_files: Vec<(String, String)>,
+}
+
+/// Unregisters the rename `rename_validate` registered (`InodeTable::renames`)
+/// when dropped, also on error.
+struct RenameMark<'a> {
+    inode_table: &'a RwLock<InodeTable>,
+    old_path: String,
+    new_path: String,
+}
+
+impl Drop for RenameMark<'_> {
+    fn drop(&mut self) {
+        self.inode_table
+            .write()
+            .expect("inodes poisoned")
+            .remove_rename(&self.old_path, &self.new_path);
+    }
 }
 
 // ── Internal types ─────────────────────────────────────────────────────
@@ -4619,11 +4466,8 @@ fn channel_is_terminal(channel: &StreamingChannel) -> bool {
 enum OpenFile {
     /// Local file (staging for writes, or dirty reads).
     Local { ino: u64, file: Arc<File>, writable: bool },
-    /// Lazy remote — data fetched on-demand with adaptive prefetch buffer.
-    Lazy {
-        ino: u64,
-        prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
-    },
+    /// Lazy remote: data fetched on demand, with read-ahead.
+    Lazy { ino: u64, reader: Arc<RemoteReader> },
     /// Streaming append-only writer (default write mode).
     Streaming { ino: u64, channel: Arc<StreamingChannel> },
 }
@@ -4704,9 +4548,7 @@ async fn streaming_worker(
 enum ReadTarget {
     /// Hold an Arc<File> so the FD stays alive even if release() runs concurrently.
     LocalFd(Arc<File>),
-    Remote {
-        prefetch: Arc<tokio::sync::Mutex<PrefetchState>>,
-    },
+    Remote(Arc<RemoteReader>),
 }
 
 #[cfg(test)]
