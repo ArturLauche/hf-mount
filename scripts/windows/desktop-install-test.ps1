@@ -6,9 +6,15 @@
 
 .PARAMETER Installer
     Path to hf-mount Desktop_<version>_x64-setup.exe.
+
+.PARAMETER CliSha256
+    Expected SHA-256 of the hf-mount.exe shipped in the portable archive.
 #>
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Installer)
+param(
+    [Parameter(Mandatory)][string]$Installer,
+    [ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$CliSha256
+)
 
 $ErrorActionPreference = 'Stop'
 function Step([string]$m) { Write-Host "`n== $m" }
@@ -33,7 +39,11 @@ if ($hash -ne '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
 Write-Host "ok  $hash"
 
 Step "Installed CLI runs"
-& (Join-Path $dir 'hf-mount.exe') --version
+$cli = Join-Path $dir 'hf-mount.exe'
+if ($CliSha256 -and (Get-FileHash -Algorithm SHA256 -LiteralPath $cli).Hash -ne $CliSha256) {
+    throw 'Installed CLI does not match the portable CLI from this build'
+}
+& $cli --version
 if ($LASTEXITCODE -ne 0) { throw "hf-mount --version exited $LASTEXITCODE" }
 
 Step "Desktop app starts (tray, window hidden) and keeps running"
