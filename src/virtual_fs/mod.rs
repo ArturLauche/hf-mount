@@ -1553,28 +1553,17 @@ impl VirtualFs {
                     HeadProbe::Transient(e) => return Err(e.to_errno()),
                     HeadProbe::Inconclusive => {}
                 }
-                // The resolve endpoint returns 404 for directories, so a HEAD
-                // miss could still be a remotely-added dir. Targeted listing
-                // catches that; list_tree only returns strict descendants of
-                // the path, so a non-empty result means the dir exists.
-                let entries = match self.hub_client.list_tree(&full_path).await {
-                    Ok(entries) => entries,
-                    Err(e) if e.is_transient() => {
+                // HEAD can miss a remotely added directory. A single real child
+                // proves it exists even if the full listing spans many pages.
+                match self.hub_client.has_children(&full_path).await {
+                    Ok(true) => return self.insert_dir(parent, name, &full_path),
+                    Ok(false) => {}
+                    // Repos return 404 for a missing directory; buckets return an empty list.
+                    Err(e) if e.status() == Some(404) => {}
+                    Err(e) => {
                         debug!("list miss-probe {} failed: {}", full_path, e);
                         return Err(e.to_errno());
                     }
-                    // The repo tree endpoint returns 404 for a nonexistent
-                    // path (buckets return an empty listing): an authoritative
-                    // miss. Other permanent failures also fall through to the
-                    // negative cache — pre-existing behavior, and unlike
-                    // transient ones they won't clear within NEG_CACHE_TTL.
-                    Err(e) => {
-                        debug!("list miss-probe {} failed permanently: {}", full_path, e);
-                        Vec::new()
-                    }
-                };
-                if !entries.is_empty() {
-                    return self.insert_dir(parent, name, &full_path);
                 }
                 self.negative_cache_insert(full_path);
                 return Err(libc::ENOENT);

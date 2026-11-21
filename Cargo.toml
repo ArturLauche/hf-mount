@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive", "env"] }
 ctrlc = { version = "3", features = ["termination"] }
 futures = "0.3"
 libc = "0.2"
+nom-rfc8288 = "0.4"
 nfsserve = { version = "0.11", optional = true }
 percent-encoding = "2"
 reqwest = { version = "0.12", features = ["json", "stream"] }

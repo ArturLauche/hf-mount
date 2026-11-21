@@ -677,7 +677,11 @@ pub fn try_build_with_runtime(
     if read_only && !hub_client.path_prefix().is_empty() {
         runtime.block_on(async {
             if let Err(e) = hub_client.validate_path_prefix().await {
-                warn!("{e}");
+                warn!(
+                    "Checking subfolder '{}' in {} failed: {e}",
+                    hub_client.path_prefix(),
+                    hub_client.source()
+                );
             }
         });
     }

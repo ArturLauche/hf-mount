@@ -11,6 +11,9 @@ use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
 use crate::error::{Error, Result, is_retryable_status, is_transient_http};
 
+mod tree;
+pub use tree::TreeEntry;
+
 /// Characters that must be percent-encoded when a file path is interpolated
 /// into a URL path: `#` starts a fragment, `?` a query string, `%` corrupts
 /// decoding, and the rest are not valid in URL paths. `/` is intentionally
@@ -53,6 +56,16 @@ fn encode_url_revision(revision: &str) -> std::borrow::Cow<'_, str> {
     utf8_percent_encode(revision, URL_REVISION_ESCAPE).into()
 }
 
+/// Startup and polling must inspect the same ref as tree and resolve requests.
+/// Request only the metadata they use; a full repo info response includes its file list.
+fn repo_info_url(endpoint: &str, repo_type: RepoType, repo_id: &str, revision: &str) -> String {
+    format!(
+        "{endpoint}/api/{}/{repo_id}/revision/{}?expand=sha&expand=lastModified",
+        repo_type.api_prefix(),
+        encode_url_revision(revision)
+    )
+}
+
 /// The path of `path` relative to the directory `prefix`, if `path` lives
 /// strictly under `{prefix}/` — as opposed to merely sharing `prefix` as a
 /// raw key prefix (`a/1.manifest#1` vs `a/1.manifest`) or being `prefix`
@@ -70,6 +83,11 @@ pub(crate) fn strict_descendant_rel<'a>(path: &'a str, prefix: &str) -> Option<&
 #[async_trait::async_trait]
 pub trait HubOps: Send + Sync {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>>;
+    /// Does the directory have at least one strict descendant? Implementations
+    /// with paginated listings can stop as soon as they find a child.
+    async fn has_children(&self, prefix: &str) -> Result<bool> {
+        Ok(!self.list_tree(prefix).await?.is_empty())
+    }
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>>;
     async fn batch_operations(&self, ops: &[BatchOp]) -> Result<()>;
     async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()>;
@@ -205,53 +223,6 @@ pub enum BatchOp {
     },
     #[serde(rename_all = "camelCase")]
     DeleteFile { path: String },
-}
-
-/// Unified tree entry exposed to the rest of the codebase.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TreeEntry {
-    pub path: String,
-    #[serde(rename = "type")]
-    pub entry_type: String,
-    pub size: Option<u64>,
-    pub xet_hash: Option<String>,
-    /// Git blob OID (same value as ETag on resolve endpoint).
-    #[serde(default)]
-    pub oid: Option<String>,
-    pub mtime: Option<String>,
-}
-
-/// Raw tree entry from the repo `/tree` API (different shape from bucket tree).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RepoTreeEntry {
-    path: String,
-    #[serde(rename = "type")]
-    entry_type: String,
-    size: Option<u64>,
-    #[serde(default)]
-    oid: Option<String>,
-    #[serde(default)]
-    xet_hash: Option<String>,
-    #[serde(default)]
-    lfs: Option<LfsInfo>,
-    #[serde(default)]
-    last_commit: Option<CommitInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CommitInfo {
-    date: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LfsInfo {
-    size: u64,
-    #[allow(dead_code)]
-    pointer_size: Option<u64>,
 }
 
 /// Metadata returned by HEAD on the resolve endpoint
@@ -502,9 +473,8 @@ fn make_clients(backend: &str) -> (Client, Client, Client) {
 }
 
 impl HubApiClient {
-    /// Create a client from a `SourceKind` (bucket or repo).
-    /// Create a client from a source kind. For repos, resolves aliases
-    /// (e.g. "gpt2" → "openai-community/gpt2") and fetches repo metadata.
+    /// Create a client for a bucket or repo. Resolve repo aliases (e.g.
+    /// "gpt2" → "openai-community/gpt2") and fetch the mounted revision's mtime.
     pub async fn from_source(
         endpoint: &str,
         token: Option<&str>,
@@ -522,7 +492,7 @@ impl HubApiClient {
                 repo_type,
                 revision,
             } => {
-                let url = format!("{}/api/{}/{}", endpoint, repo_type.api_prefix(), repo_id);
+                let url = repo_info_url(&endpoint, repo_type, &repo_id, &revision);
                 let context = format!("resolve repo {repo_id}");
                 let resp =
                     send_with_retry(|| init_auth_get(&client, &url, token, &token_file), &context, false).await?;
@@ -666,42 +636,23 @@ impl HubApiClient {
         }
     }
 
-    /// Strip `path_prefix` from the beginning of `full`. Returns `None` if the
-    /// path doesn't start with the prefix (shouldn't happen for correctly scoped results).
-    fn strip_path_prefix<'a>(&self, full: &'a str) -> Option<&'a str> {
-        if self.path_prefix.is_empty() {
-            return Some(full);
-        }
-        if full == self.path_prefix {
-            // The prefix directory itself — caller should filter this out.
-            return Some("");
-        }
-        strict_descendant_rel(full, &self.path_prefix)
-    }
-
     /// Validate that the path prefix exists on the remote.
-    /// Calls list_tree("") which internally prepends the prefix.
+    /// Probe for a child without enumerating the whole subfolder twice at mount.
     pub async fn validate_path_prefix(&self) -> Result<()> {
         if self.path_prefix.is_empty() {
             return Ok(());
         }
-        let entries = self.list_tree("").await.map_err(|e| {
-            Error::hub(format!(
-                "subfolder '{}' not found in {}: {e}",
-                self.path_prefix, self.source
-            ))
-        })?;
-        if entries.is_empty() {
+        if !self.has_children("").await? {
             return Err(Error::hub(format!(
-                "subfolder '{}' is empty or does not exist in {}",
-                self.path_prefix, self.source,
+                "subfolder '{}' is empty or does not exist",
+                self.path_prefix
             )));
         }
         Ok(())
     }
 
-    /// Cheap probe: fetch `/api/{type}/{id}` or `/api/buckets/{id}` and return
-    /// an opaque revision token. The poll loop calls this once per round and
+    /// Fetch metadata for the mounted repo revision or bucket and return an
+    /// opaque revision token. The poll loop calls this once per round and
     /// skips the full tree fan-out when the token matches the previous one.
     ///
     /// Repos: prefer `sha` (commit head) — changes on every push and only on
@@ -710,9 +661,11 @@ impl HubApiClient {
     /// against the production Hub).
     pub async fn probe_revision(&self) -> Result<String> {
         let url = match &self.source {
-            SourceKind::Repo { repo_id, repo_type, .. } => {
-                format!("{}/api/{}/{}", self.endpoint, repo_type.api_prefix(), repo_id)
-            }
+            SourceKind::Repo {
+                repo_id,
+                repo_type,
+                revision,
+            } => repo_info_url(&self.endpoint, *repo_type, repo_id, revision),
             SourceKind::Bucket { bucket_id } => {
                 format!("{}/api/buckets/{}", self.endpoint, bucket_id)
             }
@@ -782,146 +735,6 @@ impl HubApiClient {
             resp,
             self.path_prefix.clone(),
         ))))
-    }
-
-    /// List tree entries at the given prefix (single directory level).
-    /// Follows `Link` header pagination. For repos, includes `expand=true`
-    /// to get per-file lastCommit (mtime). For buckets, passes `recursive=false`.
-    ///
-    /// Only entries strictly under `{prefix}/` are returned: the bucket tree
-    /// API matches by raw S3 key prefix (listing `a/1.manifest` also returns
-    /// the sibling `a/1.manifest#1`), so raw-prefix matches are filtered out
-    /// here, at the boundary where that server behavior originates. Consumers
-    /// can rely on every entry being a descendant of `prefix`.
-    pub async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
-        let api_prefix = self.prefixed_path(prefix);
-        let mut entries = match &self.source {
-            SourceKind::Bucket { bucket_id } => self.list_tree_bucket(bucket_id, &api_prefix).await?,
-            SourceKind::Repo {
-                repo_id,
-                repo_type,
-                revision,
-            } => self.list_tree_repo(repo_id, *repo_type, revision, &api_prefix).await?,
-        };
-        if !api_prefix.is_empty() {
-            entries.retain(|e| strict_descendant_rel(&e.path, &api_prefix).is_some());
-        }
-
-        // Strip path prefix from returned entries and filter out the prefix dir itself.
-        if !self.path_prefix.is_empty() {
-            entries.retain_mut(|e| {
-                match self.strip_path_prefix(&e.path) {
-                    Some(stripped) if !stripped.is_empty() => {
-                        e.path = stripped.to_string();
-                        true
-                    }
-                    _ => false, // filter out prefix dir itself or unrelated entries
-                }
-            });
-        }
-
-        Ok(entries)
-    }
-
-    async fn list_tree_bucket(&self, bucket_id: &str, prefix: &str) -> Result<Vec<TreeEntry>> {
-        let mut all_entries = Vec::new();
-        let recursive_param = "?recursive=false&limit=5000";
-        let mut url = if prefix.is_empty() {
-            format!("{}/api/buckets/{}/tree{recursive_param}", self.endpoint, bucket_id)
-        } else {
-            format!(
-                "{}/api/buckets/{}/tree/{}{recursive_param}",
-                self.endpoint,
-                bucket_id,
-                encode_url_path(prefix)
-            )
-        };
-
-        loop {
-            let resp = send_with_retry(|| self.auth(self.client.get(&url)), "tree listing", false).await?;
-
-            let next_url = resp
-                .headers()
-                .get("link")
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_link_next);
-
-            let entries: Vec<TreeEntry> = resp.json().await?;
-            all_entries.extend(entries);
-
-            match next_url {
-                Some(next) => url = next,
-                None => break,
-            }
-        }
-
-        Ok(all_entries)
-    }
-
-    async fn list_tree_repo(
-        &self,
-        repo_id: &str,
-        repo_type: RepoType,
-        revision: &str,
-        prefix: &str,
-    ) -> Result<Vec<TreeEntry>> {
-        let mut all_entries = Vec::new();
-        let params = "?limit=1000";
-        let mut url = if prefix.is_empty() {
-            format!(
-                "{}/api/{}/{}/tree/{}{params}",
-                self.endpoint,
-                repo_type.api_prefix(),
-                repo_id,
-                encode_url_revision(revision),
-            )
-        } else {
-            format!(
-                "{}/api/{}/{}/tree/{}/{}{params}",
-                self.endpoint,
-                repo_type.api_prefix(),
-                repo_id,
-                encode_url_revision(revision),
-                encode_url_path(prefix),
-            )
-        };
-
-        loop {
-            let resp = send_with_retry(|| self.auth(self.client.get(&url)), "repo tree listing", false).await?;
-
-            let next_url = resp
-                .headers()
-                .get("link")
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_link_next);
-
-            let raw_entries: Vec<RepoTreeEntry> = resp.json().await?;
-            for raw in raw_entries {
-                // For LFS files, the top-level `size` is the pointer size;
-                // the real file size lives in `lfs.size`.
-                let size = if let Some(ref lfs) = raw.lfs {
-                    Some(lfs.size)
-                } else {
-                    raw.size
-                };
-
-                all_entries.push(TreeEntry {
-                    path: raw.path,
-                    entry_type: raw.entry_type,
-                    size,
-                    xet_hash: raw.xet_hash,
-                    oid: raw.oid,
-                    mtime: raw.last_commit.and_then(|c| c.date),
-                });
-            }
-
-            match next_url {
-                Some(next) => url = next,
-                None => break,
-            }
-        }
-
-        Ok(all_entries)
     }
 
     /// Build the resolve-endpoint URL for `path` (prefixed and URL-encoded).
@@ -1199,6 +1012,10 @@ impl HubOps for HubApiClient {
     async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree(prefix).await
     }
+
+    async fn has_children(&self, prefix: &str) -> Result<bool> {
+        self.has_children(prefix).await
+    }
     async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         self.head_file(path).await
     }
@@ -1229,10 +1046,8 @@ impl HubOps for HubApiClient {
     }
 }
 
-/// Fields read from `/api/{type}/{id}` for the cheap-probe path. For repos,
-/// `sha` is the commit head and changes on every push; `last_modified` is a
-/// fallback when `sha` is absent (older Hub responses). For buckets,
-/// `updated_at` is the only signal.
+/// Repos expose the mounted revision's commit SHA, with its modification time
+/// as a fallback for older Hub responses. Buckets expose their update time.
 #[derive(serde::Deserialize)]
 struct RevisionProbe {
     #[serde(default)]
@@ -1241,21 +1056,6 @@ struct RevisionProbe {
     last_modified: Option<String>,
     #[serde(default, rename = "updatedAt")]
     updated_at: Option<String>,
-}
-
-/// Parse `Link` header to extract the URL with `rel="next"`.
-/// Format: `<https://example.com/page2>; rel="next", <...>; rel="prev"`
-fn parse_link_next(header: &str) -> Option<String> {
-    for part in header.split(',') {
-        let part = part.trim();
-        if part.contains("rel=\"next\"")
-            && let Some(start) = part.find('<')
-            && let Some(end) = part.find('>')
-        {
-            return Some(part[start + 1..end].to_string());
-        }
-    }
-    None
 }
 
 // ── Token refresh ─────────────────────────────────────────────────────
@@ -1358,21 +1158,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_link_next_picks_next_relation() {
-        let header = r#"<https://api.example.com/page=1>; rel="prev", <https://api.example.com/page=3>; rel="next""#;
-        assert_eq!(
-            parse_link_next(header),
-            Some("https://api.example.com/page=3".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_link_next_returns_none_when_missing() {
-        let header = r#"<https://api.example.com/page=1>; rel="prev", <https://api.example.com/page=2>; rel="last""#;
-        assert_eq!(parse_link_next(header), None);
-    }
-
-    #[test]
     fn test_mtime_parsers_fallback_to_unix_epoch_on_invalid_input() {
         assert_eq!(mtime_from_str("not-a-date"), UNIX_EPOCH);
         assert_eq!(mtime_from_http_date("still-not-a-date"), UNIX_EPOCH);
@@ -1463,7 +1248,7 @@ mod tests {
         assert!(split_path_prefix("user/bucket/./foo").is_err());
     }
 
-    // ── prefixed_path / strip_path_prefix tests ───────────────────────
+    // ── prefixed_path tests ───────────────────────
 
     fn make_test_client(prefix: &str, token_file: Option<PathBuf>) -> HubApiClient {
         let (client, head_client, follow_client) = make_clients("test");
@@ -1565,24 +1350,6 @@ mod tests {
         assert_eq!(c.prefixed_path("file.txt"), "sub/dir/file.txt");
         assert_eq!(c.prefixed_path("a/b"), "sub/dir/a/b");
         assert_eq!(c.prefixed_path(""), "sub/dir");
-    }
-
-    #[test]
-    fn test_strip_path_prefix_empty_prefix() {
-        let c = make_test_client("", None);
-        assert_eq!(c.strip_path_prefix("file.txt"), Some("file.txt"));
-        assert_eq!(c.strip_path_prefix("a/b/c"), Some("a/b/c"));
-    }
-
-    #[test]
-    fn test_strip_path_prefix_with_prefix() {
-        let c = make_test_client("sub/dir", None);
-        assert_eq!(c.strip_path_prefix("sub/dir/file.txt"), Some("file.txt"));
-        assert_eq!(c.strip_path_prefix("sub/dir/a/b"), Some("a/b"));
-        // The prefix directory itself → empty string
-        assert_eq!(c.strip_path_prefix("sub/dir"), Some(""));
-        // Unrelated path → None
-        assert_eq!(c.strip_path_prefix("other/file.txt"), None);
     }
 
     // ── token file cache tests ────────────────────────────────────────

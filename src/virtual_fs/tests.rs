@@ -7235,6 +7235,23 @@ fn miss_probe_404_stays_enoent_and_seeds_negative_cache() {
     });
 }
 
+/// A denied listing says nothing about whether the child exists.
+#[test]
+fn forbidden_directory_probe_does_not_seed_a_negative_lookup() {
+    let hub = MockHub::new_repo();
+    let (rt, vfs) = vfs_repo(&hub, &MockXet::new());
+    rt.block_on(async {
+        hub.fail_next_list_tree_with_status(403);
+        assert_eq!(vfs.lookup(ROOT_INODE, "folder").await.unwrap_err(), libc::EACCES);
+        assert!(!vfs.negative_cache_check("folder"));
+        hub.add_file("folder/item", 1, Some("hash"), None);
+        assert_eq!(
+            vfs.lookup(ROOT_INODE, "folder").await.unwrap().kind,
+            InodeKind::Directory
+        );
+    });
+}
+
 /// A PERMANENT HEAD failure must not kill the lookup: the targeted listing
 /// below can still resolve the path when it is a directory (the resolve
 /// endpoint is file-only). Only transient failures early-return.
