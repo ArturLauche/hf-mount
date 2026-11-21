@@ -964,6 +964,8 @@ impl InodeTable {
             self.path_to_inode.remove(&*old_path);
         }
 
+        // Revalidation holds the previous Arc. A fresh allocation on each
+        // move also identifies an ancestor or file renamed away and back.
         let new_full_path_arc: Arc<str> = Arc::from(new_full_path.as_str());
         let children = if let Some(entry) = self.inodes.get_mut(&inode) {
             entry.full_path = new_full_path_arc.clone();

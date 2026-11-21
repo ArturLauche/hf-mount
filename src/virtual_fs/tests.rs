@@ -3571,6 +3571,33 @@ fn revalidation_preserves_open_file_across_remote_replacement() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn overlay_close_after_remote_deletion_preserves_local_replacement() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    hub.add_file("item", 3, Some("old"), None);
+    xet.add_file("old", b"old");
+    let t = make_overlay_test_vfs_with_root(hub.clone(), xet, fresh_overlay_dir("remote-replaced"));
+    t.runtime.block_on(async {
+        let original = t.vfs.lookup(ROOT_INODE, "item").await.unwrap().ino;
+        let old_handle = t.vfs.open(original, false, false, None).await.unwrap();
+        hub.remove_file("item");
+        assert_eq!(t.vfs.lookup(ROOT_INODE, "item").await.unwrap_err(), libc::ENOENT);
+
+        let (local, local_handle) = t.vfs.create(ROOT_INODE, "item", 0o644, 1000, 1000, None).await.unwrap();
+        assert_ne!(local.ino, original);
+        write_blocking(&t.vfs, local.ino, local_handle, 0, b"replacement")
+            .await
+            .unwrap();
+        t.vfs.release(local_handle).await.unwrap();
+        assert_eq!(&t.vfs.read(old_handle, 0, 3).await.unwrap().0[..], b"old");
+        t.vfs.release(old_handle).await.unwrap();
+        assert_eq!(std::fs::read(t.overlay_root.join("item")).unwrap(), b"replacement");
+        assert_eq!(t.vfs.lookup(ROOT_INODE, "item").await.unwrap().ino, local.ino);
+    });
+}
+
 /// Dirty files are not overwritten by revalidation (uses advanced mode to avoid streaming hangs).
 #[test]
 fn revalidation_skips_dirty_files() {
@@ -6702,13 +6729,37 @@ fn overlay_unlink_local_file_ok() {
             .await
             .unwrap();
         write_blocking(&t.vfs, attr.ino, fh, 0, b"data").await.unwrap();
-        t.vfs.release(fh).await.unwrap();
-
         t.vfs.unlink(ROOT_INODE, "local.txt").await.unwrap();
+        assert!(!t.overlay_root.join("local.txt").exists());
+        let (new, new_fh) = t
+            .vfs
+            .create(ROOT_INODE, "local.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, new.ino, new_fh, 0, b"new").await.unwrap();
+        assert_eq!(&t.vfs.read(fh, 0, 4).await.unwrap().0[..], b"data");
+        t.vfs.release(fh).await.unwrap();
+        t.vfs.release(new_fh).await.unwrap();
+        assert_eq!(std::fs::read(t.overlay_root.join("local.txt")).unwrap(), b"new");
     });
 
     let log = hub.take_batch_log();
     assert!(log.is_empty(), "unlink should not send remote ops in overlay: {log:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_create_preserves_a_backing_file_added_after_the_directory_listing() {
+    let root = tempfile::tempdir().unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let path = root.path().join("occupied");
+        std::fs::write(&path, b"existing").unwrap();
+        let result = t.vfs.create(ROOT_INODE, "occupied", 0o644, 1000, 1000, None).await;
+        assert_eq!(result.unwrap_err(), libc::EEXIST);
+        assert_eq!(std::fs::read(path).unwrap(), b"existing");
+    });
 }
 
 /// Rename of a remote-only file returns EPERM in overlay mode.
@@ -6754,10 +6805,18 @@ fn overlay_rename_local_moves_on_disk() {
         write_blocking(&t.vfs, attr.ino, fh, 0, b"rename me").await.unwrap();
         t.vfs.release(fh).await.unwrap();
 
+        let (old, old_fh) = t
+            .vfs
+            .create(ROOT_INODE, "dst.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, old.ino, old_fh, 0, b"old").await.unwrap();
         t.vfs
             .rename(ROOT_INODE, "src.txt", ROOT_INODE, "dst.txt", false)
             .await
             .unwrap();
+        assert_eq!(&t.vfs.read(old_fh, 0, 3).await.unwrap().0[..], b"old");
+        t.vfs.release(old_fh).await.unwrap();
     });
 
     assert!(!t.overlay_root.join("src.txt").exists(), "old path should be gone");

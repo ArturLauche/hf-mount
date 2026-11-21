@@ -58,6 +58,7 @@ impl FileRevalidation {
             return;
         };
         if entry.inode != self.ino
+            || !Arc::ptr_eq(&entry.full_path, &self.path)
             || inodes.is_held_locally(entry)
             || entry.last_revalidated != self.last_revalidated
             || entry.xet_hash != self.hash
@@ -149,6 +150,50 @@ pub(super) fn remove_remote_file(
 mod tests {
     use super::*;
     use crate::virtual_fs::inode::{InodeKind, ROOT_INODE};
+
+    #[test]
+    fn head_from_before_a_file_or_parent_rename_round_trip_is_stale() {
+        let mut table = InodeTable::new(false);
+        let dir = table.insert(
+            ROOT_INODE,
+            "dir".into(),
+            "dir".into(),
+            InodeKind::Directory,
+            0,
+            SystemTime::UNIX_EPOCH,
+            None,
+            0o755,
+            1000,
+            1000,
+        );
+        let file = table.insert(
+            dir,
+            "file".into(),
+            "dir/file".into(),
+            InodeKind::File,
+            4,
+            SystemTime::UNIX_EPOCH,
+            None,
+            0o644,
+            1000,
+            1000,
+        );
+        let mut pending = Vec::new();
+        for (ino, parent, name) in [(file, dir, "file"), (dir, ROOT_INODE, "dir")] {
+            let check = FileRevalidation::new(table.get(file).unwrap());
+            for (from, to) in [(name, "tmp"), ("tmp", name)] {
+                let path = crate::virtual_fs::inode::child_path(&table.get(parent).unwrap().full_path, to);
+                table.move_child(ino, parent, from, parent, to);
+                table.update_subtree_paths(ino, path);
+            }
+            check.apply(&mut table, None, &mut pending);
+            assert_eq!(table.get_by_path("dir/file").map(|e| e.inode), Some(file));
+            assert!(pending.is_empty());
+        }
+        let fresh = FileRevalidation::new(table.get(file).unwrap());
+        fresh.apply(&mut table, None, &mut pending);
+        assert!(table.get_by_path("dir/file").is_none());
+    }
 
     #[test]
     fn stale_head_cannot_discard_a_newer_update_a_rename_or_a_dirty_file() {

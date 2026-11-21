@@ -1094,19 +1094,6 @@ impl VirtualFs {
         }
     }
 
-    fn remove_local_backing_file(&self, ino: u64, full_path: &str) -> std::io::Result<()> {
-        match self.overlay_backing.as_deref() {
-            Some(overlay) => overlay.remove_file(full_path),
-            None => {
-                let path = self
-                    .staging
-                    .path(ino)
-                    .expect("staging directory required for local backing");
-                std::fs::remove_file(&path)
-            }
-        }
-    }
-
     /// Install a pending commit watch hook on a streaming channel.
     /// Called in flush() before commit or deferral so open() can await the result.
     /// No-op if a hook is already installed (prevents replacing a receiver that
@@ -2589,37 +2576,19 @@ impl VirtualFs {
         }
     }
 
-    /// Last-close cleanup: reap the orphan or evict-pending inode, remove its
-    /// local backing (overlay file or staging), and GC clean staging files
-    /// over budget.
+    /// Last close can reclaim inode-keyed staging. An unlinked overlay name
+    /// may already belong to another file, so only unlink or rename may remove it.
     async fn reap_on_last_release(&self, ino: u64) {
-        let (removed, is_clean, overlay_path) = {
+        let (removed, is_clean) = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            // Capture path before removal so we can clean up the overlay
-            // backing file for an unlink-while-open case (POSIX delete on
-            // last close): unlink() saw open handles and skipped the
-            // overlay-side remove, so we have to do it here.
-            let overlay_path = self
-                .overlay_backing
-                .is_some()
-                .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
-                .flatten();
             let orphan = inodes.remove_orphan(ino);
             let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
             let removed = orphan || evicted;
             let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
-            (removed, is_clean, overlay_path.filter(|_| removed))
+            (removed, is_clean)
         };
         if removed {
-            if let Some(path) = overlay_path {
-                if let Err(e) = self.remove_local_backing_file(ino, &path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!("Failed to remove overlay file for ino={} on release: {}", ino, e);
-                }
-            } else {
-                self.drop_staging(ino);
-            }
+            self.drop_staging(ino);
         } else if is_clean && self.staging.gc_one(ino, &self.inode_table).await {
             debug!("staging GC: removed ino={} on release", ino);
         }
@@ -2765,6 +2734,26 @@ impl VirtualFs {
         Ok(())
     }
 
+    fn register_created_local_file(
+        &self,
+        inodes: &InodeTable,
+        ino: u64,
+        file: File,
+    ) -> VirtualFsResult<(VirtualFsAttr, u64)> {
+        let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
+        let fh = self.alloc_file_handle();
+        inodes.bump_open_handles(ino);
+        self.open_files.write().expect("open_files poisoned").insert(
+            fh,
+            OpenFile::Local {
+                ino,
+                file: Arc::new(file),
+                writable: true,
+            },
+        );
+        Ok((attr, fh))
+    }
+
     pub async fn create(
         &self,
         parent: u64,
@@ -2789,7 +2778,7 @@ impl VirtualFs {
 
         let now = SystemTime::now();
         // Re-check parent + EEXIST + insert under one write lock (TOCTOU guard)
-        let (ino, full_path, dirty_gen) = {
+        let (ino, full_path, dirty_gen, overlay_open) = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let parent_entry = match inodes.get(parent) {
                 Some(e) if e.kind == InodeKind::Directory => e,
@@ -2800,6 +2789,14 @@ impl VirtualFs {
             if inodes.lookup_child(parent, name).is_some() {
                 return Err(libc::EEXIST);
             }
+            // Overlay namespace operations share this lock. Create and pin
+            // the backing descriptor before unlink or rename can reuse the name.
+            let overlay_file = self
+                .overlay_backing
+                .as_ref()
+                .map(|overlay| overlay.create_file(&full_path, mode))
+                .transpose()
+                .map_err(|e| crate::error::io_errno(&e))?;
             // Insert as dirty — content lives in local staging until flushed
             let ino = inodes.insert(
                 parent,
@@ -2821,7 +2818,10 @@ impl VirtualFs {
             };
             inodes.touch_parent(parent, now);
             inodes.touch(ino);
-            (ino, full_path, dirty_gen)
+            let overlay_open = overlay_file
+                .map(|file| self.register_created_local_file(&inodes, ino, file))
+                .transpose()?;
+            (ino, full_path, dirty_gen, overlay_open)
         };
 
         self.negative_cache_remove(&full_path);
@@ -2829,29 +2829,15 @@ impl VirtualFs {
             fm.cancel_delete(&full_path);
         }
 
+        if let Some(open) = overlay_open {
+            return Ok(open);
+        }
         if self.advanced_writes {
-            // Advanced mode: staging file on disk + async flush (or overlay file in overlay mode).
+            // Non-overlay staging files are keyed by inode and may be opened outside the namespace lock.
             match self.open_local_backing_file(ino, &full_path, true, true, true, true) {
                 Ok(file) => {
-                    if let Err(e) = self.set_local_backing_mode(&full_path, mode) {
-                        error!("Failed to set local backing mode for {}: {}", full_path, e);
-                        self.inode_table.write().expect("inodes poisoned").remove(ino);
-                        return Err(libc::EIO);
-                    }
-                    let file_handle = self.alloc_file_handle();
                     let inodes = self.inode_table.read().expect("inodes poisoned");
-                    inodes.bump_open_handles(ino);
-                    self.open_files.write().expect("open_files poisoned").insert(
-                        file_handle,
-                        OpenFile::Local {
-                            ino,
-                            file: Arc::new(file),
-                            writable: true,
-                        },
-                    );
-
-                    let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
-                    Ok((attr, file_handle))
+                    self.register_created_local_file(&inodes, ino, file)
                 }
                 Err(e) => {
                     error!("Failed to create staging file: {}", e);
@@ -3320,6 +3306,19 @@ impl VirtualFs {
         // so open file handles can still fstat() it.
         let inode_fully_removed = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
+            let entry = inodes.lookup_child(parent, name).ok_or(libc::ENOENT)?;
+            if entry.inode != ino || entry.full_path.as_ref() != full_path {
+                return Err(libc::ENOENT);
+            }
+            if let Some(overlay) = &self.overlay_backing {
+                // Remove the name while it still belongs to this inode. Open
+                // handles retain the original file descriptor across unlink.
+                if let Err(e) = overlay.remove_file(&full_path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(crate::error::io_errno(&e));
+                }
+            }
             let last_link = inodes
                 .unlink_one(parent, name)
                 .map(|(removed, _)| removed)
@@ -3358,15 +3357,7 @@ impl VirtualFs {
         // open fd, drop_staging waits until release() so writes through the
         // surviving fd can still update bytes_used coherently.
         if inode_fully_removed {
-            if self.overlay() {
-                if let Err(e) = self.remove_local_backing_file(ino, &full_path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!("Failed to remove overlay file for ino={}: {}", ino, e);
-                }
-            } else {
-                self.staging.drop_locked(ino).await;
-            }
+            self.staging.drop_locked(ino).await;
         }
 
         info!("Deleted file: {}", full_path);
@@ -3606,28 +3597,6 @@ impl VirtualFs {
         };
         let old_path = info.old_path.clone();
 
-        // Overlay: move the on-disk file to match the new path.
-        if let Some(overlay) = &self.overlay_backing {
-            let old_exists = overlay.exists(&info.old_path).map_err(|e| {
-                error!("Overlay rename: failed to stat {}: {}", info.old_path, e);
-                libc::EIO
-            })?;
-            if !old_exists {
-                return Err(libc::EPERM);
-            }
-            if let Err(e) = overlay.create_parent_dirs(&info.new_full_path) {
-                error!("Overlay rename: failed to create destination parents: {}", e);
-                return Err(crate::error::io_errno(&e));
-            }
-            if let Err(e) = overlay.rename(&info.old_path, &info.new_full_path) {
-                error!(
-                    "Overlay rename {} -> {} failed: {}",
-                    info.old_path, info.new_full_path, e
-                );
-                return Err(crate::error::io_errno(&e));
-            }
-        }
-
         // Phase 3: apply to local inode table under write lock.
         // If Phase 2 mutated the remote and Phase 3 fails with ENOENT (source
         // concurrently unlinked), swallow the error and let poll reconcile.
@@ -3645,7 +3614,7 @@ impl VirtualFs {
                 }
                 Ok(())
             }
-            Err(libc::ENOENT) if remote_mutated || self.overlay() => {
+            Err(libc::ENOENT) if remote_mutated => {
                 warn!("rename: source gone after rename; next dir load will reconcile");
                 // Invalidate parents so the next lookup re-fetches from remote
                 // instead of trusting the stale children_loaded state.
@@ -3849,7 +3818,10 @@ impl VirtualFs {
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
 
         // Re-validate source still exists (could have been unlinked concurrently)
-        if inodes.get(info.ino).is_none() {
+        if !inodes
+            .lookup_child(parent, oldname)
+            .is_some_and(|entry| entry.inode == info.ino && entry.full_path.as_ref() == info.old_path)
+        {
             return Err(libc::ENOENT);
         }
 
@@ -3877,6 +3849,23 @@ impl VirtualFs {
         } else {
             None
         };
+        if let Some(overlay) = &self.overlay_backing {
+            // Serialize both namespace changes with unlink and with each
+            // other. Once the backing rename succeeds, the table update is infallible.
+            let dest_parent = inodes.get(newparent).ok_or(libc::ENOENT)?;
+            if inode::child_path(&dest_parent.full_path, newname) != info.new_full_path {
+                return Err(libc::ENOENT);
+            }
+            if !overlay.exists(&info.old_path).map_err(|e| crate::error::io_errno(&e))? {
+                return Err(libc::EPERM);
+            }
+            overlay
+                .create_parent_dirs(&info.new_full_path)
+                .map_err(|e| crate::error::io_errno(&e))?;
+            overlay
+                .rename(&info.old_path, &info.new_full_path)
+                .map_err(|e| crate::error::io_errno(&e))?;
+        }
         let mut replaced_staging_ino: Option<u64> = None;
         if let Some((existing_ino, existing_kind)) = replace_target {
             if existing_kind == InodeKind::Directory {
