@@ -994,14 +994,20 @@ impl VirtualFs {
         self.next_file_handle.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Bump the per-inode open-handle refcount. Used by the FUSE adapter
-    /// on `opendir` so a directory with an active readdir can't be evicted.
+    /// Check the type and pin the directory under one table lock, so a
+    /// concurrent eviction cannot intervene between the two.
     #[cfg(feature = "fuse")]
-    pub(crate) fn bump_open_handles(&self, ino: u64) {
-        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+    pub(crate) fn pin_directory(&self, ino: u64) -> VirtualFsResult<()> {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        if inodes.get(ino).ok_or(libc::ENOENT)?.kind != InodeKind::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        inodes.touch(ino);
+        inodes.bump_open_handles(ino);
+        Ok(())
     }
 
-    /// Counterpart to `bump_open_handles`, called from `releasedir`.
+    /// Release a directory pin after the last in-flight read of its handle.
     #[cfg(feature = "fuse")]
     pub(crate) fn drop_open_handles(&self, ino: u64) {
         self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
@@ -1836,6 +1842,16 @@ impl VirtualFs {
     }
 
     pub async fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {
+        self.collect_dir_entries(ino, ToString::to_string).await
+    }
+
+    /// Full-list callers own their names. A long-lived FUSE listing can
+    /// instead share the immutable names already stored in the inode table.
+    pub(crate) async fn collect_dir_entries<Name: From<&'static str>>(
+        &self,
+        ino: u64,
+        copy_name: impl Fn(&Arc<str>) -> Name,
+    ) -> VirtualFsResult<Vec<DirectoryEntry<Name>>> {
         debug!("readdir: ino={}", ino);
 
         self.ensure_children_loaded(ino).await?;
@@ -1844,23 +1860,23 @@ impl VirtualFs {
         let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
 
         let mut entries = Vec::with_capacity(2 + entry.children.len());
-        entries.push(VirtualFsDirEntry {
+        entries.push(DirectoryEntry {
             ino,
             kind: InodeKind::Directory,
-            name: ".".to_string(),
+            name: ".".into(),
         });
-        entries.push(VirtualFsDirEntry {
+        entries.push(DirectoryEntry {
             ino: entry.parent,
             kind: InodeKind::Directory,
-            name: "..".to_string(),
+            name: "..".into(),
         });
 
         for child_ref in &entry.children {
             if let Some(child) = inodes.get(child_ref.ino) {
-                entries.push(VirtualFsDirEntry {
+                entries.push(DirectoryEntry {
                     ino: child.inode,
                     kind: child.kind,
-                    name: child_ref.name.to_string(),
+                    name: copy_name(&child_ref.name),
                 });
             }
         }
@@ -4175,11 +4191,15 @@ pub struct PendingUploads {
     pub failed_files: usize,
 }
 
+/// An entry returned by the public full-directory listing.
+pub type VirtualFsDirEntry = DirectoryEntry<String>;
+
+/// A directory entry with either an owned name or one shared with the inode table.
 #[derive(Debug)]
-pub struct VirtualFsDirEntry {
+pub struct DirectoryEntry<Name> {
     pub ino: u64,
     pub kind: InodeKind,
-    pub name: String,
+    pub name: Name,
 }
 
 /// Snapshot of rename state collected under read lock (phase 1),

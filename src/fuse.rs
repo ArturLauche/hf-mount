@@ -1,9 +1,12 @@
+mod directory;
+
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -25,6 +28,7 @@ const GENERATION: Generation = Generation(0);
 pub struct FuseAdapter {
     runtime: tokio::runtime::Handle,
     virtual_fs: Arc<VirtualFs>,
+    directories: Mutex<HashMap<FileHandle, Arc<directory::OpenDirectory>>>,
     /// Kernel metadata cache TTL. Short enough to detect remote changes quickly,
     /// long enough to avoid cascade re-lookups in the kernel.
     metadata_ttl: Duration,
@@ -46,6 +50,7 @@ impl FuseAdapter {
         Self {
             runtime,
             virtual_fs,
+            directories: Mutex::new(HashMap::new()),
             metadata_ttl,
             read_only,
             advanced_writes,
@@ -212,24 +217,17 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// List directory entries. `offset` is the index of the last entry already returned;
-    /// entries before it are skipped so the kernel can paginate large directories.
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        match self.runtime.block_on(self.virtual_fs.readdir(ino.0)) {
-            Ok(entries) => {
-                for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                    let file_type = match entry.kind {
-                        InodeKind::File => FileType::RegularFile,
-                        InodeKind::Directory => FileType::Directory,
-                        InodeKind::Symlink => FileType::Symlink,
-                    };
-                    // (i + 1) is the offset cookie the kernel will pass back on the next call.
-                    if reply.add(INodeNo(entry.ino), (i + 1) as u64, file_type, entry.name) {
-                        break; // reply buffer full
-                    }
-                }
-                reply.ok();
-            }
+    fn readdir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        let result = self.read_directory(fh, offset, |cookie, entry| {
+            let kind = match entry.kind {
+                InodeKind::File => FileType::RegularFile,
+                InodeKind::Directory => FileType::Directory,
+                InodeKind::Symlink => FileType::Symlink,
+            };
+            reply.add(INodeNo(entry.ino), cookie, kind, entry.name.as_ref())
+        });
+        match result {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -531,23 +529,17 @@ impl Filesystem for FuseAdapter {
 
     /// Open a directory (allocates a handle for readdir).
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.virtual_fs.getattr(ino.0) {
-            Ok(attr) if attr.kind == InodeKind::Directory => {
-                // Pin the dir against eviction until the matching releasedir.
-                // Otherwise a concurrent force-evict could drop the inode
-                // between opendir and the readdir that follows.
-                self.virtual_fs.bump_open_handles(ino.0);
-                reply.opened(FileHandle(self.virtual_fs.alloc_file_handle()), FopenFlags::empty());
-            }
-            Ok(_) => reply.error(Errno::ENOTDIR),
+        match self.open_directory(ino.0) {
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    /// Release a directory handle. Drops the refcount bumped by `opendir`.
-    fn releasedir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
-        self.virtual_fs.drop_open_handles(ino.0);
-        reply.ok();
+    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+        match self.close_directory(fh) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
     }
 
     /// Filesystem statistics (df). Reports 42 PB for fun

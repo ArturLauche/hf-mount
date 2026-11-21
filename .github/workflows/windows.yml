@@ -76,6 +76,11 @@ jobs:
       - name: Unit tests
         run: cargo test --locked --lib --features fuse,nfs
 
+      - name: FUSE directory paging through the kernel
+        run: |
+          sudo modprobe fuse
+          cargo test --locked --lib --features fuse,nfs kernel_directory_stream_survives_remote_mutation -- --ignored
+
   windows:
     name: Windows build, tests & WinFsp mount tests
     runs-on: windows-2025

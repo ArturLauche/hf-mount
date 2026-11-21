@@ -398,10 +398,12 @@ hf-mount provides **eventual consistency** with remote changes. For buckets, a l
 Files can be stale for up to `--metadata-ttl-ms` (default 10 s) after a remote update. Three mechanisms detect changes:
 
 1. **Live-follow stream** (buckets, default on, `--live-follow`) -- subscribes to the Hub's `/api/buckets/{id}/events` SSE feed; adds, updates, and deletes land in already-loaded directories within about a second of the remote commit. On any stream interruption the client reconnects with its last cursor; when the server can't resume (its replay buffer covers ~15 min), one full poll round reconciles before re-subscribing. Reconnects back off exponentially (10 s base, honoring `Retry-After`). If the Hub doesn't serve the feed, or streams keep dying before the initial `ready`, the mount falls back to interval polling for the session.
-2. **Metadata revalidation** (FUSE only) -- when the per-file TTL expires, the next access checks the Hub. If the file changed, cached data is invalidated.
-3. **Background polling** (default every 30 s) -- lists the full tree and detects additions, modifications, and deletions. Skipped entirely while the live-follow stream is healthy.
+2. **Metadata revalidation** (FUSE only) checks the Hub on access after the per-file TTL expires. If the file changed, hf-mount invalidates cached data. If it was deleted, the name disappears and an existing open file handle keeps its inode until close.
+3. **Background polling** (default every 30 s) checks the mounted repo revision or the bucket update time. When it changes, hf-mount lists the directories you have visited and reconciles additions, modifications, and deletions. If any directory listing fails, polling retries even if the revision stays the same. A healthy live-follow stream takes over this work.
 
 A lookup of a path that does not exist yet probes the Hub directly, so a file added remotely is visible as soon as the upload lands. Repeated misses are served from a negative cache for `--negative-ttl-ms` (default 1 s) without hitting the Hub; a client that probes a path before the producer finishes uploading sees it at most that long after it lands.
+
+On FUSE, the first read of an open directory captures its entry names. As you read further, additions, deletions, and renames leave the positions in that listing stable. Rewinding or reopening reads the current cached view, subject to the metadata TTL. Each enumerated handle retains one entry reference per name until rewind or close.
 
 ### Writes
 
@@ -453,6 +455,12 @@ See the [hf-csi-driver README](https://github.com/huggingface/hf-csi-driver#read
 ```bash
 # Unit tests (no network, no token)
 cargo test --lib --features fuse,nfs
+
+# Directory paging through the Linux kernel (requires a mountable /dev/fuse, no token)
+cargo test --lib --features fuse kernel_directory_stream_survives_remote_mutation -- --ignored
+
+# Local directory paging and poll reconciliation benchmarks (no Hub or mount required)
+cargo test --release --lib --features fuse,nfs bench_ -- --ignored --nocapture --test-threads=1
 
 # Integration tests (require HF_TOKEN and FUSE)
 HF_TOKEN=... cargo test --release --features fuse,nfs --test fuse_ops -- --test-threads=1 --nocapture
