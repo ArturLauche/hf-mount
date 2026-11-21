@@ -737,12 +737,13 @@ impl InodeTable {
             .collect()
     }
 
-    /// Snapshot of all file entries: (ino, full_path, xet_hash, etag, size, is_dirty)
+    /// Snapshot of files still linked into the tree. An open, unlinked inode
+    /// can share its old path with a replacement; Hub listings describe the replacement.
     #[allow(clippy::type_complexity)]
     pub fn file_snapshot(&self) -> Vec<(u64, Arc<str>, Option<String>, Option<String>, u64, bool)> {
         self.inodes
             .values()
-            .filter(|e| e.kind == InodeKind::File)
+            .filter(|e| e.kind == InodeKind::File && e.nlink > 0)
             .map(|e| {
                 (
                     e.inode,

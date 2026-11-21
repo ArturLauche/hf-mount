@@ -10,6 +10,7 @@ use crate::follow::{FollowChange, FollowEvent, FollowOp};
 use crate::hub_api::HubOps;
 
 use super::inode::{InodeKind, InodeTable, ROOT_INODE};
+use super::revalidate::{queue_file_invalidation, remove_remote_file};
 use super::{InvalKind, Invalidator};
 
 /// Exponential backoff shared by the remote-change loops: `base * 2^exp`,
@@ -56,50 +57,6 @@ impl Backoff {
     }
 }
 
-/// Queue the kernel invalidation for a file whose remote metadata changed.
-/// An inode with open handles may have an in-flight read holding its folio
-/// locks; a full page invalidation would block in the kernel waiting on
-/// that lock and deadlock against the read (#195), so such inodes get an
-/// attribute-only invalidation that never touches pages.
-fn queue_file_invalidation(inode_table: &InodeTable, ino: u64, inos_to_invalidate: &mut Vec<(u64, InvalKind)>) {
-    let kind = if inode_table.has_open_handles(ino) {
-        InvalKind::AttrOnly
-    } else {
-        InvalKind::Pages
-    };
-    inos_to_invalidate.push((ino, kind));
-}
-
-/// Drop a remotely deleted file from the inode table and queue the parent
-/// directory + inode invalidations. Returns the parent directory, or `None`
-/// when the inode is gone, dirty (local writes take precedence until flushed)
-/// or being renamed (the deletion is the rename's own commit).
-fn remove_remote_file(
-    inode_table: &mut InodeTable,
-    ino: u64,
-    inos_to_invalidate: &mut Vec<(u64, InvalKind)>,
-) -> Option<u64> {
-    let (parent_ino, name) = match inode_table.get(ino) {
-        Some(entry) if inode_table.is_held_locally(entry) => return None,
-        Some(entry) => (entry.parent, entry.name.clone()),
-        None => return None,
-    };
-    inos_to_invalidate.push((parent_ino, InvalKind::Pages));
-    // Decide the invalidation kind while the inode is still in the table.
-    queue_file_invalidation(inode_table, ino, inos_to_invalidate);
-    if inode_table.has_open_handles(ino) {
-        // Unlink the pathname but keep the inode as orphan (nlink=0)
-        // so open handles can still read/fstat. release() will clean
-        // up the orphan. Without this, the file stays visible by name
-        // and a recreated file at the same path would collide.
-        inode_table.unlink_one(parent_ino, &name);
-        debug!("Remote deletion of ino={ino}: unlinked path, kept orphan (open handles)");
-    } else {
-        inode_table.remove(ino);
-    }
-    Some(parent_ino)
-}
-
 /// A bucket has no directory objects: a directory exists only while a file
 /// sits under it. After a remote deletion in `dir_ino`, walk up while the
 /// directory may have lost its last file (no file child left, or not listed
@@ -143,6 +100,25 @@ pub(super) struct PollRound {
 /// rate only makes things worse.
 fn should_back_off(e: &Error) -> bool {
     matches!(e.status(), Some(401)) || e.is_transient()
+}
+
+/// Forget misses under a changed directory, including a miss for the directory
+/// itself. Visit each cached path once even if hundreds of directories changed.
+fn invalidate_cached_misses(cache: &mut HashMap<String, Instant>, dirs: &HashSet<&str>) {
+    if dirs.contains("") {
+        cache.clear();
+    } else if dirs.len() == 1 {
+        let dir = *dirs.iter().next().expect("one directory");
+        cache.retain(|path, _| {
+            !path
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        });
+    } else {
+        cache.retain(|path, _| {
+            !dirs.contains(path.as_str()) && !path.match_indices('/').any(|(slash, _)| dirs.contains(&path[..slash]))
+        });
+    }
 }
 
 impl super::VirtualFs {
@@ -202,23 +178,13 @@ impl super::VirtualFs {
         loop {
             tokio::time::sleep(backoff.delay()).await;
 
-            match hub_client.probe_revision().await {
-                Ok(rev) => {
-                    // A successful probe means the Hub recovered: reset the
-                    // backoff even when the revision is unchanged, otherwise a
-                    // healthy-but-quiet mount stays at the max poll interval
-                    // until the next remote change.
-                    if backoff.is_backing_off() {
-                        info!("Revision probe recovered, resetting backoff");
-                        backoff.reset();
-                    }
-                    if last_revision.as_ref() == Some(&rev) {
-                        debug!("Revision unchanged ({rev}); skipping tree fan-out");
-                        continue;
-                    }
-                    debug!("Revision changed to {rev}; running full poll");
-                    last_revision = Some(rev);
+            let revision = match hub_client.probe_revision().await {
+                Ok(rev) if last_revision.as_ref() == Some(&rev) => {
+                    debug!("Revision unchanged ({rev}); skipping tree fan-out");
+                    backoff.reset();
+                    continue;
                 }
+                Ok(rev) => Some(rev),
                 Err(e) => {
                     if should_back_off(&e) {
                         backoff.next();
@@ -230,11 +196,16 @@ impl super::VirtualFs {
                         continue;
                     }
                     warn!("Revision probe failed, falling back to full poll: {e}");
+                    None
                 }
-            }
+            };
 
             let round =
                 Self::poll_round(&hub_client, &inodes, &negative_cache, &invalidator, listing_concurrency).await;
+            // A partial round may already have applied some changes. Neither
+            // the old nor the new revision describes that view. Retry even if
+            // the ref stays put (or moves back to its previous commit).
+            last_revision = if round.complete { revision } else { None };
             if round.saw_backoff_status {
                 backoff.next();
                 warn!(
@@ -262,7 +233,7 @@ impl super::VirtualFs {
         // directories have never been accessed.
         let prefixes = inodes.read().expect("inodes poisoned").loaded_dir_prefixes();
         // buffer_unordered yields out of order, so carry the prefix alongside the result.
-        let results: Vec<(String, _)> = stream::iter(prefixes)
+        let mut listings = stream::iter(prefixes)
             .map(|prefix| {
                 let client = hub_client.clone();
                 async move {
@@ -270,14 +241,12 @@ impl super::VirtualFs {
                     (prefix, result)
                 }
             })
-            .buffer_unordered(listing_concurrency)
-            .collect()
-            .await;
+            .buffer_unordered(listing_concurrency);
         let mut all_entries = Vec::new();
         let mut polled_prefixes = HashSet::new();
         let mut failed_prefixes = Vec::new();
         let mut saw_backoff_status = false;
-        for (prefix, result) in results {
+        while let Some((prefix, result)) = listings.next().await {
             match result {
                 Ok(entries) => {
                     polled_prefixes.insert(prefix);
@@ -629,15 +598,15 @@ impl super::VirtualFs {
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: &Invalidator,
     ) {
-        let remote_map: HashMap<String, _> = remote_entries
-            .iter()
-            .filter(|e| e.entry_type == "file")
-            .map(|e| (e.path.clone(), e))
-            .collect();
-
-        // All remote paths (including directories) for new-entry detection.
-        // Non-recursive listings return subdirs as directory entries, not nested file paths.
-        let all_remote_paths: HashSet<&str> = remote_entries.iter().map(|e| e.path.as_str()).collect();
+        // Index every path once. When a listing contains both a file and
+        // a directory at a path, retain the file metadata for file diffing.
+        let mut remote_by_path = HashMap::with_capacity(remote_entries.len());
+        for entry in &remote_entries {
+            let file = remote_by_path.entry(entry.path.as_str()).or_insert(None);
+            if entry.entry_type == "file" {
+                *file = Some(entry);
+            }
+        }
 
         // Take snapshot under lock, then release to avoid blocking VFS ops
         let snapshot = inodes.read().expect("inodes poisoned").file_snapshot();
@@ -659,7 +628,7 @@ impl super::VirtualFs {
             if *is_dirty {
                 continue;
             }
-            match remote_map.get(path.as_ref()) {
+            match remote_by_path.get(path.as_ref()).copied().flatten() {
                 Some(remote) => {
                     let remote_hash = remote.xet_hash.as_deref();
                     let remote_oid = remote.oid.as_deref();
@@ -710,13 +679,14 @@ impl super::VirtualFs {
             // The diff was computed from a snapshot: an inode renamed since
             // then sits at another path, which the listing says nothing about.
             let at_path =
-                |table: &InodeTable, ino: u64, path: &str| table.get(ino).is_some_and(|e| &*e.full_path == path);
+                |table: &InodeTable, ino: u64, path: &str| table.get_by_path(path).is_some_and(|e| e.inode == ino);
             for update in updates {
                 if !at_path(&inode_table, update.ino, &update.path) {
                     continue;
                 }
-                inode_table.update_remote_file(update.ino, update.hash, update.etag, update.size, update.mtime);
-                queue_file_invalidation(&inode_table, update.ino, &mut inos_to_invalidate);
+                if inode_table.update_remote_file(update.ino, update.hash, update.etag, update.size, update.mtime) {
+                    queue_file_invalidation(&inode_table, update.ino, &mut inos_to_invalidate);
+                }
             }
 
             // Re-checked under the write lock by the helper: the inode may
@@ -728,18 +698,17 @@ impl super::VirtualFs {
             }
 
             // Phase 3: New remote entries (files AND directories) -> invalidate parent dir.
-            // Use all_remote_paths (not just files) so new subdirectories also trigger
-            // parent invalidation. Only invalidate directories whose children have been
+            // Only invalidate directories whose children have been
             // loaded — unloaded dirs contain entries that are simply unexplored, not new.
             let mut dirs_to_invalidate = HashSet::new();
-            let mut dir_paths_to_invalidate = Vec::new();
-            for path in &all_remote_paths {
+            let mut dir_paths_to_invalidate = HashSet::new();
+            for path in remote_by_path.keys() {
                 if inode_table.get_by_path(path).is_none() {
                     let (dir_ino, dir_path) = inode_table.nearest_dir_ancestor(path);
                     // Only invalidate if this directory was already loaded.
                     // If not loaded, the "missing" file is just unexplored.
                     if inode_table.is_children_loaded(dir_ino) && dirs_to_invalidate.insert(dir_ino) {
-                        dir_paths_to_invalidate.push(dir_path.to_string());
+                        dir_paths_to_invalidate.insert(dir_path);
                     }
                 }
             }
@@ -755,11 +724,11 @@ impl super::VirtualFs {
                         inode_table.get(c.ino).is_some_and(|e| {
                             e.kind == InodeKind::Directory
                                 && !e.created_locally
-                                && !all_remote_paths.contains(e.full_path.as_ref())
+                                && !remote_by_path.contains_key(e.full_path.as_ref())
                         })
                     });
                 if lists_vanished_dir && dirs_to_invalidate.insert(dir_ino) {
-                    dir_paths_to_invalidate.push(prefix.clone());
+                    dir_paths_to_invalidate.insert(prefix.as_str());
                 }
             }
 
@@ -773,20 +742,7 @@ impl super::VirtualFs {
             // Invalidate negative cache entries under changed directories
             if !dir_paths_to_invalidate.is_empty() {
                 let mut nc = negative_cache.write().expect("neg_cache poisoned");
-                for dir_path in &dir_paths_to_invalidate {
-                    let prefix = if dir_path.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{}/", dir_path)
-                    };
-                    nc.retain(|k, _| {
-                        if dir_path.is_empty() {
-                            false
-                        } else {
-                            !k.starts_with(&prefix) && k != dir_path
-                        }
-                    });
-                }
+                invalidate_cached_misses(&mut nc, &dir_paths_to_invalidate);
             }
         }
 
@@ -804,3 +760,6 @@ impl super::VirtualFs {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

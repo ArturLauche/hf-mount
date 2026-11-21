@@ -3539,6 +3539,38 @@ fn poll_detects_remote_deletion_via_revalidation() {
     });
 }
 
+#[test]
+fn revalidation_preserves_open_file_across_remote_replacement() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    hub.add_file("item", 3, Some("old"), None);
+    xet.add_file("old", b"old");
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+    rt.block_on(async {
+        let original = vfs.lookup(ROOT_INODE, "item").await.unwrap().ino;
+        let fh = vfs.open(original, false, false, None).await.unwrap();
+        hub.remove_file("item");
+        assert_eq!(vfs.lookup(ROOT_INODE, "item").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(vfs.getattr(original).unwrap().nlink, 0);
+
+        hub.add_file("item", 11, Some("replacement"), None);
+        let replacement = vfs.lookup(ROOT_INODE, "item").await.unwrap();
+        assert_ne!(replacement.ino, original);
+        VirtualFs::apply_poll_diff(
+            hub.list_tree("").await.unwrap(),
+            &[String::new()].into(),
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+        assert_eq!(vfs.getattr(original).unwrap().size, 3);
+        assert_eq!(&vfs.read(fh, 0, 16).await.unwrap().0[..], b"old");
+        vfs.release(fh).await.unwrap();
+        assert_eq!(vfs.getattr(original).unwrap_err(), libc::ENOENT);
+        assert_eq!(vfs.lookup(ROOT_INODE, "item").await.unwrap().ino, replacement.ino);
+    });
+}
+
 /// Dirty files are not overwritten by revalidation (uses advanced mode to avoid streaming hangs).
 #[test]
 fn revalidation_skips_dirty_files() {

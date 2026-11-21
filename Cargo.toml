@@ -94,6 +94,7 @@ required-features = ["fuse"]
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 # Pin fuser to the HF fork until cberner/fuser merges Session::from_fds
 # (sidecar with externally pre-cloned fds — see #94).

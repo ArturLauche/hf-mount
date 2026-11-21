@@ -17,10 +17,12 @@ mod flush;
 pub mod inode;
 mod poll;
 mod remote_reader;
+mod revalidate;
 mod staging;
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
 use remote_reader::{ReadAheadBudget, RemoteReader};
+use revalidate::FileRevalidation;
 use staging::StagingCoordinator;
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -784,123 +786,6 @@ impl VirtualFs {
         }
     }
 
-    /// Revalidate a remote file by checking the Hub for metadata changes.
-    /// Skips HEAD if the inode was validated within `metadata_ttl`.
-    /// If the file's xet_hash changed, updates the inode and invalidates kernel cache.
-    /// If the file was deleted (404), removes the inode.
-    /// On network errors, silently returns (graceful degradation).
-    async fn revalidate_file(&self, ino: u64, full_path: &str, current_hash: Option<&str>, current_etag: Option<&str>) {
-        // When serve_lookup_from_cache is true, skip HEAD if recently validated.
-        // When false (minimal mode), always HEAD on every lookup.
-        if self.serve_lookup_from_cache {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            if let Some(entry) = inodes.get(ino)
-                && let Some(last) = entry.last_revalidated
-                && last.elapsed() < self.metadata_ttl
-            {
-                return;
-            }
-        }
-
-        let remote = match self.hub_client.head_file(full_path).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("head_file({}) failed, using cached: {}", full_path, e);
-                return;
-            }
-        };
-
-        // Collect kernel invalidations to issue after we drop the inode_table
-        // write lock. `inval_inode` issues a synchronous writev to /dev/fuse that
-        // ends up in `invalidate_inode_pages2_range` on the kernel side, which
-        // blocks on per-folio waits. Calling it under the global write lock can
-        // stall the whole VFS (and has been observed to deadlock production
-        // pods). Apply the mutation, drop the lock, then notify.
-        let mut to_invalidate: Vec<(u64, InvalKind)> = Vec::new();
-        match remote {
-            None => {
-                // File deleted remotely → remove from inode table
-                info!("Remote deletion detected via HEAD: {}", full_path);
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                if let Some(entry) = inodes.get(ino) {
-                    let parent = entry.parent;
-                    // A full page drop on an inode with an in-flight read deadlocks
-                    // against the read's folio lock (#195); fall back to attr-only.
-                    let kind = if inodes.has_open_handles(ino) {
-                        InvalKind::AttrOnly
-                    } else {
-                        InvalKind::Pages
-                    };
-                    to_invalidate.push((parent, InvalKind::Pages));
-                    to_invalidate.push((ino, kind));
-                }
-                inodes.remove(ino);
-            }
-            Some(head_info) => {
-                let remote_hash = head_info.xet_hash.as_deref();
-                let remote_etag = head_info.etag.as_deref();
-                // Detect changes via xet_hash (preferred) or ETag.
-                let changed = if current_hash.is_some() || remote_hash.is_some() {
-                    remote_hash != current_hash
-                } else {
-                    remote_etag != current_etag
-                };
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                if changed {
-                    let remote_size = match head_info.size {
-                        Some(s) => s,
-                        None => {
-                            warn!("HEAD response missing size for {}, skipping update", full_path);
-                            return;
-                        }
-                    };
-                    let remote_mtime = head_info
-                        .last_modified
-                        .as_deref()
-                        .map(crate::hub_api::mtime_from_http_date)
-                        .unwrap_or(SystemTime::now());
-                    debug!("Remote change detected via HEAD: {}", full_path);
-                    inodes.update_remote_file(
-                        ino,
-                        remote_hash.map(|s| s.to_string()),
-                        remote_etag.map(|s| s.to_string()),
-                        remote_size,
-                        remote_mtime,
-                    );
-                    let kind = if inodes.has_open_handles(ino) {
-                        InvalKind::AttrOnly
-                    } else {
-                        InvalKind::Pages
-                    };
-                    to_invalidate.push((ino, kind));
-                } else {
-                    // Update stored etag even when content didn't change,
-                    // so future revalidations have the latest value.
-                    if let Some(entry) = inodes.get_mut(ino)
-                        && remote_etag.is_some()
-                    {
-                        entry.etag = remote_etag.map(|s| s.to_string());
-                    }
-                }
-                // Stamp revalidation time regardless of whether content changed
-                if let Some(entry) = inodes.get_mut(ino) {
-                    entry.last_revalidated = Some(Instant::now());
-                }
-            }
-        }
-
-        // Drop happened at scope end above. Notify after the new state is
-        // published so a racing lookup repopulating the kernel cache cannot
-        // beat the invalidation.
-        if !to_invalidate.is_empty()
-            && let Some(invalidate) = self.invalidator.get()
-        {
-            for (ino, kind) in to_invalidate {
-                invalidate(ino, kind);
-            }
-        }
-    }
-
     /// Ensure children of a directory inode are loaded from the Hub API.
     /// Fetch remote children for `parent_ino` if not already loaded.
     /// Uses a per-directory lock to prevent thundering herd: concurrent callers
@@ -1429,12 +1314,7 @@ impl VirtualFs {
         // Revalidation info extracted from the lock scope so we can await outside it.
         enum FastResult {
             Hit(VirtualFsAttr),
-            NeedsRevalidation {
-                ino: u64,
-                full_path: Arc<str>,
-                current_hash: Option<String>,
-                current_etag: Option<String>,
-            },
+            NeedsRevalidation(FileRevalidation),
             Miss {
                 full_path: String,
                 /// True when the parent has no remote presence (locally
@@ -1461,19 +1341,18 @@ impl VirtualFs {
             // the dir was removed or replaced remotely (files revalidate
             // individually via HEAD, dirs don't).
             match inodes.lookup_child(parent, name) {
-                // Clean cached file: HEAD-revalidate (gated by `metadata_ttl`)
-                // so size/hash/mtime stay fresh between poll cycles.
-                Some(entry) if entry.kind == InodeKind::File && !entry.is_dirty() => FastResult::NeedsRevalidation {
-                    ino: entry.inode,
-                    full_path: entry.full_path.clone(),
-                    current_hash: entry.xet_hash.clone(),
-                    current_etag: entry.etag.clone(),
-                },
-                // Either a dirty file (local writes win until flushed) or any
-                // entry under a freshly listed parent we can trust as-is.
-                Some(entry) if entry.kind == InodeKind::File || self.listing_is_fresh(parent_entry) => {
-                    FastResult::Hit(self.make_vfs_attr(entry))
+                Some(entry) if entry.kind == InodeKind::File => {
+                    let fresh = self.serve_lookup_from_cache
+                        && entry
+                            .last_revalidated
+                            .is_some_and(|last| last.elapsed() < self.metadata_ttl);
+                    if entry.is_dirty() || fresh {
+                        FastResult::Hit(self.make_vfs_attr(entry))
+                    } else {
+                        FastResult::NeedsRevalidation(FileRevalidation::new(entry))
+                    }
                 }
+                Some(entry) if self.listing_is_fresh(parent_entry) => FastResult::Hit(self.make_vfs_attr(entry)),
                 // Cached non-file under an unloaded or stale parent: we can't
                 // HEAD-probe a directory to check it still exists (resolve
                 // endpoint only serves files), so defer to the slow path which lists.
@@ -1504,19 +1383,15 @@ impl VirtualFs {
 
         match fast {
             FastResult::Hit(attr) => return Ok(attr),
-            FastResult::NeedsRevalidation {
-                ino,
-                full_path,
-                current_hash,
-                current_etag,
-            } => {
-                self.revalidate_file(ino, &full_path, current_hash.as_deref(), current_etag.as_deref())
-                    .await;
+            FastResult::NeedsRevalidation(check) => {
+                check.run(self).await;
+                // A remote unlink can keep the original inode alive for an open
+                // fd. A lookup must resolve the name again after the request.
                 let inodes = self.inode_table.read().expect("inodes poisoned");
-                return match inodes.get(ino) {
-                    Some(entry) => Ok(self.make_vfs_attr(entry)),
-                    None => Err(libc::ENOENT),
-                };
+                return inodes
+                    .lookup_child(parent, name)
+                    .map(|entry| self.make_vfs_attr(entry))
+                    .ok_or(libc::ENOENT);
             }
             FastResult::Miss { full_path, local_only } => {
                 // A cached listing can still hide entries added remotely after
