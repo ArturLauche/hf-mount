@@ -139,9 +139,15 @@ impl super::VirtualFs {
         listing_concurrency: usize,
         live_follow: bool,
     ) {
-        // None forces a full fan-out next round; primed with an initial probe so
-        // a freshly mounted source doesn't redundantly re-list once.
-        let mut last_revision: Option<String> = hub_client.probe_revision().await.ok();
+        // A bucket timestamp also seeds the first live subscription. Repo
+        // preloading reads a moving ref, so its first checkpoint must come
+        // from a completed listing at the probed commit.
+        let is_repo = hub_client.is_repo();
+        let mut last_revision = if is_repo {
+            None
+        } else {
+            hub_client.probe_revision().await.ok()
+        };
 
         // Prefer the Hub's bucket live-follow SSE feed: while the stream is
         // healthy, per-file changes are applied as they happen and the
@@ -151,7 +157,7 @@ impl super::VirtualFs {
         // poll below takes over unchanged. The follow loop uses the probe
         // above as its own baseline and doesn't re-probe before the first
         // connect.
-        if live_follow {
+        if live_follow && !is_repo {
             Self::follow_remote_changes(
                 &hub_client,
                 &inodes,
@@ -178,13 +184,18 @@ impl super::VirtualFs {
         loop {
             tokio::time::sleep(backoff.delay()).await;
 
-            let revision = match hub_client.probe_revision().await {
-                Ok(rev) if last_revision.as_ref() == Some(&rev) => {
+            let probe = if is_repo {
+                hub_client.probe_repo_commit().await
+            } else {
+                hub_client.probe_revision().await.map(Some)
+            };
+            let revision = match probe {
+                Ok(Some(rev)) if last_revision.as_ref() == Some(&rev) => {
                     debug!("Revision unchanged ({rev}); skipping tree fan-out");
                     backoff.reset();
                     continue;
                 }
-                Ok(rev) => Some(rev),
+                Ok(rev) => rev,
                 Err(e) => {
                     if should_back_off(&e) {
                         backoff.next();
@@ -200,8 +211,16 @@ impl super::VirtualFs {
                 }
             };
 
-            let round =
-                Self::poll_round(&hub_client, &inodes, &negative_cache, &invalidator, listing_concurrency).await;
+            let commit = revision.as_deref().filter(|_| is_repo);
+            let round = Self::poll_round(
+                &hub_client,
+                &inodes,
+                &negative_cache,
+                &invalidator,
+                listing_concurrency,
+                commit,
+            )
+            .await;
             // A partial round may already have applied some changes. Neither
             // the old nor the new revision describes that view. Retry even if
             // the ref stays put (or moves back to its previous commit).
@@ -227,17 +246,29 @@ impl super::VirtualFs {
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: &Invalidator,
         listing_concurrency: usize,
+        repo_commit: Option<&str>,
     ) -> PollRound {
         // Only poll directories the user has actually visited (children_loaded).
         // This avoids fetching the entire tree for large repos where most
         // directories have never been accessed.
         let prefixes = inodes.read().expect("inodes poisoned").loaded_dir_prefixes();
+        if repo_commit.is_some() && prefixes.is_empty() {
+            // The first poll can race root preloading. An empty round cannot
+            // certify the mutable-ref listing that is still in flight.
+            return PollRound {
+                saw_backoff_status: false,
+                complete: false,
+            };
+        }
         // buffer_unordered yields out of order, so carry the prefix alongside the result.
         let mut listings = stream::iter(prefixes)
             .map(|prefix| {
                 let client = hub_client.clone();
                 async move {
-                    let result = client.list_tree(&prefix).await;
+                    let result = match repo_commit {
+                        Some(commit) => client.list_tree_at_commit(&prefix, commit).await,
+                        None => client.list_tree(&prefix).await,
+                    };
                     (prefix, result)
                 }
             })
@@ -344,9 +375,15 @@ impl super::VirtualFs {
                     Ok(rev) => {
                         if last_revision.as_ref() != Some(&rev) {
                             debug!("live-follow: no cursor and revision moved; running a full poll round");
-                            let round =
-                                Self::poll_round(hub_client, inodes, negative_cache, invalidator, listing_concurrency)
-                                    .await;
+                            let round = Self::poll_round(
+                                hub_client,
+                                inodes,
+                                negative_cache,
+                                invalidator,
+                                listing_concurrency,
+                                None,
+                            )
+                            .await;
                             if !round.complete {
                                 let delay = backoff.next();
                                 warn!("live-follow: reconcile round incomplete; retrying in {delay:?}");
@@ -678,8 +715,11 @@ impl super::VirtualFs {
 
             // The diff was computed from a snapshot: an inode renamed since
             // then sits at another path, which the listing says nothing about.
-            let at_path =
-                |table: &InodeTable, ino: u64, path: &str| table.get_by_path(path).is_some_and(|e| e.inode == ino);
+            let at_path = |table: &InodeTable, ino: u64, path: &Arc<str>| {
+                table
+                    .get_by_path(path)
+                    .is_some_and(|e| e.inode == ino && Arc::ptr_eq(&e.full_path, path))
+            };
             for update in updates {
                 if !at_path(&inode_table, update.ino, &update.path) {
                     continue;

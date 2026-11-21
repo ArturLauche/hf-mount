@@ -2,11 +2,13 @@
 
 use std::collections::HashSet;
 
-use reqwest::{Response, Url, header::LINK};
+use reqwest::Url;
 use serde::{Deserialize, de::DeserializeOwned};
 
 use super::{HubApiClient, SourceKind, encode_url_path, encode_url_revision, send_with_retry, strict_descendant_rel};
 use crate::error::{Error, Result};
+
+mod pagination;
 
 /// Unified tree entry exposed to the rest of the codebase.
 #[derive(Debug, Clone, Deserialize)]
@@ -77,14 +79,22 @@ impl HubApiClient {
     /// List the immediate children of a mount-relative directory. Filter raw
     /// S3 prefix matches (e.g. `a/b#1` is not under `a/b/`) before returning.
     pub async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
-        self.read_tree(prefix, TreeRead::All).await
+        self.read_tree(prefix, TreeRead::All, None).await
     }
 
     pub(super) async fn has_children(&self, prefix: &str) -> Result<bool> {
-        Ok(!self.read_tree(prefix, TreeRead::FirstChild).await?.is_empty())
+        Ok(!self.read_tree(prefix, TreeRead::FirstChild, None).await?.is_empty())
     }
 
-    async fn read_tree(&self, prefix: &str, mode: TreeRead) -> Result<Vec<TreeEntry>> {
+    /// List a repo directory at a previously resolved commit.
+    pub async fn list_tree_at_commit(&self, prefix: &str, commit: &str) -> Result<Vec<TreeEntry>> {
+        if !self.is_repo() {
+            return Err(Error::hub("commit-pinned tree listing requires a repo"));
+        }
+        self.read_tree(prefix, TreeRead::All, Some(commit)).await
+    }
+
+    async fn read_tree(&self, prefix: &str, mode: TreeRead, commit: Option<&str>) -> Result<Vec<TreeEntry>> {
         let api_prefix = self.prefixed_path(prefix);
         let subdir = if api_prefix.is_empty() {
             String::new()
@@ -99,7 +109,7 @@ impl HubApiClient {
                 );
                 // Buckets can return many raw-prefix siblings. Keep the normal
                 // page size so a negative probe does not need one request per sibling.
-                self.tree_pages::<TreeEntry>(&url, &api_prefix, mode).await
+                self.tree_pages::<TreeEntry>(&url, &api_prefix, mode, None).await
             }
             SourceKind::Repo {
                 repo_id,
@@ -107,13 +117,12 @@ impl HubApiClient {
                 revision,
             } => {
                 let limit = if mode == TreeRead::FirstChild { 1 } else { 1000 };
-                let url = format!(
-                    "{}/api/{}/{repo_id}/tree/{}{subdir}?limit={limit}",
-                    self.endpoint,
-                    repo_type.api_prefix(),
-                    encode_url_revision(revision)
-                );
-                self.tree_pages::<RepoTreeEntry>(&url, &api_prefix, mode).await
+                let tree_root = format!("{}/api/{}/{repo_id}/tree/", self.endpoint, repo_type.api_prefix());
+                let revision = encode_url_revision(commit.unwrap_or(revision));
+                let url = format!("{tree_root}{revision}{subdir}?limit={limit}");
+                let pinned_root = commit.map(|_| parse_tree_url(&tree_root)).transpose()?;
+                self.tree_pages::<RepoTreeEntry>(&url, &api_prefix, mode, pinned_root.as_ref())
+                    .await
             }
         }
     }
@@ -123,9 +132,22 @@ impl HubApiClient {
         first: &str,
         api_prefix: &str,
         mode: TreeRead,
+        pinned_root: Option<&Url>,
     ) -> Result<Vec<TreeEntry>> {
-        let mut url = Url::parse(first).map_err(|e| Error::hub(format!("invalid tree listing URL: {e}")))?;
+        let mut url = parse_tree_url(first)?;
         let hub_origin = url.origin();
+        let pinned_dir = pinned_root.map(|root| (root, url.path().to_owned()));
+        let check_pin = |page: &Url| {
+            // Opaque continuation URLs can be served elsewhere. A link or
+            // redirect back into this repo's tree must name the same snapshot.
+            if let Some((root, dir)) = &pinned_dir
+                && page.as_str().starts_with(root.as_str())
+                && page.path() != dir
+            {
+                return Err(Error::hub("tree listing left the pinned commit or directory"));
+            }
+            Ok(())
+        };
         let mut visited = HashSet::new();
         let mut entries = Vec::new();
         loop {
@@ -142,7 +164,8 @@ impl HubApiClient {
                 false,
             )
             .await?;
-            let next = next_page(&resp);
+            check_pin(resp.url())?;
+            let next = pagination::next_page(&resp);
             let page: Vec<T> = resp.json().await?;
             for mut entry in page.into_iter().map(Into::<TreeEntry>::into) {
                 if !api_prefix.is_empty() && strict_descendant_rel(&entry.path, api_prefix).is_none() {
@@ -158,6 +181,7 @@ impl HubApiClient {
                 }
             }
             let Some(next) = next? else { return Ok(entries) };
+            check_pin(&next)?;
             visited.insert(url);
             if visited.contains(&next) {
                 return Err(Error::hub("tree listing repeated a pagination link"));
@@ -167,41 +191,8 @@ impl HubApiClient {
     }
 }
 
-/// Link references are relative to the effective response URL (after redirects).
-/// An invalid continuation must fail the listing: polling treats a successful
-/// but truncated tree as evidence that the missing children have been deleted.
-fn next_page(response: &Response) -> Result<Option<Url>> {
-    for header in response.headers().get_all(LINK) {
-        let header = header
-            .to_str()
-            .map_err(|_| Error::hub("invalid tree listing Link header"))?;
-        let links =
-            nom_rfc8288::complete::link_lenient(header).map_err(|_| Error::hub("invalid tree listing Link header"))?;
-        for link in links.into_iter().flatten() {
-            let is_next = link.params.iter().any(|p| {
-                p.key.eq_ignore_ascii_case("rel")
-                    && p.val
-                        .as_deref()
-                        .is_some_and(|v| v.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("next")))
-            });
-            if is_next {
-                let mut next = response
-                    .url()
-                    .join(link.url)
-                    .map_err(|e| Error::hub(format!("invalid tree listing continuation: {e}")))?;
-                if !matches!(next.scheme(), "http" | "https")
-                    || !next.username().is_empty()
-                    || next.password().is_some()
-                {
-                    return Err(Error::hub("invalid tree listing continuation URL"));
-                }
-                // Fragments never reach the server and cannot identify a new page.
-                next.set_fragment(None);
-                return Ok(Some(next));
-            }
-        }
-    }
-    Ok(None)
+fn parse_tree_url(url: &str) -> Result<Url> {
+    Url::parse(url).map_err(|e| Error::hub(format!("invalid tree listing URL: {e}")))
 }
 
 #[cfg(test)]

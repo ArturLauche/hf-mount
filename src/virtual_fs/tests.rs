@@ -2977,25 +2977,23 @@ fn poll_skips_list_tree_when_revision_unchanged() {
 
         let (stop, handle) = spawn_poll_loop(&vfs, &hub, false);
 
-        // Let 5 rounds run with identical revision -> probe fires, list_tree does not.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(hub.probe_revision_call_count() >= 3, "probe should run each round");
+        // The first pinned round establishes the checkpoint for this repo.
+        assert!(wait_until(|| hub.probe_revision_call_count() >= 3).await);
+        let checkpoint_lists = baseline_list_tree + 1;
         assert_eq!(
             hub.list_tree_call_count(),
-            baseline_list_tree,
-            "list_tree must not fire when revision is unchanged"
+            checkpoint_lists,
+            "unchanged commits skip subsequent listings"
         );
 
         // Advance the revision -> next round fans out.
         let probes_before = hub.probe_revision_call_count();
         hub.set_revision("rev-b");
         // Wait until at least one more probe + one fan-out.
-        wait_until(|| {
-            hub.probe_revision_call_count() > probes_before && hub.list_tree_call_count() > baseline_list_tree
-        })
-        .await;
+        wait_until(|| hub.probe_revision_call_count() > probes_before && hub.list_tree_call_count() > checkpoint_lists)
+            .await;
         assert!(
-            hub.list_tree_call_count() > baseline_list_tree,
+            hub.list_tree_call_count() > checkpoint_lists,
             "list_tree must fire after revision change"
         );
 

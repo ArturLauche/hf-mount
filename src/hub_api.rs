@@ -97,14 +97,26 @@ pub trait HubOps: Send + Sync {
 
     /// Cheap probe returning an opaque "revision" token that changes whenever
     /// the source content changes. For repos this is the commit head SHA; for
-    /// buckets it is `updatedAt`. The poll loop uses this to skip the full
-    /// tree-listing fan-out when nothing has changed.
+    /// buckets it is `updatedAt`. Bucket polling and live-follow use this
+    /// token. Repo polling needs an immutable SHA from `probe_repo_commit`.
     ///
     /// Errors fall through to a full fan-out — the probe is an optimization,
     /// not a gate. The default impl errors out so mocks that don't care about
     /// the probe path keep doing full polls.
     async fn probe_revision(&self) -> Result<String> {
         Err(Error::hub("probe_revision not implemented"))
+    }
+
+    /// Resolve the mounted repo ref to an immutable commit that
+    /// `list_tree_at_commit` can read. Without one, poll the mounted ref
+    /// normally and leave the round uncheckpointed.
+    async fn probe_repo_commit(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// List a directory at a commit returned by `probe_repo_commit`.
+    async fn list_tree_at_commit(&self, _prefix: &str, _commit: &str) -> Result<Vec<TreeEntry>> {
+        Err(Error::hub("commit-pinned tree listing unavailable"))
     }
 
     /// Open the bucket live-follow SSE stream (`GET /api/buckets/{id}/events`).
@@ -652,14 +664,27 @@ impl HubApiClient {
     }
 
     /// Fetch metadata for the mounted repo revision or bucket and return an
-    /// opaque revision token. The poll loop calls this once per round and
-    /// skips the full tree fan-out when the token matches the previous one.
+    /// opaque revision token. Older repo endpoints can return a timestamp
+    /// when a commit SHA is unavailable.
     ///
     /// Repos: prefer `sha` (commit head) — changes on every push and only on
     /// pushes. Buckets: `updatedAt` — set by Hub on every bucket mutation.
     /// Errors if the Hub response omits the expected field (should not happen
     /// against the production Hub).
     pub async fn probe_revision(&self) -> Result<String> {
+        let probe = self.revision_metadata().await?;
+        match &self.source {
+            SourceKind::Repo { .. } => probe
+                .sha
+                .or(probe.last_modified)
+                .ok_or_else(|| Error::hub("revision probe: repo response missing sha and lastModified")),
+            SourceKind::Bucket { .. } => probe
+                .updated_at
+                .ok_or_else(|| Error::hub("revision probe: bucket response missing updatedAt")),
+        }
+    }
+
+    async fn revision_metadata(&self) -> Result<RevisionProbe> {
         let url = match &self.source {
             SourceKind::Repo {
                 repo_id,
@@ -671,16 +696,7 @@ impl HubApiClient {
             }
         };
         let resp = send_with_retry(|| self.auth(self.client.get(&url)), "revision probe", false).await?;
-        let probe: RevisionProbe = resp.json().await?;
-        match &self.source {
-            SourceKind::Repo { .. } => probe
-                .sha
-                .or(probe.last_modified)
-                .ok_or_else(|| Error::hub("revision probe: repo response missing sha and lastModified")),
-            SourceKind::Bucket { .. } => probe
-                .updated_at
-                .ok_or_else(|| Error::hub("revision probe: bucket response missing updatedAt")),
-        }
+        Ok(resp.json().await?)
     }
 
     /// Open the bucket live-follow SSE stream. See [`HubOps::follow_events`]
@@ -1036,6 +1052,15 @@ impl HubOps for HubApiClient {
     }
     async fn probe_revision(&self) -> Result<String> {
         self.probe_revision().await
+    }
+    async fn probe_repo_commit(&self) -> Result<Option<String>> {
+        if !self.is_repo() {
+            return Ok(None);
+        }
+        Ok(self.revision_metadata().await?.sha.filter(|sha| !sha.is_empty()))
+    }
+    async fn list_tree_at_commit(&self, prefix: &str, commit: &str) -> Result<Vec<TreeEntry>> {
+        self.list_tree_at_commit(prefix, commit).await
     }
     async fn follow_events(
         &self,

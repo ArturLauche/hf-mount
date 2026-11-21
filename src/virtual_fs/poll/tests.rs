@@ -120,7 +120,6 @@ async fn incomplete_rounds_back_off_and_retry_the_same_revision() {
         1000,
         1000,
     );
-    table.get_mut(ROOT_INODE).unwrap().children_loaded_at = Some(Instant::now());
     let inodes = Arc::new(RwLock::new(table));
     let poll = tokio::spawn(VirtualFs::poll_remote_changes(
         hub.clone(),
@@ -132,10 +131,14 @@ async fn incomplete_rounds_back_off_and_retry_the_same_revision() {
         false,
     ));
     tokio::task::yield_now().await;
-    assert_eq!(hub.probe_revision_call_count(), 1);
+    assert_eq!(hub.probe_revision_call_count(), 0);
 
+    // A probe can finish before root preload. It cannot checkpoint this
+    // commit until a real listing completes, even if the ref never changes.
+    advance(1).await;
+    assert_eq!(hub.list_tree_call_count(), 0);
+    inodes.write().unwrap().get_mut(ROOT_INODE).unwrap().children_loaded_at = Some(Instant::now());
     hub.add_file("file", 2, Some("new"), None);
-    hub.set_revision("updated");
     hub.fail_next_list_tree_with_status(503);
     advance(1).await;
     assert_eq!(hub.list_tree_call_count(), 1);
@@ -168,4 +171,105 @@ async fn incomplete_rounds_back_off_and_retry_the_same_revision() {
     assert_eq!(hub.list_tree_call_count(), 3, "completed revision now skips listings");
     poll.abort();
     assert!(poll.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn repo_poll_lists_the_probed_commit_while_the_mounted_ref_moves() {
+    use crate::hub_api::{HubApiClient, RepoType, SourceKind};
+    use crate::test_mocks::serve_hub_requests;
+
+    let mut head = "commit-a";
+    let mut probes = 0;
+    let (endpoint, requests) = serve_hub_requests(6, move |target| {
+        if target.contains("/revision/") {
+            let info = format!(r#"{{"id":"org/data","sha":"{head}"}}"#);
+            probes += 1;
+            if probes == 2 {
+                head = "commit-b"; // After the poll probe and before either tree page.
+            }
+            return (String::new(), info);
+        }
+        let commit = if target.contains("/tree/commit-a?") {
+            "commit-a"
+        } else {
+            head
+        };
+        let second_page = target.ends_with("?cursor=2");
+        let (headers, path) = if second_page {
+            head = "commit-a"; // The next probe will see A again.
+            ("", "two")
+        } else {
+            ("Link: <?cursor=2>; rel=next\r\n", "one")
+        };
+        (
+            headers.into(),
+            format!(r#"[{{"path":"{path}","type":"file","size":1,"oid":"{commit}"}}]"#),
+        )
+    })
+    .await;
+
+    let client = HubApiClient::from_source(
+        &endpoint,
+        None,
+        None,
+        SourceKind::Repo {
+            repo_type: RepoType::Dataset,
+            repo_id: "org/data".into(),
+            revision: "feature/docs".into(),
+        },
+        String::new(),
+        "test",
+    )
+    .await
+    .unwrap();
+    let mut table = InodeTable::new(false);
+    for path in ["one", "two"] {
+        table.insert(
+            ROOT_INODE,
+            path.into(),
+            path.into(),
+            InodeKind::File,
+            1,
+            SystemTime::UNIX_EPOCH,
+            None,
+            0o644,
+            1000,
+            1000,
+        );
+    }
+    table.get_mut(ROOT_INODE).unwrap().children_loaded_at = Some(Instant::now());
+    let inodes = Arc::new(RwLock::new(table));
+    let poll = tokio::spawn(VirtualFs::poll_remote_changes(
+        client,
+        inodes.clone(),
+        Default::default(),
+        Default::default(),
+        Some(Duration::from_millis(5)),
+        1,
+        false,
+    ));
+    let requests = requests.await.unwrap();
+    poll.abort();
+    assert!(poll.await.unwrap_err().is_cancelled());
+
+    let info_url = "/api/datasets/org/data/revision/feature%2Fdocs?expand=sha&expand=lastModified";
+    let paths: Vec<_> = requests
+        .iter()
+        .map(|r| r.split_ascii_whitespace().nth(1).unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            info_url,
+            info_url,
+            "/api/datasets/org/data/tree/commit-a?limit=1000",
+            "/api/datasets/org/data/tree/commit-a?cursor=2",
+            info_url,
+            info_url,
+        ]
+    );
+    let table = inodes.read().unwrap();
+    for path in ["one", "two"] {
+        assert_eq!(table.get_by_path(path).unwrap().etag.as_deref(), Some("commit-a"));
+    }
 }
