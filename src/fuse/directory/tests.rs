@@ -157,16 +157,29 @@ fn bench_directory_pages() {
 /// `--ignored` on a Linux host with permission to mount /dev/fuse.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires a mountable /dev/fuse"]
+#[ignore = "requires a mountable /dev/fuse and user_allow_other"]
 fn kernel_directory_stream_survives_remote_mutation() {
+    check_kernel_directory_stream(fuser::SessionACL::All);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a mountable /dev/fuse"]
+fn kernel_directory_stream_survives_remote_mutation_owner_only() {
+    check_kernel_directory_stream(fuser::SessionACL::Owner);
+}
+
+#[cfg(target_os = "linux")]
+fn check_kernel_directory_stream(acl: fuser::SessionACL) {
     let hub = MockHub::new();
     let names: Vec<_> = (0..4096).map(|i| format!("entry-{i:04}")).collect();
     for name in &names {
         hub.add_file(name, 0, None, None);
     }
-    let (_rt, fuse) = adapter(hub.clone(), Duration::ZERO);
+    let (_rt, mut fuse) = adapter(hub.clone(), Duration::ZERO);
     let mount = tempfile::tempdir().unwrap();
-    let session = fuser::spawn_mount2(fuse, mount.path(), &fuser::Config::default()).unwrap();
+    let config = fuse.mount_config(acl);
+    let session = fuser::spawn_mount2(fuse, mount.path(), &config).unwrap();
 
     let mut stream = std::fs::read_dir(mount.path())
         .unwrap()

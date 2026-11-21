@@ -36,9 +36,12 @@ pub struct FuseAdapter {
     advanced_writes: bool,
     /// FOPEN_DIRECT_IO flag on open/create, bypassing kernel page cache.
     direct_io: bool,
+    allow_idmap: bool,
 }
 
 impl FuseAdapter {
+    /// Create an adapter compatible with fuser's default owner-only ACL.
+    /// Use [`Self::mount_config`] to select the ACL and options for a mount.
     pub fn new(
         runtime: tokio::runtime::Handle,
         virtual_fs: Arc<VirtualFs>,
@@ -55,7 +58,25 @@ impl FuseAdapter {
             read_only,
             advanced_writes,
             direct_io,
+            allow_idmap: false,
         }
+    }
+
+    /// Configure kernel permission checks and the matching userspace ACL together.
+    pub fn mount_config(&mut self, acl: fuser::SessionACL) -> fuser::Config {
+        let mut config = fuser::Config::default();
+        config.acl = acl;
+        config.mount_options = vec![
+            fuser::MountOption::FSName(FS_NAME.to_string()),
+            fuser::MountOption::DefaultPermissions,
+        ];
+        if self.read_only {
+            config.mount_options.push(fuser::MountOption::RO);
+        }
+        // With ID mapping, the kernel sends FUSE_INVALID_UIDGID for requests
+        // such as GETATTR. fuser's owner ACL checks those request UIDs.
+        self.allow_idmap = acl == fuser::SessionACL::All;
+        config
     }
 
     /// Per-open flags: DIRECT_IO bypasses the page cache; otherwise we ask
@@ -181,10 +202,10 @@ impl Filesystem for FuseAdapter {
             }
         }
 
-        // Allow idmapped mounts (Linux 6.2+). Required for pods running in
+        // Allow idmapped mounts on supported kernels. Required for pods running in
         // user namespaces (hostUsers: false) where the kernel needs to remap
         // uid/gid on the FUSE mount.
-        if config.add_capabilities(InitFlags::FUSE_ALLOW_IDMAP).is_err() {
+        if self.allow_idmap && config.add_capabilities(InitFlags::FUSE_ALLOW_IDMAP).is_err() {
             info!(
                 "kernel does not support FUSE_ALLOW_IDMAP; \
                  user namespace (idmapped) mounts may fail"
@@ -610,7 +631,7 @@ pub fn mount_fuse(
     daemon_guard: Option<&mut DaemonGuard>,
     fuse_fds: Vec<OwnedFd>,
 ) -> Result<FuseSession, io::Error> {
-    let adapter = FuseAdapter::new(
+    let mut adapter = FuseAdapter::new(
         setup.runtime.clone(),
         setup.virtual_fs.clone(),
         setup.metadata_ttl,
@@ -620,14 +641,11 @@ pub fn mount_fuse(
     );
     let mount_point = &setup.mount_point;
 
-    let mut config = fuser::Config::default();
-    config.mount_options = vec![
-        fuser::MountOption::FSName(FS_NAME.to_string()),
-        fuser::MountOption::DefaultPermissions,
-    ];
-    if setup.read_only {
-        config.mount_options.push(fuser::MountOption::RO);
-    }
+    let mut config = adapter.mount_config(if setup.fuse_owner_only {
+        fuser::SessionACL::Owner
+    } else {
+        fuser::SessionACL::All
+    });
     #[cfg(target_os = "macos")]
     {
         let volname = mount_point
@@ -643,11 +661,6 @@ pub fn mount_fuse(
             .mount_options
             .push(fuser::MountOption::CUSTOM("local".to_string()));
     }
-    config.acl = if setup.fuse_owner_only {
-        fuser::SessionACL::Owner
-    } else {
-        fuser::SessionACL::All
-    };
     // clone_fd and multi-threading are only supported on Linux by fuser.
     // In sidecar mode the sidecar is unprivileged and cannot open /dev/fuse,
     // so the CSI driver pre-clones N fds and sends them via SCM_RIGHTS;

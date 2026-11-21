@@ -79,6 +79,7 @@ jobs:
       - name: FUSE directory paging through the kernel
         run: |
           sudo modprobe fuse
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
           cargo test --locked --lib --features fuse,nfs kernel_directory_stream_survives_remote_mutation -- --ignored
 
   windows:

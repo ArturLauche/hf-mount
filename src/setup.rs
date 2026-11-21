@@ -290,6 +290,7 @@ pub struct MountOptions {
     /// Restrict mount access to the mounting user only (FUSE only).
     /// By default all users can access the mount.
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
+    /// Linux idmapped mounts require the default all-users mode.
     #[arg(long, default_value_t = false)]
     pub fuse_owner_only: bool,
 
