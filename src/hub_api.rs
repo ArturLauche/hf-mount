@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -277,6 +277,9 @@ pub struct HubApiClient {
     /// Cached token from `token_file`, refreshed every 30s.
     token_file_cache: std::sync::Mutex<Option<(std::time::Instant, String)>>,
     source: SourceKind,
+    /// Some older Hub deployments omit sha from revision metadata. Remember
+    /// whether the commit-history endpoint can supply the mounted ref's head.
+    commit_history_available: Mutex<Option<bool>>,
     /// Last modification time (from repo/bucket info endpoint).
     /// Used as default mtime when per-file mtime is unavailable.
     last_modified: SystemTime,
@@ -557,6 +560,7 @@ impl HubApiClient {
         };
 
         Ok(Arc::new(Self {
+            commit_history_available: Mutex::new(None),
             client,
             head_client,
             follow_client,
@@ -574,6 +578,7 @@ impl HubApiClient {
     pub fn new(endpoint: &str, token: Option<&str>, bucket_id: &str, backend: &str) -> Arc<Self> {
         let (client, head_client, follow_client) = make_clients(backend);
         Arc::new(Self {
+            commit_history_available: Mutex::new(None),
             client,
             head_client,
             follow_client,
@@ -697,6 +702,45 @@ impl HubApiClient {
         };
         let resp = send_with_retry(|| self.auth(self.client.get(&url)), "revision probe", false).await?;
         Ok(resp.json().await?)
+    }
+
+    /// Optional fallback for timestamp-only revision metadata. Request just the
+    /// newest commit on the selected ref. An unavailable history never prevents
+    /// the poller from reconciling the mutable tree.
+    async fn history_head(&self, repo_type: RepoType, repo_id: &str, revision: &str) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Commit {
+            id: String,
+        }
+
+        let url = format!(
+            "{}/api/{}/{repo_id}/commits/{}?limit=1",
+            self.endpoint,
+            repo_type.api_prefix(),
+            encode_url_revision(revision)
+        );
+        let result: Result<Option<String>> = async {
+            let response = self.auth(self.client.get(url)).send().await?;
+            if matches!(response.status().as_u16(), 404 | 405 | 501) {
+                *self.commit_history_available.lock().expect("commit history poisoned") = Some(false);
+                return Ok(None);
+            }
+            let commits: Vec<Commit> = response.error_for_status()?.json().await?;
+            let head = commits
+                .into_iter()
+                .next()
+                .map(|c| c.id)
+                .filter(|id| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit()));
+            if head.is_some() {
+                *self.commit_history_available.lock().expect("commit history poisoned") = Some(true);
+            }
+            Ok(head)
+        }
+        .await;
+        result.unwrap_or_else(|e| {
+            debug!("commit history probe unavailable for {repo_id}@{revision}: {e}");
+            None
+        })
     }
 
     /// Open the bucket live-follow SSE stream. See [`HubOps::follow_events`]
@@ -1054,10 +1098,28 @@ impl HubOps for HubApiClient {
         self.probe_revision().await
     }
     async fn probe_repo_commit(&self) -> Result<Option<String>> {
-        if !self.is_repo() {
+        let SourceKind::Repo {
+            repo_type,
+            repo_id,
+            revision,
+        } = &self.source
+        else {
             return Ok(None);
+        };
+        let history = *self.commit_history_available.lock().expect("commit history poisoned");
+        if history == Some(true)
+            && let Some(head) = self.history_head(*repo_type, repo_id, revision).await
+        {
+            return Ok(Some(head));
         }
-        Ok(self.revision_metadata().await?.sha.filter(|sha| !sha.is_empty()))
+        let probe = self.revision_metadata().await?;
+        if let Some(sha) = probe.sha.filter(|sha| !sha.is_empty()) {
+            return Ok(Some(sha));
+        }
+        if history.is_none() && probe.last_modified.is_some() {
+            return Ok(self.history_head(*repo_type, repo_id, revision).await);
+        }
+        Ok(None)
     }
     async fn list_tree_at_commit(&self, prefix: &str, commit: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree_at_commit(prefix, commit).await
@@ -1278,6 +1340,7 @@ mod tests {
     fn make_test_client(prefix: &str, token_file: Option<PathBuf>) -> HubApiClient {
         let (client, head_client, follow_client) = make_clients("test");
         HubApiClient {
+            commit_history_available: Mutex::new(None),
             client,
             head_client,
             follow_client,

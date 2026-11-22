@@ -181,16 +181,31 @@ impl super::VirtualFs {
         // Slows the rounds down while the Hub keeps failing (401 or transient
         // statuses); reset as soon as we see a successful round.
         let mut backoff = Backoff::new(interval);
+        let mut last_listing_generation = None;
         loop {
             tokio::time::sleep(backoff.delay()).await;
 
+            let listing_generation = if is_repo {
+                let table = inodes.read().expect("inodes poisoned");
+                if !table.has_loaded_directory() {
+                    // A pending load can still install a listing from a moving ref.
+                    last_revision = None;
+                    backoff.reset();
+                    continue;
+                }
+                Some(table.listing_generation)
+            } else {
+                None
+            };
             let probe = if is_repo {
                 hub_client.probe_repo_commit().await
             } else {
                 hub_client.probe_revision().await.map(Some)
             };
             let revision = match probe {
-                Ok(Some(rev)) if last_revision.as_ref() == Some(&rev) => {
+                Ok(Some(rev))
+                    if last_revision.as_ref() == Some(&rev) && listing_generation == last_listing_generation =>
+                {
                     debug!("Revision unchanged ({rev}); skipping tree fan-out");
                     backoff.reset();
                     continue;
@@ -225,6 +240,8 @@ impl super::VirtualFs {
             // the old nor the new revision describes that view. Retry even if
             // the ref stays put (or moves back to its previous commit).
             last_revision = if round.complete { revision } else { None };
+            // A directory loaded after this snapshot needs its own pinned round.
+            last_listing_generation = listing_generation;
             if round.saw_backoff_status {
                 backoff.next();
                 warn!(

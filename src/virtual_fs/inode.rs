@@ -302,6 +302,9 @@ pub struct InodeTable {
     /// while the table holds the old one, so they must leave both paths
     /// alone until the local move (`is_held_locally`, `in_rename`).
     renames: Vec<(String, String)>,
+    /// A mutable-ref listing installed since a pinned poll needs another
+    /// reconcile even if the next probe returns the same commit.
+    pub(super) listing_generation: u64,
 }
 
 impl Default for InodeTable {
@@ -322,6 +325,7 @@ impl InodeTable {
             touch_counter: AtomicU64::new(0),
             touch_enabled: AtomicBool::new(track_touches),
             renames: Vec::new(),
+            listing_generation: 0,
         };
 
         // Create root inode
@@ -894,6 +898,27 @@ impl InodeTable {
             .filter(|e| e.kind == InodeKind::Directory && e.children_loaded())
             .map(|e| e.full_path.to_string())
             .collect()
+    }
+
+    pub(super) fn finish_remote_listing(&mut self, ino: u64, skipped_rename: bool) {
+        let dir = self.get_mut(ino).expect("validated listing directory");
+        // Stable listings are read many times and rarely regrow.
+        dir.children.shrink_to_fit();
+        if !skipped_rename {
+            dir.children_loaded_at = Some(Instant::now());
+        }
+        dir.children_from_remote = true;
+        self.listing_generation = self.listing_generation.wrapping_add(1);
+    }
+
+    /// The root is usually loaded. After invalidation, a child listing can
+    /// still be authoritative and must continue to be polled.
+    pub(super) fn has_loaded_directory(&self) -> bool {
+        self.is_children_loaded(ROOT_INODE)
+            || self
+                .inodes
+                .values()
+                .any(|e| e.kind == InodeKind::Directory && e.children_loaded())
     }
 
     /// Inode and path of the nearest materialized ancestor directory of

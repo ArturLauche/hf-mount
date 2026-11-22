@@ -94,6 +94,7 @@ async fn repo_timestamp_is_not_a_commit_and_a_pinned_listing_cannot_switch_back_
         ("", legacy_info),
         ("", legacy_info),
         ("", legacy_info),
+        ("", "[]"),
         (
             "Link: </api/models/org/model/tree/main?cursor=2>; rel=next\r\n",
             r#"[{"path":"partial","type":"file"}]"#,
@@ -119,7 +120,51 @@ async fn repo_timestamp_is_not_a_commit_and_a_pinned_listing_cannot_switch_back_
     let error = client.list_tree_at_commit("", "commit-a").await.unwrap_err();
     assert!(error.to_string().contains("left the pinned commit"));
     let requests = requests.await.unwrap();
-    assert!(requests[3].starts_with("GET /api/models/org/model/tree/commit-a?limit=1000 "));
+    assert!(requests[3].starts_with("GET /api/models/org/model/commits/main?limit=1 "));
+    assert!(requests[4].starts_with("GET /api/models/org/model/tree/commit-a?limit=1000 "));
+}
+
+#[tokio::test]
+async fn pinned_pages_accept_equivalent_paths_but_keep_segment_boundaries() {
+    let (url, requests) = serve_hub_responses(&[
+        ("", r#"{"id":"org/model","sha":"commit-a"}"#),
+        (
+            "Link: </api/models/org/model/tree/%63ommit-a/caf%c3%a9/./docs/?cursor=2>; rel=next\r\n",
+            "[]",
+        ),
+        ("", r#"[{"path":"café/docs/item","type":"file"}]"#),
+        (
+            "Link: </api/models/org/model/tr%65e/commit-a/caf%c3%a9%2fdocs?cursor=2>; rel=next\r\n",
+            "[]",
+        ),
+        (
+            "Link: </api/models/org/model/tr%65e/main/caf%c3%a9/docs?cursor=2>; rel=next\r\n",
+            "[]",
+        ),
+    ])
+    .await;
+    let client = HubApiClient::from_source(
+        &url,
+        None,
+        None,
+        SourceKind::Repo {
+            repo_id: "org/model".into(),
+            repo_type: RepoType::Model,
+            revision: "main".into(),
+        },
+        String::new(),
+        "test",
+    )
+    .await
+    .unwrap();
+    let entries = client.list_tree_at_commit("café/docs", "commit-a").await.unwrap();
+    assert_eq!(entries[0].path, "café/docs/item");
+    for _ in 0..2 {
+        let err = client.list_tree_at_commit("café/docs", "commit-a").await.unwrap_err();
+        assert!(err.to_string().contains("left the pinned commit or directory"), "{err}");
+    }
+    let requests = requests.await.unwrap();
+    assert!(requests[2].contains("/caf%c3%a9/docs/?cursor=2 "));
 }
 
 #[tokio::test]

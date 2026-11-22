@@ -954,16 +954,7 @@ impl VirtualFs {
 
         self.merge_overlay_entries(&mut inodes, parent_ino);
 
-        if let Some(parent) = inodes.get_mut(parent_ino) {
-            // Vec growth doubles capacity; for a one-shot readdir of a stable
-            // directory we'd otherwise keep ~50% slack forever. Trim now,
-            // since regrowth on rare child mutations is cheap.
-            parent.children.shrink_to_fit();
-            if !skipped_rename {
-                parent.children_loaded_at = Some(Instant::now());
-            }
-            parent.children_from_remote = true;
-        }
+        inodes.finish_remote_listing(parent_ino, skipped_rename);
         Ok(true)
     }
 

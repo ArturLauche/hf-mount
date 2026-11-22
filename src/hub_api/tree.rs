@@ -1,7 +1,8 @@
 //! Paginated, mount-relative directory listings for Hub repos and buckets.
 
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
+use percent_encoding::percent_decode_str;
 use reqwest::Url;
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -141,10 +142,13 @@ impl HubApiClient {
             // Opaque continuation URLs can be served elsewhere. A link or
             // redirect back into this repo's tree must name the same snapshot.
             if let Some((root, dir)) = &pinned_dir
-                && page.as_str().starts_with(root.as_str())
                 && page.path() != dir
+                && page.origin() == hub_origin
             {
-                return Err(Error::hub("tree listing left the pinned commit or directory"));
+                let candidate = decoded_segments(page.path());
+                if candidate.starts_with(&decoded_segments(root.path())) && candidate != decoded_segments(dir) {
+                    return Err(Error::hub("tree listing left the pinned commit or directory"));
+                }
             }
             Ok(())
         };
@@ -193,6 +197,15 @@ impl HubApiClient {
 
 fn parse_tree_url(url: &str) -> Result<Url> {
     Url::parse(url).map_err(|e| Error::hub(format!("invalid tree listing URL: {e}")))
+}
+
+// Split before decoding so an encoded slash stays inside one segment.
+// Url already resolves dot segments when parsing links and redirects.
+fn decoded_segments(path: &str) -> Vec<Cow<'_, [u8]>> {
+    path.trim_end_matches('/')
+        .split('/')
+        .map(|part| percent_decode_str(part).into())
+        .collect()
 }
 
 #[cfg(test)]

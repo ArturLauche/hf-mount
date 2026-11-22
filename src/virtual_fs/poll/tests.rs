@@ -133,10 +133,11 @@ async fn incomplete_rounds_back_off_and_retry_the_same_revision() {
     tokio::task::yield_now().await;
     assert_eq!(hub.probe_revision_call_count(), 0);
 
-    // A probe can finish before root preload. It cannot checkpoint this
-    // commit until a real listing completes, even if the ref never changes.
+    // An empty cache needs no probe. Once root loads, a real listing must
+    // still complete before the commit can be checkpointed.
     advance(1).await;
     assert_eq!(hub.list_tree_call_count(), 0);
+    assert_eq!(hub.probe_revision_call_count(), 0, "no directories to reconcile yet");
     inodes.write().unwrap().get_mut(ROOT_INODE).unwrap().children_loaded_at = Some(Instant::now());
     hub.add_file("file", 2, Some("new"), None);
     hub.fail_next_list_tree_with_status(503);
@@ -169,6 +170,44 @@ async fn incomplete_rounds_back_off_and_retry_the_same_revision() {
         "successful reconcile resets the interval"
     );
     assert_eq!(hub.list_tree_call_count(), 3, "completed revision now skips listings");
+    // Only a child listing remains loaded. It came from the mutable ref
+    // after the checkpoint, and needs a pinned poll even at the same SHA.
+    let nested = {
+        let mut table = inodes.write().unwrap();
+        table.invalidate_children(ROOT_INODE);
+        let dir = table.insert(
+            ROOT_INODE,
+            "dir".into(),
+            "dir".into(),
+            InodeKind::Directory,
+            0,
+            SystemTime::UNIX_EPOCH,
+            None,
+            0o755,
+            1000,
+            1000,
+        );
+        let nested = table.insert(
+            dir,
+            "child".into(),
+            "dir/child".into(),
+            InodeKind::File,
+            9,
+            SystemTime::UNIX_EPOCH,
+            None,
+            0o644,
+            1000,
+            1000,
+        );
+        table.finish_remote_listing(dir, false);
+        nested
+    };
+    hub.add_file("dir/child", 5, Some("pinned"), None);
+    advance(1).await;
+    assert_eq!(hub.list_tree_call_count(), 4);
+    assert_eq!(inodes.read().unwrap().get(nested).unwrap().size, 5);
+    advance(1).await;
+    assert_eq!(hub.list_tree_call_count(), 4);
     poll.abort();
     assert!(poll.await.unwrap_err().is_cancelled());
 }
@@ -272,4 +311,79 @@ async fn repo_poll_lists_the_probed_commit_while_the_mounted_ref_moves() {
     for path in ["one", "two"] {
         assert_eq!(table.get_by_path(path).unwrap().etag.as_deref(), Some("commit-a"));
     }
+}
+
+#[tokio::test]
+async fn legacy_repo_skips_unchanged_trees_and_detects_commits_with_identical_timestamps() {
+    use crate::hub_api::{HubApiClient, RepoType, SourceKind};
+    use crate::test_mocks::serve_hub_responses;
+
+    let metadata = r#"{"id":"org/model","lastModified":"2025-01-01T00:00:00Z"}"#;
+    let a = "a".repeat(40);
+    let b = "b".repeat(40);
+    let head_a = format!(r#"[{{"id":"{a}"}}]"#);
+    let head_b = format!(r#"[{{"id":"{b}"}}]"#);
+    let (url, requests) = serve_hub_responses(&[
+        ("", metadata),
+        ("", metadata),
+        ("", &head_a),
+        ("", "[]"),
+        ("", &head_a),
+        ("", &head_b),
+        ("", "[]"),
+        ("", &head_b),
+    ])
+    .await;
+    let client = HubApiClient::from_source(
+        &url,
+        Some("test"),
+        None,
+        SourceKind::Repo {
+            repo_id: "org/model".into(),
+            repo_type: RepoType::Model,
+            revision: "feature/docs".into(),
+        },
+        String::new(),
+        "test",
+    )
+    .await
+    .unwrap();
+    let mut table = InodeTable::new(false);
+    table.get_mut(ROOT_INODE).unwrap().children_loaded_at = Some(Instant::now());
+    let poll = tokio::spawn(VirtualFs::poll_remote_changes(
+        client,
+        Arc::new(RwLock::new(table)),
+        Default::default(),
+        Default::default(),
+        Some(Duration::from_millis(5)),
+        1,
+        false,
+    ));
+    let requests = requests.await.unwrap();
+    poll.abort();
+    assert!(poll.await.unwrap_err().is_cancelled());
+    let info = "/api/models/org/model/revision/feature%2Fdocs?expand=sha&expand=lastModified";
+    let history = "/api/models/org/model/commits/feature%2Fdocs?limit=1";
+    let paths: Vec<_> = requests
+        .iter()
+        .map(|r| r.split_ascii_whitespace().nth(1).unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            info,
+            info,
+            history,
+            &format!("/api/models/org/model/tree/{a}?limit=1000"),
+            history,
+            history,
+            &format!("/api/models/org/model/tree/{b}?limit=1000"),
+            history
+        ]
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.to_ascii_lowercase().contains("authorization: bearer test\r\n"))
+    );
 }
