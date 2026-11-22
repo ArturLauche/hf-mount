@@ -47,10 +47,12 @@ require the billed seat count. The documented public allowances depend on
 best-effort policies, grants, and add-ons. `storagePercent` is a listing metric
 with no documented contract for deriving a scope's effective quota.
 
-Public, anonymous, ambiguous, and unauthorized mounts use a 42 PiB
-placeholder, as do requests that fail or exceed the four-second refresh
-budget. Quota lookup stays independent of the Hub requests needed to mount
-and access remote files. Resource-scoped tokens and non-admin organization roles can expose
-partial usage. Protected Space storage has no documented billing scope. The
-placeholder applies if those cases prevent a reliable estimate. WinFsp and
-FUSE report the same cached bytes, with FUSE rounding down to whole blocks.
+Public, anonymous, ambiguous, unauthorized, and overlay mounts use a 42 PiB
+placeholder. A request that fails or exceeds the four-second budget before the
+first successful estimate also uses it; later failures keep the last good
+estimate instead of flapping back to the placeholder. Quota lookup stays
+independent of the Hub requests needed to mount and access remote files.
+Resource-scoped tokens and non-admin organization roles can expose partial
+usage. Protected Space storage has no documented billing scope. The placeholder
+applies if those cases prevent a reliable estimate. WinFsp and FUSE report the
+same cached bytes, with FUSE rounding down to whole blocks.

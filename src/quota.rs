@@ -52,6 +52,9 @@ impl QuotaSnapshot {
         Self {
             total_bytes,
             used_bytes,
+            // Clamp to the included allowance. Paid plans may still accept
+            // pay-as-you-go writes above it, but the Hub does not expose that
+            // effective limit, and free space must never exceed total capacity.
             remaining_bytes: total_bytes.saturating_sub(used_bytes),
             scope,
             source,
@@ -105,8 +108,8 @@ impl QuotaCache {
                     .ok()
                     .flatten();
                 if let Some(state) = state.upgrade() {
-                    *state.snapshot.write().expect("quota cache poisoned") =
-                        estimate.or_else(|| scope.map(QuotaSnapshot::fallback));
+                    let mut snapshot = state.snapshot.write().expect("quota cache poisoned");
+                    publish(&mut snapshot, estimate, scope);
                 } else {
                     break;
                 }
@@ -135,6 +138,19 @@ impl QuotaCache {
         if let Some(task) = self.0.refresh.get() {
             task.abort();
         }
+    }
+}
+
+/// Keep the last good estimate across transient failures. Only the first
+/// fetch and a verified visibility change may replace it with the placeholder.
+fn publish(snapshot: &mut Option<QuotaSnapshot>, estimate: Option<QuotaSnapshot>, scope: Option<QuotaScope>) {
+    if let Some(estimate) = estimate {
+        *snapshot = Some(estimate);
+    } else if snapshot
+        .as_ref()
+        .is_none_or(|current| scope.is_some_and(|scope| current.scope != scope))
+    {
+        *snapshot = scope.map(QuotaSnapshot::fallback);
     }
 }
 
@@ -184,8 +200,12 @@ struct Identity {
     #[serde(rename = "type")]
     kind: String,
     name: String,
+    #[serde(default)]
     is_pro: bool,
-    orgs: Vec<Organization>,
+    // Keep raw values: one malformed organization must not disable quota for
+    // the user's own namespace.
+    #[serde(default)]
+    orgs: Option<Vec<serde_json::Value>>,
     auth: Auth,
 }
 
@@ -193,16 +213,31 @@ struct Identity {
 #[serde(rename_all = "camelCase")]
 struct Organization {
     name: String,
+    #[serde(default)]
     plan: Option<String>,
+    #[serde(default)]
     role_in_org: Option<String>,
     #[serde(default)]
-    security_restrictions: Vec<String>,
+    security_restrictions: serde_json::Value,
+}
+
+impl Organization {
+    /// The schema marks `securityRestrictions` optional. Treat a missing or
+    /// null value as unrestricted and any unexpected shape as restricted.
+    fn is_unrestricted(&self) -> bool {
+        match &self.security_restrictions {
+            serde_json::Value::Null => true,
+            serde_json::Value::Array(restrictions) => restrictions.is_empty(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Auth {
-    access_token: AccessToken,
+    #[serde(default)]
+    access_token: Option<AccessToken>,
 }
 
 #[derive(Deserialize)]
@@ -247,7 +282,8 @@ async fn fetch(
     .ok()?;
     // A resource-scoped token can produce a partial listing. Require a
     // namespace-wide credential and, for orgs, an unrestricted admin role.
-    if identity.kind != "user" || !matches!(identity.auth.access_token.role.as_str(), "read" | "write") {
+    let role = identity.auth.access_token.as_ref().map(|token| token.role.as_str());
+    if identity.kind != "user" || !role.is_some_and(|role| matches!(role, "read" | "write")) {
         return None;
     }
     let mut listing = Url::parse(endpoint).ok()?;
@@ -260,9 +296,12 @@ async fn fetch(
         } else {
             let org = identity
                 .orgs
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
+                .filter_map(|value| serde_json::from_value::<Organization>(value.clone()).ok())
                 .find(|org| org.name.eq_ignore_ascii_case(namespace))?;
-            if org.role_in_org.as_deref() != Some("admin") || !org.security_restrictions.is_empty() {
+            if org.role_in_org.as_deref() != Some("admin") || !org.is_unrestricted() {
                 return None;
             }
             // The Hub omits plan for free organizations. Paid plans depend
@@ -285,11 +324,20 @@ async fn fetch(
         }
         let response = success(client.get(page).bearer_auth(token).send().await.ok()?)?;
         let next = pagination::next_page(&response).ok()?;
-        for repo in response.json::<Vec<RepoStorage>>().await.ok()? {
-            let (owner, _) = repo.id.split_once('/')?;
+        let entries: Vec<serde_json::Value> = response.json().await.ok()?;
+        for entry in entries {
+            // Filter before parsing so a malformed entry in another namespace
+            // cannot discard this namespace's estimate.
+            let Some(id) = entry.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some((owner, _)) = id.split_once('/') else {
+                continue;
+            };
             if !owner.eq_ignore_ascii_case(namespace) {
                 continue;
             }
+            let repo: RepoStorage = serde_json::from_value(entry).ok()?;
             match repo.visibility.as_str() {
                 "private" => {
                     if !seen_repos.insert((repo.kind, repo.id)) {
@@ -503,6 +551,119 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_refresh_keeps_the_last_good_estimate() {
+        let estimate = QuotaSnapshot::new(QuotaScope::Private, QuotaSource::HubEstimate, 100 * GB, 43 * GB);
+        let mut snapshot = Some(estimate);
+
+        publish(&mut snapshot, None, Some(QuotaScope::Private));
+        assert_eq!(snapshot, Some(estimate));
+
+        // A verified visibility change still replaces the estimate.
+        publish(&mut snapshot, None, Some(QuotaScope::Public));
+        let fallback = snapshot.unwrap();
+        assert_eq!(fallback.scope, QuotaScope::Public);
+        assert_eq!(fallback.source, QuotaSource::Fallback);
+        assert_eq!(fallback.total_bytes, FALLBACK_BYTES);
+    }
+
+    #[test]
+    fn failed_first_refresh_publishes_the_scope_fallback() {
+        let mut snapshot = None;
+        publish(&mut snapshot, None, Some(QuotaScope::Private));
+        let fallback = snapshot.unwrap();
+        assert_eq!(fallback.scope, QuotaScope::Private);
+        assert_eq!(fallback.source, QuotaSource::Fallback);
+        assert_eq!(fallback.total_bytes, FALLBACK_BYTES);
+    }
+
+    #[tokio::test]
+    async fn org_entries_with_null_restrictions_do_not_disable_the_estimate() {
+        const TOLERANT_IDENTITY: &str = r#"{
+            "type":"user","name":"alice","isPro":false,
+            "orgs":[
+                {"name":"broken","plan":123},
+                {"name":"lab","roleInOrg":"admin","securityRestrictions":null}
+            ],
+            "auth":{"accessToken":{"role":"read"}}
+        }"#;
+        let (endpoint, server) = mock_server(vec![
+            ok("/api/whoami-v2", TOLERANT_IDENTITY),
+            ok(
+                "/api/organizations/lab/settings/repositories",
+                r#"[{"id":"lab/model","type":"model","visibility":"private","storage":42}]"#,
+            ),
+        ])
+        .await;
+        let snapshot = fetch_quota(&endpoint, Some("mock-token"), "lab", QuotaScope::Private)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.used_bytes, 42);
+        assert_eq!(snapshot.total_bytes, 100 * GB);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn null_org_list_does_not_disable_a_personal_estimate() {
+        const NULL_ORGS_IDENTITY: &str = r#"{
+            "type":"user","name":"alice","isPro":false,"orgs":null,
+            "auth":{"accessToken":{"role":"read"}}
+        }"#;
+        let (endpoint, server) = mock_server(vec![
+            ok("/api/whoami-v2", NULL_ORGS_IDENTITY),
+            ok(
+                "/api/settings/repositories",
+                r#"[{"id":"alice/model","type":"model","visibility":"private","storage":7}]"#,
+            ),
+        ])
+        .await;
+        let snapshot = fetch_quota(&endpoint, Some("mock-token"), "alice", QuotaScope::Private)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.used_bytes, 7);
+        assert_eq!(snapshot.total_bytes, 100 * GB);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_entries_in_other_namespaces_are_ignored() {
+        let (endpoint, server) = mock_server(vec![
+            ok("/api/whoami-v2", IDENTITY),
+            ok(
+                "/api/settings/repositories",
+                r#"[
+                    {"id":"bob/broken","type":null,"visibility":null,"storage":null},
+                    {"id":"alice/model","type":"model","visibility":"private","storage":500}
+                ]"#,
+            ),
+        ])
+        .await;
+        let snapshot = fetch_quota(&endpoint, Some("mock-token"), "alice", QuotaScope::Private)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.used_bytes, 500);
+        assert_eq!(snapshot.total_bytes, 1000 * GB);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_entry_in_the_mounted_namespace_falls_back() {
+        let (endpoint, server) = mock_server(vec![
+            ok("/api/whoami-v2", IDENTITY),
+            ok(
+                "/api/settings/repositories",
+                r#"[{"id":"alice/model","type":"model","visibility":"private","storage":null}]"#,
+            ),
+        ])
+        .await;
+        assert!(
+            fetch_quota(&endpoint, Some("mock-token"), "alice", QuotaScope::Private)
+                .await
+                .is_none()
+        );
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn unauthorized_usage_falls_back() {
         let (endpoint, server) = mock_server(vec![
@@ -514,25 +675,15 @@ mod tests {
             },
         ])
         .await;
-        let hub = HubApiClient::from_source(
-            &endpoint,
-            Some("mock-token"),
-            None,
-            SourceKind::Bucket {
-                bucket_id: "alice/files".into(),
-            },
-            String::new(),
-            "test",
-        )
-        .await
-        .unwrap();
+        // Start without cached visibility so the first refresh has to resolve
+        // the scope before the listing fails.
+        let hub = HubApiClient::new(&endpoint, Some("mock-token"), "alice/files", "test");
         let cache = QuotaCache::start(&Handle::current(), hub);
-        let initial = cache.snapshot().unwrap();
-        let updated = wait_for_snapshot(&cache, |quota| quota.fetched_at != initial.fetched_at).await;
-        assert_eq!(
-            (updated.scope, updated.source),
-            (QuotaScope::Private, QuotaSource::Fallback)
-        );
+        let snapshot = wait_for_snapshot(&cache, |quota| {
+            quota.scope == QuotaScope::Private && quota.source == QuotaSource::Fallback
+        })
+        .await;
+        assert_eq!(snapshot.used_bytes, 0);
         assert_eq!(cache.volume_bytes(), (FALLBACK_BYTES, FALLBACK_BYTES));
         server.await.unwrap();
     }
