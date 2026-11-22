@@ -155,7 +155,8 @@ export function DriveCard({ row, busy, letterBusy, actions }: {
           )}
           aria-hidden
         >
-          {row.target}
+          {/* Center the visible glyphs within the badge, accounting for the colon's side bearing. */}
+          <span className="translate-x-[1.5px] translate-y-px">{row.target}</span>
           {mounted && <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-surface bg-ok" />}
         </div>
 

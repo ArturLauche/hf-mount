@@ -104,9 +104,8 @@ export function Select<T extends string | number>({ id, value, onChange, options
           if (found) onChange(found.value);
         }}
         className={cn(
-          "h-9 w-full appearance-none rounded-[var(--radius-control)] border border-border bg-surface pl-3 pr-8 text-[13.5px] text-fg",
-          "outline-none transition-[border-color,box-shadow] duration-150 hover:border-border-strong",
-          "focus:border-border-strong focus:shadow-[0_0_0_3px_var(--ring-soft)]",
+          "app-select h-9 w-full appearance-none rounded-[var(--radius-control)] border border-border bg-surface pl-3 pr-8 text-[13.5px] text-fg",
+          "transition-colors duration-150 hover:border-border-strong hover:bg-surface-2",
         )}
       >
         {options.map((o) => (
@@ -117,7 +116,7 @@ export function Select<T extends string | number>({ id, value, onChange, options
       </select>
       <svg
         viewBox="0 0 16 16"
-        className="pointer-events-none absolute right-2.5 top-1/2 size-3.5 -translate-y-1/2 text-fg-3"
+        className="pointer-events-none absolute right-2.5 top-1/2 size-3.5 -translate-y-1/2 text-fg-2"
         aria-hidden
       >
         <path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" />
