@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use cap_std::fs::{Dir, DirBuilder, OpenOptions};
 #[cfg(unix)]
-use cap_std::fs::{DirBuilderExt, Permissions, PermissionsExt};
+use cap_std::fs::{DirBuilderExt, OpenOptionsExt, Permissions, PermissionsExt};
 
 #[derive(Debug, Clone)]
 pub struct OverlayDirEntry {
@@ -65,6 +65,26 @@ impl OverlayBacking {
             opts.truncate(true);
         }
         Ok(self.dir.open_with(rel, &opts)?.into_std())
+    }
+
+    /// Publish a new overlay file without truncating a name that already exists on disk.
+    pub fn create_file(&self, full_path: &str, mode: u16) -> std::io::Result<std::fs::File> {
+        let rel = validate_rel_path(full_path)?;
+        self.create_parent_dirs(full_path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(u32::from(mode));
+        #[cfg(not(unix))]
+        let _ = mode;
+        let file = self.dir.open_with(rel, &opts)?;
+        // Restore the requested mode after umask, using the open descriptor.
+        #[cfg(unix)]
+        if let Err(e) = file.set_permissions(Permissions::from_mode(u32::from(mode))) {
+            self.dir.remove_file(rel)?;
+            return Err(e);
+        }
+        Ok(file.into_std())
     }
 
     pub fn create_parent_dirs(&self, full_path: &str) -> std::io::Result<()> {

@@ -2977,25 +2977,23 @@ fn poll_skips_list_tree_when_revision_unchanged() {
 
         let (stop, handle) = spawn_poll_loop(&vfs, &hub, false);
 
-        // Let 5 rounds run with identical revision -> probe fires, list_tree does not.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(hub.probe_revision_call_count() >= 3, "probe should run each round");
+        // The first pinned round establishes the checkpoint for this repo.
+        assert!(wait_until(|| hub.probe_revision_call_count() >= 3).await);
+        let checkpoint_lists = baseline_list_tree + 1;
         assert_eq!(
             hub.list_tree_call_count(),
-            baseline_list_tree,
-            "list_tree must not fire when revision is unchanged"
+            checkpoint_lists,
+            "unchanged commits skip subsequent listings"
         );
 
         // Advance the revision -> next round fans out.
         let probes_before = hub.probe_revision_call_count();
         hub.set_revision("rev-b");
         // Wait until at least one more probe + one fan-out.
-        wait_until(|| {
-            hub.probe_revision_call_count() > probes_before && hub.list_tree_call_count() > baseline_list_tree
-        })
-        .await;
+        wait_until(|| hub.probe_revision_call_count() > probes_before && hub.list_tree_call_count() > checkpoint_lists)
+            .await;
         assert!(
-            hub.list_tree_call_count() > baseline_list_tree,
+            hub.list_tree_call_count() > checkpoint_lists,
             "list_tree must fire after revision change"
         );
 
@@ -3536,6 +3534,65 @@ fn poll_detects_remote_deletion_via_revalidation() {
         // Lookup again triggers revalidation → detects deletion
         let result = vfs.lookup(ROOT_INODE, "file.txt").await;
         assert_eq!(result.unwrap_err(), libc::ENOENT);
+    });
+}
+
+#[test]
+fn revalidation_preserves_open_file_across_remote_replacement() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    hub.add_file("item", 3, Some("old"), None);
+    xet.add_file("old", b"old");
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+    rt.block_on(async {
+        let original = vfs.lookup(ROOT_INODE, "item").await.unwrap().ino;
+        let fh = vfs.open(original, false, false, None).await.unwrap();
+        hub.remove_file("item");
+        assert_eq!(vfs.lookup(ROOT_INODE, "item").await.unwrap_err(), libc::ENOENT);
+        assert_eq!(vfs.getattr(original).unwrap().nlink, 0);
+
+        hub.add_file("item", 11, Some("replacement"), None);
+        let replacement = vfs.lookup(ROOT_INODE, "item").await.unwrap();
+        assert_ne!(replacement.ino, original);
+        VirtualFs::apply_poll_diff(
+            hub.list_tree("").await.unwrap(),
+            &[String::new()].into(),
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+        assert_eq!(vfs.getattr(original).unwrap().size, 3);
+        assert_eq!(&vfs.read(fh, 0, 16).await.unwrap().0[..], b"old");
+        vfs.release(fh).await.unwrap();
+        assert_eq!(vfs.getattr(original).unwrap_err(), libc::ENOENT);
+        assert_eq!(vfs.lookup(ROOT_INODE, "item").await.unwrap().ino, replacement.ino);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_close_after_remote_deletion_preserves_local_replacement() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    hub.add_file("item", 3, Some("old"), None);
+    xet.add_file("old", b"old");
+    let t = make_overlay_test_vfs_with_root(hub.clone(), xet, fresh_overlay_dir("remote-replaced"));
+    t.runtime.block_on(async {
+        let original = t.vfs.lookup(ROOT_INODE, "item").await.unwrap().ino;
+        let old_handle = t.vfs.open(original, false, false, None).await.unwrap();
+        hub.remove_file("item");
+        assert_eq!(t.vfs.lookup(ROOT_INODE, "item").await.unwrap_err(), libc::ENOENT);
+
+        let (local, local_handle) = t.vfs.create(ROOT_INODE, "item", 0o644, 1000, 1000, None).await.unwrap();
+        assert_ne!(local.ino, original);
+        write_blocking(&t.vfs, local.ino, local_handle, 0, b"replacement")
+            .await
+            .unwrap();
+        t.vfs.release(local_handle).await.unwrap();
+        assert_eq!(&t.vfs.read(old_handle, 0, 3).await.unwrap().0[..], b"old");
+        t.vfs.release(old_handle).await.unwrap();
+        assert_eq!(std::fs::read(t.overlay_root.join("item")).unwrap(), b"replacement");
+        assert_eq!(t.vfs.lookup(ROOT_INODE, "item").await.unwrap().ino, local.ino);
     });
 }
 
@@ -6633,6 +6690,46 @@ fn overlay_reread_does_not_bump_dirty_generation() {
     });
 }
 
+/// A scan can discover new names while an existing descriptor is writing.
+/// Only the metadata for the file changed since the scan should be discarded.
+#[cfg(unix)]
+#[test]
+fn overlay_directory_scan_preserves_a_concurrent_write_and_chmod() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("mode-only"), b"existing").unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        let (file, fh) = t.vfs.create(ROOT_INODE, "live", 0o644, 1000, 1000, None).await.unwrap();
+        let mode_only = t.vfs.lookup(ROOT_INODE, "mode-only").await.unwrap();
+        let new_mode = mode_only.perm ^ 0o040;
+        std::fs::write(root.path().join("discovered"), b"also here").unwrap();
+        let _namespace = t.vfs.overlay_read_guard().await;
+        let scan = t
+            .vfs
+            .overlay_mount
+            .as_ref()
+            .unwrap()
+            .entries(String::new(), None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        write_blocking(&t.vfs, file.ino, fh, 0, b"later").await.unwrap();
+        t.vfs
+            .setattr(mode_only.ino, None, Some(new_mode), None, None, None, None)
+            .await
+            .unwrap();
+        {
+            let mut table = t.vfs.inode_table.write().unwrap();
+            t.vfs.merge_overlay_entries(&mut table, ROOT_INODE, scan);
+            assert_eq!(table.get(file.ino).unwrap().size, 5);
+            assert_eq!(table.get(mode_only.ino).unwrap().mode, new_mode);
+            assert_eq!(table.lookup_child(ROOT_INODE, "discovered").unwrap().size, 9);
+        }
+        t.vfs.release(fh).await.unwrap();
+    });
+}
+
 /// Unlink of a remote-only file returns EPERM in overlay mode.
 #[test]
 fn overlay_unlink_remote_only_eperm() {
@@ -6670,13 +6767,190 @@ fn overlay_unlink_local_file_ok() {
             .await
             .unwrap();
         write_blocking(&t.vfs, attr.ino, fh, 0, b"data").await.unwrap();
-        t.vfs.release(fh).await.unwrap();
-
         t.vfs.unlink(ROOT_INODE, "local.txt").await.unwrap();
+        assert!(!t.overlay_root.join("local.txt").exists());
+        let (new, new_fh) = t
+            .vfs
+            .create(ROOT_INODE, "local.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, new.ino, new_fh, 0, b"new").await.unwrap();
+        assert_eq!(t.vfs.open(attr.ino, true, true, None).await.unwrap_err(), libc::ENOENT);
+        assert_eq!(&t.vfs.read(fh, 0, 4).await.unwrap().0[..], b"data");
+        t.vfs
+            .setattr(attr.ino, Some(2), Some(0o600), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(t.vfs.read(fh, 0, 4).await.unwrap().0.as_ref(), b"da");
+        assert_eq!(t.vfs.getattr(new.ino).unwrap().size, 3);
+        assert_eq!(t.vfs.getattr(new.ino).unwrap().perm, 0o644);
+        t.vfs.release(fh).await.unwrap();
+        t.vfs.release(new_fh).await.unwrap();
+        assert_eq!(std::fs::read(t.overlay_root.join("local.txt")).unwrap(), b"new");
     });
 
     let log = hub.take_batch_log();
     assert!(log.is_empty(), "unlink should not send remote ops in overlay: {log:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_chmod_on_an_orphan_cannot_modify_a_cached_remote_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let hub = MockHub::new();
+    hub.add_file("shadow", 1, None, Some("remote"));
+    let t = make_overlay_test_vfs_with_root(hub, MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "shadow").unwrap().ino;
+        let cached_handle = t.vfs.open(ino, false, false, None).await.unwrap();
+        let cached_file = {
+            let handles = t.vfs.open_files.read().unwrap();
+            let Some(OpenFile::Local { file, .. }) = handles.get(&cached_handle) else {
+                panic!("expected a downloaded HTTP cache file");
+            };
+            file.clone()
+        };
+        let mode = || cached_file.metadata().unwrap().permissions().mode() & 0o777;
+        let original_mode = mode();
+        let changed_mode = (original_mode ^ 0o040) as u16;
+
+        // The same inode now shadows the remote file. Its old cached
+        // descriptor and its new overlay descriptor refer to different files.
+        std::fs::write(root.path().join("shadow"), b"local").unwrap();
+        t.vfs.inode_table.write().unwrap().invalidate_children(ROOT_INODE);
+        t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let local = t.vfs.open(ino, false, false, None).await.unwrap();
+        t.vfs.unlink(ROOT_INODE, "shadow").await.unwrap();
+        t.vfs
+            .setattr(ino, None, Some(changed_mode), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(mode(), original_mode);
+        t.vfs.release(local).await.unwrap();
+        let result = t
+            .vfs
+            .setattr(ino, None, Some(changed_mode), None, None, None, None)
+            .await;
+        assert_eq!(result.unwrap_err(), libc::EBADF);
+        assert_eq!(mode(), original_mode);
+        t.vfs.release(cached_handle).await.unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_create_preserves_a_backing_file_added_after_the_directory_listing() {
+    let root = tempfile::tempdir().unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let path = root.path().join("occupied");
+        std::fs::write(&path, b"existing").unwrap();
+        let result = t.vfs.create(ROOT_INODE, "occupied", 0o644, 1000, 1000, None).await;
+        assert_eq!(result.unwrap_err(), libc::EEXIST);
+        assert_eq!(std::fs::read(path).unwrap(), b"existing");
+    });
+}
+
+/// Pause a real create at the disk boundary. Cached operations must still
+/// finish, and cancelling the creator must leave exactly one published file.
+#[cfg(unix)]
+#[test]
+fn overlay_slow_create_keeps_cached_reads_available_and_finishes_after_cancellation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("other"), b"cached").unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        let other = t.vfs.lookup(ROOT_INODE, "other").await.unwrap();
+        let fh = t.vfs.open(other.ino, false, false, None).await.unwrap();
+
+        let (started, at_disk) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *t.vfs.overlay_mount.as_ref().unwrap().before_io.lock().unwrap() = Some(Box::new(move || {
+            started.send(()).unwrap();
+            paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+        let vfs = t.vfs.clone();
+        let creator = tokio::spawn(async move { vfs.create(ROOT_INODE, "new", 0o644, 1000, 1000, None).await });
+        tokio::time::timeout(Duration::from_secs(5), at_disk)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(t.vfs.inode_table.try_write().is_ok(), "disk I/O held the inode table");
+        assert_eq!(t.vfs.getattr(other.ino).unwrap().size, 6);
+        assert_eq!(t.vfs.lookup(ROOT_INODE, "other").await.unwrap().ino, other.ino);
+        assert_eq!(t.vfs.read(fh, 0, 6).await.unwrap().0.as_ref(), b"cached");
+
+        creator.abort();
+        assert!(creator.await.unwrap_err().is_cancelled());
+        let competing = t.vfs.create(ROOT_INODE, "new", 0o644, 1000, 1000, None);
+        tokio::pin!(competing);
+        assert!(futures::poll!(competing.as_mut()).is_pending());
+        resume.send(()).unwrap();
+        assert_eq!(competing.await.unwrap_err(), libc::EEXIST);
+        let new = t.vfs.lookup(ROOT_INODE, "new").await.unwrap();
+        assert_eq!(std::fs::metadata(root.path().join("new")).unwrap().len(), new.size);
+        assert!(!t.vfs.has_open_handles(new.ino), "cancelled create leaked its handle");
+        t.vfs.release(fh).await.unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_parent_pins_are_released_when_a_rename_worker_panics() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("source"), b"contents").unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        *t.vfs.overlay_mount.as_ref().unwrap().before_io.lock().unwrap() =
+            Some(Box::new(|| panic!("injected namespace I/O panic")));
+        let rename = || t.vfs.rename(ROOT_INODE, "source", ROOT_INODE, "dest", false);
+        assert_eq!(rename().await, Err(libc::EIO));
+        // Same-directory rename pins the root once for each parent argument.
+        assert!(!t.vfs.has_open_handles(ROOT_INODE));
+        assert_eq!(std::fs::read(root.path().join("source")).unwrap(), b"contents");
+        rename().await.unwrap();
+        assert!(!t.vfs.has_open_handles(ROOT_INODE));
+        assert_eq!(std::fs::read(root.path().join("dest")).unwrap(), b"contents");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_lookup_waiting_for_a_parent_rename_finds_the_local_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("old")).unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        let dir = t.vfs.lookup(ROOT_INODE, "old").await.unwrap().ino;
+        t.vfs.readdir(dir).await.unwrap();
+        let (started, at_disk) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *t.vfs.overlay_mount.as_ref().unwrap().before_io.lock().unwrap() = Some(Box::new(move || {
+            started.send(()).unwrap();
+            paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+        let vfs = t.vfs.clone();
+        let rename = tokio::spawn(async move { vfs.rename(ROOT_INODE, "old", ROOT_INODE, "new", false).await });
+        tokio::time::timeout(Duration::from_secs(5), at_disk)
+            .await
+            .unwrap()
+            .unwrap();
+        let lookup = t.vfs.lookup(dir, "added");
+        tokio::pin!(lookup);
+        assert!(futures::poll!(lookup.as_mut()).is_pending());
+        std::fs::write(root.path().join("old/added"), b"local").unwrap();
+        resume.send(()).unwrap();
+        rename.await.unwrap().unwrap();
+        let file = lookup.await.unwrap();
+        assert_eq!(file.size, 5);
+        let fh = t.vfs.open(file.ino, false, false, None).await.unwrap();
+        assert_eq!(t.vfs.read(fh, 0, 5).await.unwrap().0.as_ref(), b"local");
+        t.vfs.release(fh).await.unwrap();
+    });
 }
 
 /// Rename of a remote-only file returns EPERM in overlay mode.
@@ -6722,10 +6996,18 @@ fn overlay_rename_local_moves_on_disk() {
         write_blocking(&t.vfs, attr.ino, fh, 0, b"rename me").await.unwrap();
         t.vfs.release(fh).await.unwrap();
 
+        let (old, old_fh) = t
+            .vfs
+            .create(ROOT_INODE, "dst.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, old.ino, old_fh, 0, b"old").await.unwrap();
         t.vfs
             .rename(ROOT_INODE, "src.txt", ROOT_INODE, "dst.txt", false)
             .await
             .unwrap();
+        assert_eq!(&t.vfs.read(old_fh, 0, 3).await.unwrap().0[..], b"old");
+        t.vfs.release(old_fh).await.unwrap();
     });
 
     assert!(!t.overlay_root.join("src.txt").exists(), "old path should be gone");
@@ -7016,6 +7298,10 @@ fn overlay_type_conflict_local_dir_wins() {
             .expect("conflict should exist");
         // Local directory should win over remote file
         assert_eq!(entry.kind, InodeKind::Directory);
+        t.vfs.inode_table.write().unwrap().invalidate_children(ROOT_INODE);
+        let reloaded = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let same_dir = reloaded.iter().find(|e| e.name == "conflict").unwrap();
+        assert_eq!((same_dir.ino, same_dir.kind), (entry.ino, InodeKind::Directory));
     });
 }
 
@@ -7231,6 +7517,23 @@ fn miss_probe_404_stays_enoent_and_seeds_negative_cache() {
             hub.list_tree_call_count(),
             listings,
             "second lookup must hit the negative cache"
+        );
+    });
+}
+
+/// A denied listing says nothing about whether the child exists.
+#[test]
+fn forbidden_directory_probe_does_not_seed_a_negative_lookup() {
+    let hub = MockHub::new_repo();
+    let (rt, vfs) = vfs_repo(&hub, &MockXet::new());
+    rt.block_on(async {
+        hub.fail_next_list_tree_with_status(403);
+        assert_eq!(vfs.lookup(ROOT_INODE, "folder").await.unwrap_err(), libc::EACCES);
+        assert!(!vfs.negative_cache_check("folder"));
+        hub.add_file("folder/item", 1, Some("hash"), None);
+        assert_eq!(
+            vfs.lookup(ROOT_INODE, "folder").await.unwrap().kind,
+            InodeKind::Directory
         );
     });
 }
@@ -7639,6 +7942,113 @@ fn listing_during_rename_does_not_take_the_destination() {
         let inodes = vfs.inode_table.read().unwrap();
         assert!(inodes.get_by_path("b.txt").is_some());
     });
+}
+
+#[test]
+fn lookup_discards_old_path_responses_when_the_parent_moves() {
+    #[derive(Clone, Copy, Debug)]
+    enum OldResponse {
+        File,
+        FileAfterRoundTripRename,
+        Directory,
+        EmptyDirectory,
+        MissingDirectory,
+        RateLimited,
+    }
+
+    use OldResponse::*;
+    for response in [
+        File,
+        FileAfterRoundTripRename,
+        Directory,
+        EmptyDirectory,
+        MissingDirectory,
+        RateLimited,
+    ] {
+        let hub = MockHub::new();
+        hub.add_file("old/known", 1, Some("known"), None);
+        let (rt, vfs) = vfs_simple(&hub, &MockXet::new());
+        rt.block_on(async {
+            let parent = vfs.lookup(ROOT_INODE, "old").await.unwrap().ino;
+            vfs.readdir(parent).await.unwrap();
+            let resume = match response {
+                File | FileAfterRoundTripRename => {
+                    hub.add_file("old/target", 2, Some("old"), None);
+                    hub.head_pause.arm()
+                }
+                Directory => {
+                    hub.add_file("old/target/leaf", 1, Some("leaf"), None);
+                    hub.tree_pause.arm()
+                }
+                EmptyDirectory => hub.tree_pause.arm(),
+                MissingDirectory => {
+                    hub.fail_next_list_tree_with_status(404);
+                    hub.tree_pause.arm()
+                }
+                RateLimited => {
+                    hub.fail_next_head_with_status(429);
+                    hub.head_pause.arm()
+                }
+            };
+            let lookup = vfs.lookup(parent, "target");
+            tokio::pin!(lookup);
+            assert!(futures::poll!(lookup.as_mut()).is_pending(), "{response:?}");
+            vfs.rename(ROOT_INODE, "old", ROOT_INODE, "new", false).await.unwrap();
+            let path = if matches!(response, FileAfterRoundTripRename) {
+                vfs.rename(ROOT_INODE, "new", ROOT_INODE, "old", false).await.unwrap();
+                hub.remove_file("old/target");
+                "old/target"
+            } else {
+                "new/target"
+            };
+            hub.add_file(path, 77, Some("current"), None);
+            resume.send(()).unwrap();
+            let attr = lookup.await.unwrap();
+            assert_eq!(attr.size, 77, "{response:?}");
+            let inodes = vfs.inode_table.read().unwrap();
+            assert_eq!(inodes.get_by_path(path).unwrap().inode, attr.ino);
+            assert!(!vfs.negative_cache_check("old/target"));
+        });
+    }
+}
+
+#[test]
+fn readdir_reloads_the_new_path_after_a_parent_rename() {
+    for stale_error in [None, Some(404), Some(429)] {
+        let hub = MockHub::new();
+        hub.add_file("old/known", 1, Some("known"), None);
+        let (rt, vfs) = vfs_simple(&hub, &MockXet::new());
+        rt.block_on(async {
+            let dir = vfs.lookup(ROOT_INODE, "old").await.unwrap().ino;
+            vfs.readdir(dir).await.unwrap();
+            // Start a normal rename and let a reader request a fresh listing
+            // after rename has loaded the subtree but before it moves the inodes.
+            let committing = Arc::new(tokio::sync::Barrier::new(2));
+            hub.set_batch_barrier(committing.clone());
+            let rename = vfs.rename(ROOT_INODE, "old", ROOT_INODE, "new", false);
+            tokio::pin!(rename);
+            assert!(futures::poll!(rename.as_mut()).is_pending());
+            vfs.inode_table.write().unwrap().invalidate_children(dir);
+            hub.add_file("old/stale", 1, Some("stale"), None);
+            if let Some(status) = stale_error {
+                hub.fail_next_list_tree_with_status(status);
+            }
+            let resume = hub.tree_pause.arm();
+            let listing = vfs.readdir(dir);
+            tokio::pin!(listing);
+            assert!(futures::poll!(listing.as_mut()).is_pending());
+            tokio::time::timeout(Duration::from_secs(5), committing.wait())
+                .await
+                .unwrap();
+            rename.await.unwrap();
+            hub.add_file("new/current", 1, Some("current"), None);
+            resume.send(()).unwrap();
+            let names: Vec<_> = listing.await.unwrap().into_iter().map(|e| e.name).collect();
+            assert!(names.iter().any(|n| n == "current"), "{stale_error:?}: {names:?}");
+            assert!(!names.iter().any(|n| n == "stale"));
+            assert!(vfs.inode_table.read().unwrap().get_by_path("old/stale").is_none());
+        });
+    }
 }
 
 /// While a rename is between its Hub commit and its local move: a remote

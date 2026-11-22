@@ -290,6 +290,7 @@ pub struct MountOptions {
     /// Restrict mount access to the mounting user only (FUSE only).
     /// By default all users can access the mount.
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
+    /// Linux idmapped mounts require the default all-users mode.
     #[arg(long, default_value_t = false)]
     pub fuse_owner_only: bool,
 
@@ -677,7 +678,11 @@ pub fn try_build_with_runtime(
     if read_only && !hub_client.path_prefix().is_empty() {
         runtime.block_on(async {
             if let Err(e) = hub_client.validate_path_prefix().await {
-                warn!("{e}");
+                warn!(
+                    "Checking subfolder '{}' in {} failed: {e}",
+                    hub_client.path_prefix(),
+                    hub_client.source()
+                );
             }
         });
     }

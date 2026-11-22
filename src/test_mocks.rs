@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use reqwest::StatusCode;
 use xet_data::processing::XetFileInfo;
 
 use crate::error::{Error, Result};
@@ -15,7 +16,76 @@ use crate::hub_api::{BatchOp, HeadFileInfo, HubOps, SourceKind, TreeEntry};
 use crate::overlay::OverlayBacking;
 use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
 
+/// Serve one JSON response per request and record the actual HTTP request lines and headers.
+pub(crate) async fn serve_hub_responses(pages: &[(&str, &str)]) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    let mut pages = pages
+        .iter()
+        .map(|(h, b)| (StatusCode::OK, h.to_string(), b.to_string()))
+        .collect::<Vec<_>>()
+        .into_iter();
+    serve_hub_requests(pages.len(), move |_| pages.next().unwrap()).await
+}
+
+pub(crate) async fn serve_hub_requests(
+    expected: usize,
+    mut respond: impl FnMut(&str) -> (StatusCode, String, String) + Send + 'static,
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let requests = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..expected {
+            let exchange = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut input = BufReader::new(socket);
+                let mut request = String::new();
+                while !request.ends_with("\r\n\r\n") {
+                    assert_ne!(input.read_line(&mut request).await.unwrap(), 0);
+                }
+                let target = request.split_ascii_whitespace().nth(1).unwrap();
+                let (status, headers, body) = respond(target);
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or(""),
+                    body.len()
+                );
+                input.into_inner().write_all(response.as_bytes()).await.unwrap();
+                request
+            };
+            let request = tokio::time::timeout(Duration::from_secs(10), exchange)
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for HTTP exchange {}", index + 1));
+            requests.push(request);
+        }
+        requests
+    });
+    (endpoint, requests)
+}
+
 // ── MockHub ───────────────────────────────────────────────────────────
+
+/// Suspend a single response after the mock has captured its contents.
+#[derive(Default)]
+pub struct ReadPause(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+impl ReadPause {
+    pub fn arm(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        assert!(self.0.lock().unwrap().replace(paused).is_none());
+        resume
+    }
+
+    async fn wait(&self) {
+        let paused = self.0.lock().unwrap().take();
+        if let Some(paused) = paused {
+            paused.await.unwrap();
+        }
+    }
+}
 
 pub struct MockHub {
     tree: Mutex<Vec<TreeEntry>>,
@@ -23,6 +93,8 @@ pub struct MockHub {
     pub batch_log: Mutex<Vec<Vec<BatchOp>>>,
     batch_fail_count: AtomicU32,
     batch_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    pub head_pause: ReadPause,
+    pub tree_pause: ReadPause,
     /// HTTP status for the next list_tree failure.
     list_tree_fail_status: Mutex<Option<u16>>,
     /// HTTP status for the next head_file failure (used with head_fail).
@@ -64,6 +136,8 @@ impl MockHub {
             batch_log: Mutex::new(Vec::new()),
             batch_fail_count: AtomicU32::new(0),
             batch_barrier: Mutex::new(None),
+            head_pause: ReadPause::default(),
+            tree_pause: ReadPause::default(),
             list_tree_fail_status: Mutex::new(None),
             head_fail_status: Mutex::new(None),
             head_fail: AtomicBool::new(false),
@@ -223,19 +297,8 @@ impl MockHub {
     pub fn follow_connect_log(&self) -> Vec<(Option<String>, Option<String>)> {
         self.follow_connects.lock().unwrap().clone()
     }
-}
 
-/// Build a mock Hub error, carrying `status` when one is configured.
-fn mock_error(status: Option<u16>, msg: &str) -> Error {
-    match status {
-        Some(status) => Error::hub_status(status, msg),
-        None => Error::hub(msg),
-    }
-}
-
-#[async_trait::async_trait]
-impl HubOps for MockHub {
-    async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
+    fn tree_response(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(status) = self.list_tree_fail_status.lock().unwrap().take() {
             return Err(Error::hub_status(status, "mock list_tree failure"));
@@ -286,7 +349,7 @@ impl HubOps for MockHub {
         Ok(result)
     }
 
-    async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+    fn head_response(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         self.head_file_calls.fetch_add(1, Ordering::SeqCst);
         if self.head_fail.swap(false, Ordering::SeqCst) {
             let status = self.head_fail_status.lock().unwrap().take();
@@ -302,6 +365,37 @@ impl HubOps for MockHub {
             })),
             None => Ok(None),
         }
+    }
+}
+
+/// Build a mock Hub error, carrying `status` when one is configured.
+fn mock_error(status: Option<u16>, msg: &str) -> Error {
+    match status {
+        Some(status) => Error::hub_status(status, msg),
+        None => Error::hub(msg),
+    }
+}
+
+#[async_trait::async_trait]
+impl HubOps for MockHub {
+    async fn probe_repo_commit(&self) -> Result<Option<String>> {
+        self.probe_revision().await.map(Some)
+    }
+
+    async fn list_tree_at_commit(&self, prefix: &str, _commit: &str) -> Result<Vec<TreeEntry>> {
+        self.list_tree(prefix).await
+    }
+
+    async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
+        let result = self.tree_response(prefix);
+        self.tree_pause.wait().await;
+        result
+    }
+
+    async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+        let result = self.head_response(path);
+        self.head_pause.wait().await;
+        result
     }
 
     async fn batch_operations(&self, ops: &[BatchOp]) -> Result<()> {

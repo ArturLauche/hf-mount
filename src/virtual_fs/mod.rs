@@ -15,12 +15,16 @@ use crate::overlay::OverlayBacking;
 
 mod flush;
 pub mod inode;
+mod namespace;
 mod poll;
 mod remote_reader;
+mod revalidate;
 mod staging;
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
+use namespace::{MountedOverlay, OverlaySnapshot};
 use remote_reader::{ReadAheadBudget, RemoteReader};
+use revalidate::FileRevalidation;
 use staging::StagingCoordinator;
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -152,7 +156,8 @@ pub struct VfsConfig {
 /// Lock ordering (acquire in this order to prevent deadlocks):
 ///
 ///   dir_loading_locks\[ino\]      (tokio::sync::Mutex, per-directory)
-///     → inode_table             (RwLock, read or write)
+///     → overlay namespace       (optional, Tokio RwLock)
+///       → inode_table           (RwLock, read or write)
 ///
 ///   staging.lock(ino)           (tokio::sync::Mutex, per-inode — also
 ///                                serializes streaming writer creation,
@@ -165,9 +170,9 @@ pub struct VfsConfig {
 ///   StreamingChannel.commit_hook (Mutex)
 ///     → pending_commits          (Mutex)
 ///
-/// General discipline: locks are held briefly and never across await points
-/// (except the per-inode tokio::sync::Mutex from StagingCoordinator). Most paths acquire a lock,
-/// extract data, drop the lock, perform async I/O, then re-acquire to apply.
+/// Synchronous locks never cross await points. Overlay operations acquire
+/// the namespace gate before opening local paths or taking a staging lock.
+/// Cached inode reads and operations on existing descriptors skip the gate.
 ///
 /// Exception: setattr(truncate) holds inode_table.write() across File::create
 /// / set_len syscalls (microseconds) to prevent write() from updating
@@ -188,7 +193,7 @@ pub struct VirtualFs {
     staging: Arc<StagingCoordinator>,
     /// Overlay backing fd. When `Some`, writes stay local under the pre-mount
     /// directory accessed via this fd, and remote mutations are skipped.
-    overlay_backing: Option<Arc<OverlayBacking>>,
+    overlay_mount: Option<MountedOverlay>,
     read_only: bool,
     advanced_writes: bool,
     inode_table: Arc<RwLock<InodeTable>>,
@@ -284,7 +289,6 @@ impl VirtualFs {
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
         let staging = Arc::new(StagingCoordinator::new(staging_dir));
-        let overlay_backing = overlay_backing.map(Arc::new);
         let overlay = overlay_backing.is_some();
 
         // Staging GC orders eviction by `last_touched`. When the inode evictor
@@ -349,7 +353,7 @@ impl VirtualFs {
         };
 
         let entry_invalidator: EntryInvalidator = Arc::new(OnceLock::new());
-        let vfs = Arc::new(Self {
+        let vfs = Arc::new_cyclic(|owner| Self {
             runtime,
             flush_shutdown_timeout: config.flush_shutdown_timeout,
             shutdown_once: std::sync::Once::new(),
@@ -357,7 +361,7 @@ impl VirtualFs {
             hub_client,
             xet_sessions,
             staging,
-            overlay_backing,
+            overlay_mount: overlay_backing.map(|backing| MountedOverlay::new(backing, owner.clone())),
             read_only: config.read_only,
             // Overlay implies advanced_writes (random writes via local backing file).
             advanced_writes: config.advanced_writes || overlay,
@@ -428,22 +432,19 @@ impl VirtualFs {
     /// True when the VFS is in overlay mode (writes stay local, no remote
     /// mutations). Derived from the presence of an overlay backing.
     fn overlay(&self) -> bool {
-        self.overlay_backing.is_some()
+        self.overlay_mount.is_some()
     }
 
     /// Splice local overlay entries into the inode table for `parent_ino`,
     /// overriding remote entries on name conflict (kind mismatch removes the
     /// remote inode first, then re-inserts as local). No-op when not in
     /// overlay mode.
-    fn merge_overlay_entries(&self, inodes: &mut InodeTable, parent_ino: u64) {
-        let Some(overlay) = &self.overlay_backing else {
+    fn merge_overlay_entries(&self, inodes: &mut InodeTable, parent_ino: u64, snapshot: OverlaySnapshot) {
+        if snapshot.entries.is_empty() {
             return;
-        };
-        let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
-        let Ok(entries) = overlay.read_dir(&dir_path) else {
-            return;
-        };
-        for entry in entries {
+        }
+        let dir_path = inodes.get(parent_ino).expect("validated parent").full_path.clone();
+        for entry in snapshot.entries {
             if entry.is_symlink || (self.filter_os_files && is_os_junk(&entry.name)) {
                 continue;
             }
@@ -455,12 +456,14 @@ impl VirtualFs {
             let full_path = inode::child_path(&dir_path, &entry.name);
             // If existing entry has a different kind (e.g. remote file vs
             // local dir), remove it first so local wins cleanly.
-            let conflict = inodes
-                .lookup_child(parent_ino, &entry.name)
-                .filter(|e| e.kind != kind)
-                .map(|e| e.inode);
-            if let Some(old_ino) = conflict {
-                inodes.remove(old_ino);
+            if let Some(current) = inodes.lookup_child(parent_ino, &entry.name) {
+                if current.dirty_generation > snapshot.generation {
+                    continue;
+                }
+                if current.kind != kind {
+                    let old_ino = current.inode;
+                    inodes.remove(old_ino);
+                }
             }
             let ino = inodes.insert(
                 parent_ino,
@@ -476,13 +479,14 @@ impl VirtualFs {
             );
             // Local overrides remote: clear remote identity, mark dirty.
             if let Some(e) = inodes.get_mut(ino) {
+                if !e.is_dirty() || e.size != entry.size || e.mtime != entry.mtime || e.mode != entry.mode {
+                    self.mark_local_dirty(e);
+                }
                 e.size = entry.size;
                 e.mtime = entry.mtime;
                 e.mode = entry.mode;
                 e.xet_hash = None;
-                if !e.is_dirty() {
-                    e.set_dirty();
-                }
+                e.etag = None;
                 if kind == InodeKind::Directory {
                     e.children_loaded_at = None;
                 }
@@ -495,19 +499,26 @@ impl VirtualFs {
     /// On hit, re-runs `merge_overlay_entries` on the parent so the entry
     /// shows up in the inode table even when it was added to the backing
     /// after the parent's listing was loaded.
-    fn overlay_lookup_takes_precedence(&self, parent: u64, full_path: &str) -> VirtualFsResult<bool> {
-        let Some(overlay) = &self.overlay_backing else {
+    async fn overlay_lookup_takes_precedence(
+        &self,
+        parent: &DirectoryPath,
+        full_path: &str,
+    ) -> DirectoryReadResult<bool> {
+        let Some(overlay) = &self.overlay_mount else {
             return Ok(false);
         };
-        let exists = overlay.exists(full_path).map_err(|e| {
-            error!("Failed to stat overlay path {}: {}", full_path, e);
-            libc::EIO
-        })?;
-        if exists {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            self.merge_overlay_entries(&mut inodes, parent);
-        }
-        Ok(exists)
+        let _namespace = self.overlay_read_guard().await;
+        parent.current(&self.inode_table.read().expect("inodes poisoned"))?;
+        let Some(entries) = overlay
+            .entries(parent.path.to_string(), Some(full_path.to_owned()))
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut inodes = self.inode_table.write().expect("inodes poisoned");
+        parent.current(&inodes)?;
+        self.merge_overlay_entries(&mut inodes, parent.ino, entries);
+        Ok(true)
     }
 
     /// True if the entry is a clean remote entry that overlay mode treats as immutable.
@@ -784,123 +795,6 @@ impl VirtualFs {
         }
     }
 
-    /// Revalidate a remote file by checking the Hub for metadata changes.
-    /// Skips HEAD if the inode was validated within `metadata_ttl`.
-    /// If the file's xet_hash changed, updates the inode and invalidates kernel cache.
-    /// If the file was deleted (404), removes the inode.
-    /// On network errors, silently returns (graceful degradation).
-    async fn revalidate_file(&self, ino: u64, full_path: &str, current_hash: Option<&str>, current_etag: Option<&str>) {
-        // When serve_lookup_from_cache is true, skip HEAD if recently validated.
-        // When false (minimal mode), always HEAD on every lookup.
-        if self.serve_lookup_from_cache {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            if let Some(entry) = inodes.get(ino)
-                && let Some(last) = entry.last_revalidated
-                && last.elapsed() < self.metadata_ttl
-            {
-                return;
-            }
-        }
-
-        let remote = match self.hub_client.head_file(full_path).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("head_file({}) failed, using cached: {}", full_path, e);
-                return;
-            }
-        };
-
-        // Collect kernel invalidations to issue after we drop the inode_table
-        // write lock. `inval_inode` issues a synchronous writev to /dev/fuse that
-        // ends up in `invalidate_inode_pages2_range` on the kernel side, which
-        // blocks on per-folio waits. Calling it under the global write lock can
-        // stall the whole VFS (and has been observed to deadlock production
-        // pods). Apply the mutation, drop the lock, then notify.
-        let mut to_invalidate: Vec<(u64, InvalKind)> = Vec::new();
-        match remote {
-            None => {
-                // File deleted remotely → remove from inode table
-                info!("Remote deletion detected via HEAD: {}", full_path);
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                if let Some(entry) = inodes.get(ino) {
-                    let parent = entry.parent;
-                    // A full page drop on an inode with an in-flight read deadlocks
-                    // against the read's folio lock (#195); fall back to attr-only.
-                    let kind = if inodes.has_open_handles(ino) {
-                        InvalKind::AttrOnly
-                    } else {
-                        InvalKind::Pages
-                    };
-                    to_invalidate.push((parent, InvalKind::Pages));
-                    to_invalidate.push((ino, kind));
-                }
-                inodes.remove(ino);
-            }
-            Some(head_info) => {
-                let remote_hash = head_info.xet_hash.as_deref();
-                let remote_etag = head_info.etag.as_deref();
-                // Detect changes via xet_hash (preferred) or ETag.
-                let changed = if current_hash.is_some() || remote_hash.is_some() {
-                    remote_hash != current_hash
-                } else {
-                    remote_etag != current_etag
-                };
-                let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                if changed {
-                    let remote_size = match head_info.size {
-                        Some(s) => s,
-                        None => {
-                            warn!("HEAD response missing size for {}, skipping update", full_path);
-                            return;
-                        }
-                    };
-                    let remote_mtime = head_info
-                        .last_modified
-                        .as_deref()
-                        .map(crate::hub_api::mtime_from_http_date)
-                        .unwrap_or(SystemTime::now());
-                    debug!("Remote change detected via HEAD: {}", full_path);
-                    inodes.update_remote_file(
-                        ino,
-                        remote_hash.map(|s| s.to_string()),
-                        remote_etag.map(|s| s.to_string()),
-                        remote_size,
-                        remote_mtime,
-                    );
-                    let kind = if inodes.has_open_handles(ino) {
-                        InvalKind::AttrOnly
-                    } else {
-                        InvalKind::Pages
-                    };
-                    to_invalidate.push((ino, kind));
-                } else {
-                    // Update stored etag even when content didn't change,
-                    // so future revalidations have the latest value.
-                    if let Some(entry) = inodes.get_mut(ino)
-                        && remote_etag.is_some()
-                    {
-                        entry.etag = remote_etag.map(|s| s.to_string());
-                    }
-                }
-                // Stamp revalidation time regardless of whether content changed
-                if let Some(entry) = inodes.get_mut(ino) {
-                    entry.last_revalidated = Some(Instant::now());
-                }
-            }
-        }
-
-        // Drop happened at scope end above. Notify after the new state is
-        // published so a racing lookup repopulating the kernel cache cannot
-        // beat the invalidation.
-        if !to_invalidate.is_empty()
-            && let Some(invalidate) = self.invalidator.get()
-        {
-            for (ino, kind) in to_invalidate {
-                invalidate(ino, kind);
-            }
-        }
-    }
-
     /// Ensure children of a directory inode are loaded from the Hub API.
     /// Fetch remote children for `parent_ino` if not already loaded.
     /// Uses a per-directory lock to prevent thundering herd: concurrent callers
@@ -924,37 +818,44 @@ impl VirtualFs {
         // Serialize concurrent loads for the same directory.
         let dir_lock = self.dir_loading_lock(parent_ino);
         let _guard = dir_lock.lock().await;
+        retry_directory_read(|| self.load_children_once(parent_ino)).await
+    }
 
+    async fn load_children_once(&self, parent_ino: u64) -> DirectoryReadResult<bool> {
         // Re-check: another task may have loaded while we waited.
-        let prefix = {
+        let directory = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
-            match inodes.get(parent_ino) {
-                Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if self.listing_is_fresh(e) => return Ok(false),
-                Some(e) => e.full_path.to_string(),
-                None => return Err(libc::ENOENT),
+            let entry = inodes.get(parent_ino).ok_or(libc::ENOENT)?;
+            if self.listing_is_fresh(entry) {
+                return Ok(false);
             }
+            DirectoryPath::new(entry)
         };
 
-        let entries = match self.hub_client.list_tree(&prefix).await {
+        let prefix = directory.path.as_ref();
+        let entries = match self.hub_client.list_tree(prefix).await {
             Ok(entries) => entries,
             Err(e) => {
+                directory.current(&self.inode_table.read().expect("inodes poisoned"))?;
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
                 // Preserve the error semantics: a 429 after client-side retries
                 // must surface as EAGAIN (transient), not EIO — EIO reads as
                 // hard data loss and aborts whole distributed jobs on a single
                 // rate-limited stat().
-                return Err(e.to_errno());
+                return Err(e.to_errno().into());
             }
         };
 
+        let _namespace = self.overlay_read_guard().await;
+        let local_entries = match &self.overlay_mount {
+            Some(overlay) => overlay.entries(prefix.to_string(), None).await,
+            None => Ok(None),
+        };
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(parent_ino) {
-            Some(e) if self.listing_is_fresh(e) => return Ok(false),
-            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-            None => return Err(libc::ENOENT),
-            _ => {}
+        if self.listing_is_fresh(directory.current(&inodes)?) {
+            return Ok(false);
         }
+        let local_entries = local_entries?;
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Entries skipped for a rename in flight: the listing stays stale, so
@@ -972,16 +873,26 @@ impl VirtualFs {
             let rel_path = if prefix.is_empty() {
                 entry.path.clone()
             } else {
-                match crate::hub_api::strict_descendant_rel(&entry.path, &prefix) {
+                match crate::hub_api::strict_descendant_rel(&entry.path, prefix) {
                     Some(rel) => rel.to_string(),
                     // list_tree guarantees strict descendants; skip defensively.
                     None => continue,
                 }
             };
 
-            if let Some(slash_pos) = rel_path.find('/') {
+            // A local file can shadow a remote directory (and conversely).
+            // Its kind and metadata come from the backing snapshot below.
+            let nested = rel_path.split_once('/');
+            if self.overlay()
+                && inodes
+                    .lookup_child(parent_ino, nested.map_or(rel_path.as_str(), |(dir, _)| dir))
+                    .is_some_and(|child| child.is_dirty())
+            {
+                continue;
+            }
+
+            if let Some((dir_name, _)) = nested {
                 // Nested path → create the immediate subdirectory only (lazy-loaded later)
-                let dir_name = &rel_path[..slash_pos];
                 if seen_dirs.insert(dir_name.to_string()) {
                     let dir_full_path = if prefix.is_empty() {
                         dir_name.to_string()
@@ -1067,18 +978,11 @@ impl VirtualFs {
             }
         }
 
-        self.merge_overlay_entries(&mut inodes, parent_ino);
-
-        if let Some(parent) = inodes.get_mut(parent_ino) {
-            // Vec growth doubles capacity; for a one-shot readdir of a stable
-            // directory we'd otherwise keep ~50% slack forever. Trim now,
-            // since regrowth on rare child mutations is cheap.
-            parent.children.shrink_to_fit();
-            if !skipped_rename {
-                parent.children_loaded_at = Some(Instant::now());
-            }
-            parent.children_from_remote = true;
+        if let Some(snapshot) = local_entries {
+            self.merge_overlay_entries(&mut inodes, parent_ino, snapshot);
         }
+
+        inodes.finish_remote_listing(parent_ino, skipped_rename);
         Ok(true)
     }
 
@@ -1109,14 +1013,20 @@ impl VirtualFs {
         self.next_file_handle.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Bump the per-inode open-handle refcount. Used by the FUSE adapter
-    /// on `opendir` so a directory with an active readdir can't be evicted.
+    /// Check the type and pin the directory under one table lock, so a
+    /// concurrent eviction cannot intervene between the two.
     #[cfg(feature = "fuse")]
-    pub(crate) fn bump_open_handles(&self, ino: u64) {
-        self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
+    pub(crate) fn pin_directory(&self, ino: u64) -> VirtualFsResult<()> {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        if inodes.get(ino).ok_or(libc::ENOENT)?.kind != InodeKind::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        inodes.touch(ino);
+        inodes.bump_open_handles(ino);
+        Ok(())
     }
 
-    /// Counterpart to `bump_open_handles`, called from `releasedir`.
+    /// Release a directory pin after the last in-flight read of its handle.
     #[cfg(feature = "fuse")]
     pub(crate) fn drop_open_handles(&self, ino: u64) {
         self.inode_table.read().expect("inodes poisoned").drop_open_handles(ino);
@@ -1149,7 +1059,7 @@ impl VirtualFs {
     }
 
     fn local_backing_exists(&self, ino: u64, full_path: &str) -> std::io::Result<bool> {
-        match self.overlay_backing.as_deref() {
+        match self.overlay_backing() {
             Some(overlay) => overlay.exists(full_path),
             None => Ok(self
                 .staging
@@ -1168,7 +1078,7 @@ impl VirtualFs {
         create: bool,
         truncate: bool,
     ) -> std::io::Result<File> {
-        match self.overlay_backing.as_deref() {
+        match self.overlay_backing() {
             Some(overlay) => {
                 // Overlay paths are hierarchical; parents may exist as inodes
                 // (from a remote listing) without being materialized locally.
@@ -1196,23 +1106,22 @@ impl VirtualFs {
         }
     }
 
-    fn set_local_backing_mode(&self, full_path: &str, mode: u16) -> std::io::Result<()> {
-        match self.overlay_backing.as_deref() {
+    fn set_local_backing_mode(&self, full_path: &str, mode: u16, unlinked_file: Option<&File>) -> std::io::Result<()> {
+        if let Some(file) = unlinked_file {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                return file.set_permissions(std::fs::Permissions::from_mode(u32::from(mode)));
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = file;
+                return Ok(());
+            }
+        }
+        match self.overlay_backing() {
             Some(overlay) => overlay.set_mode(full_path, mode),
             None => Ok(()),
-        }
-    }
-
-    fn remove_local_backing_file(&self, ino: u64, full_path: &str) -> std::io::Result<()> {
-        match self.overlay_backing.as_deref() {
-            Some(overlay) => overlay.remove_file(full_path),
-            None => {
-                let path = self
-                    .staging
-                    .path(ino)
-                    .expect("staging directory required for local backing");
-                std::fs::remove_file(&path)
-            }
         }
     }
 
@@ -1335,9 +1244,9 @@ impl VirtualFs {
     }
 
     /// Open a local file as read-only and return the file handle.
-    fn open_local_readonly(&self, ino: u64, path: &PathBuf) -> VirtualFsResult<u64> {
+    fn open_local_readonly(&self, ino: u64, path: &PathBuf, kind: LocalHandleKind) -> VirtualFsResult<u64> {
         match File::open(path) {
-            Ok(file) => self.install_local_handle(ino, Arc::new(file), false),
+            Ok(file) => self.install_local_handle(ino, Arc::new(file), kind),
             Err(e) => {
                 error!("Failed to open file {:?}: {}", path, e);
                 Err(libc::EIO)
@@ -1345,10 +1254,9 @@ impl VirtualFs {
         }
     }
 
-    /// Register an already-opened `File` as a read-only `OpenFile::Local`
-    /// handle. Used by the file_cache fast-path so the read fd stays alive
-    /// even if eviction unlinks the on-disk copy after the open.
-    fn install_local_handle(&self, ino: u64, file: Arc<File>, writable: bool) -> VirtualFsResult<u64> {
+    /// Keep a descriptor alive across replacement or cache eviction, and
+    /// record which operations can safely target its underlying file.
+    fn install_local_handle(&self, ino: u64, file: Arc<File>, kind: LocalHandleKind) -> VirtualFsResult<u64> {
         let file_handle = self.alloc_file_handle();
         {
             let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -1358,7 +1266,7 @@ impl VirtualFs {
         self.open_files
             .write()
             .expect("open_files poisoned")
-            .insert(file_handle, OpenFile::Local { ino, file, writable });
+            .insert(file_handle, OpenFile::Local { ino, file, kind });
         Ok(file_handle)
     }
 
@@ -1425,221 +1333,119 @@ impl VirtualFs {
     pub async fn lookup(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
         debug!("lookup: parent={}, name={}", parent, name);
 
-        // Fast path: children already loaded → lookup directly, no allocation needed.
-        // Revalidation info extracted from the lock scope so we can await outside it.
-        enum FastResult {
-            Hit(VirtualFsAttr),
-            NeedsRevalidation {
-                ino: u64,
-                full_path: Arc<str>,
-                current_hash: Option<String>,
-                current_etag: Option<String>,
-            },
-            Miss {
-                full_path: String,
-                /// True when the parent has no remote presence (locally
-                /// created in this session); HEAD/list_tree probes are
-                /// pointless and can be skipped.
-                local_only: bool,
-            },
-            NotLoaded,
+        retry_directory_read(|| self.lookup_once(parent, name)).await
+    }
+
+    async fn lookup_once(&self, parent: u64, name: &str) -> DirectoryReadResult<VirtualFsAttr> {
+        enum Lookup {
+            Revalidate(FileRevalidation),
+            Probe { full_path: String, listed: bool },
         }
-        let fast = {
+        let (directory, lookup) = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
-            let parent_entry = inodes.get(parent).ok_or(libc::ENOENT)?;
-
-            if parent_entry.kind != InodeKind::Directory {
-                return Err(libc::ENOTDIR);
+            let entry = inodes.get(parent).ok_or(libc::ENOENT)?;
+            if entry.kind != InodeKind::Directory {
+                return Err(libc::ENOTDIR.into());
             }
 
-            // Try in-memory first regardless of a fresh listing: an inode
-            // inserted via the HEAD point-lookup path or still present after
-            // a partial eviction can be served without a full re-list.
-            //
-            // For directories we still require a fresh listing to trust the
-            // cached entry: without the parent listing, we can't tell whether
-            // the dir was removed or replaced remotely (files revalidate
-            // individually via HEAD, dirs don't).
-            match inodes.lookup_child(parent, name) {
-                // Clean cached file: HEAD-revalidate (gated by `metadata_ttl`)
-                // so size/hash/mtime stay fresh between poll cycles.
-                Some(entry) if entry.kind == InodeKind::File && !entry.is_dirty() => FastResult::NeedsRevalidation {
-                    ino: entry.inode,
-                    full_path: entry.full_path.clone(),
-                    current_hash: entry.xet_hash.clone(),
-                    current_etag: entry.etag.clone(),
-                },
-                // Either a dirty file (local writes win until flushed) or any
-                // entry under a freshly listed parent we can trust as-is.
-                Some(entry) if entry.kind == InodeKind::File || self.listing_is_fresh(parent_entry) => {
-                    FastResult::Hit(self.make_vfs_attr(entry))
-                }
-                // Cached non-file under an unloaded or stale parent: we can't
-                // HEAD-probe a directory to check it still exists (resolve
-                // endpoint only serves files), so defer to the slow path which lists.
-                Some(_) => FastResult::NotLoaded,
-                // No cached entry but the parent listing is authoritative →
-                // the name really doesn't exist; populate the negative cache.
-                None if self.listing_is_fresh(parent_entry) => {
-                    let parent_path = &parent_entry.full_path;
-                    let full_path = if parent_path.is_empty() {
-                        name.to_string()
-                    } else {
-                        format!("{}/{}", parent_path, name)
-                    };
-                    // Skip the HEAD-on-miss revalidation when the listing was
-                    // just refreshed: workloads that rapidly look up unique
-                    // names (tarball extract, build systems, xfstests) would
-                    // otherwise pay one HEAD + list_tree per name despite the
-                    // cache being authoritative.
-                    FastResult::Miss {
-                        full_path,
-                        local_only: !parent_entry.children_from_remote,
+            let lookup = match inodes.lookup_child(parent, name) {
+                Some(child) if child.kind == InodeKind::File => {
+                    let fresh = self.serve_lookup_from_cache
+                        && child
+                            .last_revalidated
+                            .is_some_and(|last| last.elapsed() < self.metadata_ttl);
+                    if child.is_dirty() || fresh {
+                        return Ok(self.make_vfs_attr(child));
                     }
+                    Lookup::Revalidate(FileRevalidation::new(child))
                 }
-                // No entry, no listing → slow path (HEAD then list_tree).
-                None => FastResult::NotLoaded,
-            }
-        }; // inodes lock dropped here
-
-        match fast {
-            FastResult::Hit(attr) => return Ok(attr),
-            FastResult::NeedsRevalidation {
-                ino,
-                full_path,
-                current_hash,
-                current_etag,
-            } => {
-                self.revalidate_file(ino, &full_path, current_hash.as_deref(), current_etag.as_deref())
-                    .await;
-                let inodes = self.inode_table.read().expect("inodes poisoned");
-                return match inodes.get(ino) {
-                    Some(entry) => Ok(self.make_vfs_attr(entry)),
-                    None => Err(libc::ENOENT),
-                };
-            }
-            FastResult::Miss { full_path, local_only } => {
-                // A cached listing can still hide entries added remotely after
-                // we listed. Re-validate before serving ENOENT, gated by the
-                // negative cache so repeated misses stay free.
-                if self.negative_cache_check(&full_path) {
-                    return Err(libc::ENOENT);
-                }
-                // Skip HEAD/list probes for purely-local directories
-                // (locally-mkdir'd this session, never seen on remote):
-                // there's no remote state to discover, so the cached listing
-                // is authoritative. Hot path for tarball extract / xfstests
-                // creating thousands of unique names under fresh dirs.
-                //
-                // Do NOT seed the global negative cache here — remote churn
-                // could materialize these names while the entry hides them.
-                // The listing itself is the cache for these misses.
-                if local_only {
-                    return Err(libc::ENOENT);
-                }
-                // Overlay precedence: a file added to the overlay backing
-                // after the parent listing was loaded must shadow whatever the
-                // remote HEAD returns. Otherwise a clean remote inode wins,
-                // and a later open(write) would truncate the local backing.
-                if self.overlay_lookup_takes_precedence(parent, &full_path)? {
-                    let inodes = self.inode_table.read().expect("inodes poisoned");
-                    return inodes
-                        .lookup_child(parent, name)
-                        .map(|e| self.make_vfs_attr(e))
-                        .ok_or(libc::ENOENT);
-                }
-                match self.head_probe(&full_path).await {
-                    HeadProbe::File(head) => return self.insert_file_from_head(parent, name, &full_path, head),
-                    HeadProbe::Transient(e) => return Err(e.to_errno()),
-                    HeadProbe::Inconclusive => {}
-                }
-                // The resolve endpoint returns 404 for directories, so a HEAD
-                // miss could still be a remotely-added dir. Targeted listing
-                // catches that; list_tree only returns strict descendants of
-                // the path, so a non-empty result means the dir exists.
-                let entries = match self.hub_client.list_tree(&full_path).await {
-                    Ok(entries) => entries,
-                    Err(e) if e.is_transient() => {
-                        debug!("list miss-probe {} failed: {}", full_path, e);
-                        return Err(e.to_errno());
+                child => {
+                    let listed = self.listing_is_fresh(entry);
+                    if listed {
+                        if let Some(child) = child {
+                            return Ok(self.make_vfs_attr(child));
+                        }
+                        // A locally created directory has no remote names to discover.
+                        if !entry.children_from_remote {
+                            return Err(libc::ENOENT.into());
+                        }
                     }
-                    // The repo tree endpoint returns 404 for a nonexistent
-                    // path (buckets return an empty listing): an authoritative
-                    // miss. Other permanent failures also fall through to the
-                    // negative cache — pre-existing behavior, and unlike
-                    // transient ones they won't clear within NEG_CACHE_TTL.
-                    Err(e) => {
-                        debug!("list miss-probe {} failed permanently: {}", full_path, e);
-                        Vec::new()
+                    let full_path = inode::child_path(&entry.full_path, name);
+                    if self.negative_cache_check(&full_path) {
+                        return Err(libc::ENOENT.into());
                     }
-                };
-                if !entries.is_empty() {
-                    return self.insert_dir(parent, name, &full_path);
+                    Lookup::Probe { full_path, listed }
                 }
-                self.negative_cache_insert(full_path);
-                return Err(libc::ENOENT);
-            }
-            FastResult::NotLoaded => {} // fall through to slow path
-        }
-
-        // Slow path: children not loaded yet, fetch from Hub API.
-        let full_path = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            match inodes.get(parent) {
-                Some(e) => inode::child_path(&e.full_path, name),
-                None => return Err(libc::ENOENT),
-            }
+            };
+            (DirectoryPath::new(entry), lookup)
         };
 
-        if self.negative_cache_check(&full_path) {
-            debug!("negative cache hit: {}", full_path);
-            return Err(libc::ENOENT);
-        }
+        let (full_path, listed) = match lookup {
+            Lookup::Revalidate(check) => {
+                check.run(self).await;
+                // An open descriptor can outlive a remote unlink. Resolve the name again.
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                directory.current(&inodes)?;
+                return inodes
+                    .lookup_child(parent, name)
+                    .map(|e| self.make_vfs_attr(e))
+                    .ok_or(libc::ENOENT.into());
+            }
+            Lookup::Probe { full_path, listed } => (full_path, listed),
+        };
 
-        // Overlay precedence (see FastResult::Miss): defer to the parent
-        // listing + merge so the local entry is what we resolve.
-        if self.overlay_lookup_takes_precedence(parent, &full_path)? {
-            self.ensure_children_loaded(parent).await?;
+        // A file added to the backing after the listing still shadows the remote.
+        if self.overlay_lookup_takes_precedence(&directory, &full_path).await? {
+            if !listed {
+                self.ensure_children_loaded(parent).await?;
+            }
             let inodes = self.inode_table.read().expect("inodes poisoned");
+            directory.current(&inodes)?;
             return inodes
                 .lookup_child(parent, name)
                 .map(|e| self.make_vfs_attr(e))
-                .ok_or(libc::ENOENT);
+                .ok_or(libc::ENOENT.into());
         }
 
-        // Resolve the single requested path via HEAD instead of listing the
-        // whole parent — for point-access workloads (no `readdir`) this keeps
-        // the inode table scoped to what the caller actually touches.
-        let head_probe = match self.head_probe(&full_path).await {
-            HeadProbe::File(head) => return self.insert_file_from_head(parent, name, &full_path, head),
+        let head = match self.head_probe(&full_path).await {
+            HeadProbe::File(head) => return self.insert_file_from_head(&directory, name, &full_path, head).await,
             other => other,
         };
 
-        let freshly_listed = self.ensure_children_loaded(parent).await?;
-
-        let inodes = self.inode_table.read().expect("inodes poisoned");
-        match inodes.lookup_child(parent, name) {
-            Some(entry) => Ok(self.make_vfs_attr(entry)),
-            None => {
-                drop(inodes);
-                // A fresh listing is authoritative regardless of the HEAD
-                // outcome: the miss is real and safe to cache.
-                if freshly_listed {
-                    self.negative_cache_insert(full_path);
-                    return Err(libc::ENOENT);
-                }
-                // The listing was loaded earlier (or by a concurrent task)
-                // and may predate a remote commit: an inconclusive probe is
-                // not authoritative enough to negative-cache (uncached ENOENT
-                // lets the next lookup retry against a fresher listing), and
-                // a rate-limited probe surfaces its errno instead of a false
-                // ENOENT.
-                match head_probe {
-                    HeadProbe::Transient(e) => Err(e.to_errno()),
-                    _ => Err(libc::ENOENT),
+        // A cached listing can predate a remote commit. A single child proves
+        // the missing name is a directory, even if its full listing spans pages.
+        let authoritative = if listed {
+            if let HeadProbe::Transient(e) = head {
+                directory.current(&self.inode_table.read().expect("inodes poisoned"))?;
+                return Err(e.to_errno().into());
+            }
+            match self.hub_client.has_children(&full_path).await {
+                Ok(true) => return self.insert_dir(&directory, name, &full_path).await,
+                Ok(false) => true,
+                Err(e) if e.status() == Some(404) => true,
+                Err(e) => {
+                    directory.current(&self.inode_table.read().expect("inodes poisoned"))?;
+                    debug!("list miss-probe {} failed: {}", full_path, e);
+                    return Err(e.to_errno().into());
                 }
             }
+        } else {
+            self.ensure_children_loaded(parent).await?
+        };
+
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        directory.current(&inodes)?;
+        if let Some(child) = inodes.lookup_child(parent, name) {
+            return Ok(self.make_vfs_attr(child));
         }
+        if authoritative {
+            // Keep the path stable until its negative cache entry has been published.
+            self.negative_cache_insert(full_path);
+        } else if let HeadProbe::Transient(e) = head {
+            // Another caller's older listing cannot overrule a rate-limited HEAD.
+            return Err(e.to_errno().into());
+        }
+        Err(libc::ENOENT.into())
     }
 
     /// HEAD-probe `full_path` for a remotely-added file; both lookup miss
@@ -1671,13 +1477,13 @@ impl VirtualFs {
     /// Used by the lookup slow path to avoid listing the whole parent dir
     /// when only one file is needed. The parent's `children_loaded` stays
     /// `false` so a later `readdir` still triggers a full listing.
-    fn insert_file_from_head(
+    async fn insert_file_from_head(
         &self,
-        parent: u64,
+        directory: &DirectoryPath,
         name: &str,
         full_path: &str,
         head: crate::hub_api::HeadFileInfo,
-    ) -> VirtualFsResult<VirtualFsAttr> {
+    ) -> DirectoryReadResult<VirtualFsAttr> {
         let size = head.size.unwrap_or(0);
         let mtime = head
             .last_modified
@@ -1685,16 +1491,14 @@ impl VirtualFs {
             .map(crate::hub_api::mtime_from_http_date)
             .unwrap_or_else(|| self.hub_client.default_mtime());
 
+        let _namespace = self.overlay_read_guard().await;
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(parent) {
-            None => return Err(libc::ENOENT),
-            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-            Some(_) => {}
-        }
+        directory.current(&inodes)?;
+        let parent = directory.ino;
         if let Some(existing) = inodes.lookup_child(parent, name) {
             // A concurrent HEAD lookup may have just inserted the same file —
             // return its attr instead of redoing the work.
-            if existing.kind == InodeKind::File {
+            if existing.kind == InodeKind::File || (self.overlay() && existing.is_dirty()) {
                 return Ok(self.make_vfs_attr(existing));
             }
             // The cached entry is a directory but HEAD just confirmed the
@@ -1727,7 +1531,7 @@ impl VirtualFs {
         }
         match inodes.get(ino) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
-            None => Err(libc::EIO),
+            None => Err(libc::EIO.into()),
         }
     }
 
@@ -1735,13 +1539,16 @@ impl VirtualFs {
     /// touching siblings. Mirrors `insert_file_from_head` for the dir case.
     /// Parent's `children_loaded` stays as-is so a later `readdir` still
     /// triggers a full listing.
-    fn insert_dir(&self, parent: u64, name: &str, full_path: &str) -> VirtualFsResult<VirtualFsAttr> {
+    async fn insert_dir(
+        &self,
+        directory: &DirectoryPath,
+        name: &str,
+        full_path: &str,
+    ) -> DirectoryReadResult<VirtualFsAttr> {
+        let _namespace = self.overlay_read_guard().await;
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(parent) {
-            None => return Err(libc::ENOENT),
-            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-            Some(_) => {}
-        }
+        directory.current(&inodes)?;
+        let parent = directory.ino;
         if let Some(existing) = inodes.lookup_child(parent, name) {
             return Ok(self.make_vfs_attr(existing));
         }
@@ -1759,7 +1566,7 @@ impl VirtualFs {
         );
         match inodes.get(ino) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
-            None => Err(libc::EIO),
+            None => Err(libc::EIO.into()),
         }
     }
 
@@ -1875,7 +1682,9 @@ impl VirtualFs {
             match files.get(&file_handle) {
                 Some(OpenFile::Streaming { .. }) => return Ok(()),
                 // Overlay: sync local fd for durability, skip remote upload.
-                Some(OpenFile::Local { file, .. }) if self.overlay() => Some(Arc::clone(file)),
+                Some(OpenFile::Local { file, kind, .. }) if self.overlay() && *kind != LocalHandleKind::CachedRead => {
+                    Some(Arc::clone(file))
+                }
                 _ => None,
             }
         };
@@ -1972,6 +1781,16 @@ impl VirtualFs {
     }
 
     pub async fn readdir(&self, ino: u64) -> VirtualFsResult<Vec<VirtualFsDirEntry>> {
+        self.collect_dir_entries(ino, ToString::to_string).await
+    }
+
+    /// Full-list callers own their names. A long-lived FUSE listing can
+    /// instead share the immutable names already stored in the inode table.
+    pub(crate) async fn collect_dir_entries<Name: From<&'static str>>(
+        &self,
+        ino: u64,
+        copy_name: impl Fn(&Arc<str>) -> Name,
+    ) -> VirtualFsResult<Vec<DirectoryEntry<Name>>> {
         debug!("readdir: ino={}", ino);
 
         self.ensure_children_loaded(ino).await?;
@@ -1980,23 +1799,23 @@ impl VirtualFs {
         let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
 
         let mut entries = Vec::with_capacity(2 + entry.children.len());
-        entries.push(VirtualFsDirEntry {
+        entries.push(DirectoryEntry {
             ino,
             kind: InodeKind::Directory,
-            name: ".".to_string(),
+            name: ".".into(),
         });
-        entries.push(VirtualFsDirEntry {
+        entries.push(DirectoryEntry {
             ino: entry.parent,
             kind: InodeKind::Directory,
-            name: "..".to_string(),
+            name: "..".into(),
         });
 
         for child_ref in &entry.children {
             if let Some(child) = inodes.get(child_ref.ino) {
-                entries.push(VirtualFsDirEntry {
+                entries.push(DirectoryEntry {
                     ino: child.inode,
                     kind: child.kind,
-                    name: child_ref.name.to_string(),
+                    name: copy_name(&child_ref.name),
                 });
             }
         }
@@ -2014,7 +1833,16 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
-        let file_entry = self.get_file_entry(ino)?;
+        let mut file_entry = self.get_file_entry(ino)?;
+        // A local pathname can be reused between the inode snapshot and open.
+        // Acquire the overlay gate only for opens that need that pathname.
+        let _namespace = if self.overlay() && (writable || file_entry.is_dirty) {
+            let guard = self.overlay_read_guard().await;
+            file_entry = self.get_file_entry(ino)?;
+            guard
+        } else {
+            None
+        };
         let staging_path = self.staging.path(ino);
 
         if writable && self.advanced_writes {
@@ -2135,7 +1963,7 @@ impl VirtualFs {
         {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
             let entry = inodes.get_mut(ino).ok_or(libc::ENOENT)?;
-            entry.set_dirty();
+            self.mark_local_dirty(entry);
             if truncate {
                 entry.size = 0;
                 // POSIX: O_TRUNC must update mtime and ctime
@@ -2145,7 +1973,7 @@ impl VirtualFs {
             }
         }
 
-        self.install_local_handle(ino, Arc::new(file), true)
+        self.install_local_handle(ino, Arc::new(file), LocalHandleKind::BackingWrite)
     }
 
     /// Simple streaming write: truncate existing file and set up a new streaming writer.
@@ -2239,7 +2067,7 @@ impl VirtualFs {
                         error!("Failed to open local backing file {:?}: {}", fe.full_path, e);
                         libc::EIO
                     })?;
-                return self.install_local_handle(ino, Arc::new(file), false);
+                return self.install_local_handle(ino, Arc::new(file), LocalHandleKind::BackingRead);
             }
             error!("Dirty overlay file ino={} has missing local backing file", ino);
             return Err(libc::EIO);
@@ -2256,7 +2084,7 @@ impl VirtualFs {
         };
         match (fe.is_dirty, &staging_path) {
             // Advanced write in progress — read from local staging file.
-            (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
+            (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path, LocalHandleKind::BackingRead),
 
             // Dirty file but staging file is missing — should not happen.
             (true, Some(_)) => {
@@ -2279,7 +2107,7 @@ impl VirtualFs {
             _ if !fe.xet_hash.is_empty() => {
                 if let Some(fc) = &self.file_cache {
                     if let Some(file) = fc.try_open(&fe.xet_hash).await {
-                        return self.install_local_handle(ino, file, false);
+                        return self.install_local_handle(ino, file, LocalHandleKind::CachedRead);
                     }
                     self.spawn_populate_file_cache(fe.xet_hash.clone(), fe.size);
                 }
@@ -2320,7 +2148,7 @@ impl VirtualFs {
                             libc::EIO
                         })?;
                 }
-                self.open_local_readonly(ino, &dest)
+                self.open_local_readonly(ino, &dest, LocalHandleKind::CachedRead)
             }
 
             // Empty file (size=0, no hash).
@@ -2409,7 +2237,7 @@ impl VirtualFs {
                 Some(OpenFile::Local {
                     ino,
                     file,
-                    writable: true,
+                    kind: LocalHandleKind::BackingWrite,
                 }) => WriteTarget::Local {
                     file: file.clone(),
                     ino: *ino,
@@ -2437,7 +2265,7 @@ impl VirtualFs {
                             }
                             entry.size = new_end;
                         }
-                        entry.set_dirty();
+                        self.mark_local_dirty(entry);
                     }
                     inodes.touch(handle_ino);
                     Ok(written)
@@ -2600,7 +2428,9 @@ impl VirtualFs {
 
         match removed {
             Some(OpenFile::Local {
-                ino, writable: true, ..
+                ino,
+                kind: LocalHandleKind::BackingWrite,
+                ..
             }) => {
                 // Advanced writes: enqueue for async flush (skip unlinked files —
                 // user deleted the file, no point uploading it to remote).
@@ -2709,37 +2539,19 @@ impl VirtualFs {
         }
     }
 
-    /// Last-close cleanup: reap the orphan or evict-pending inode, remove its
-    /// local backing (overlay file or staging), and GC clean staging files
-    /// over budget.
+    /// Last close can reclaim inode-keyed staging. An unlinked overlay name
+    /// may already belong to another file, so only unlink or rename may remove it.
     async fn reap_on_last_release(&self, ino: u64) {
-        let (removed, is_clean, overlay_path) = {
+        let (removed, is_clean) = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            // Capture path before removal so we can clean up the overlay
-            // backing file for an unlink-while-open case (POSIX delete on
-            // last close): unlink() saw open handles and skipped the
-            // overlay-side remove, so we have to do it here.
-            let overlay_path = self
-                .overlay_backing
-                .is_some()
-                .then(|| inodes.get(ino).map(|e| e.full_path.clone()))
-                .flatten();
             let orphan = inodes.remove_orphan(ino);
             let evicted = inodes.take_evict_pending(ino) && inodes.evict_if_safe(ino);
             let removed = orphan || evicted;
             let is_clean = !removed && inodes.get(ino).is_some_and(|entry| !entry.is_dirty());
-            (removed, is_clean, overlay_path.filter(|_| removed))
+            (removed, is_clean)
         };
         if removed {
-            if let Some(path) = overlay_path {
-                if let Err(e) = self.remove_local_backing_file(ino, &path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!("Failed to remove overlay file for ino={} on release: {}", ino, e);
-                }
-            } else {
-                self.drop_staging(ino);
-            }
+            self.drop_staging(ino);
         } else if is_clean && self.staging.gc_one(ino, &self.inode_table).await {
             debug!("staging GC: removed ino={} on release", ino);
         }
@@ -2885,6 +2697,26 @@ impl VirtualFs {
         Ok(())
     }
 
+    fn register_created_local_file(
+        &self,
+        inodes: &InodeTable,
+        ino: u64,
+        file: File,
+    ) -> VirtualFsResult<(VirtualFsAttr, u64)> {
+        let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
+        let fh = self.alloc_file_handle();
+        inodes.bump_open_handles(ino);
+        self.open_files.write().expect("open_files poisoned").insert(
+            fh,
+            OpenFile::Local {
+                ino,
+                file: Arc::new(file),
+                kind: LocalHandleKind::BackingWrite,
+            },
+        );
+        Ok((attr, fh))
+    }
+
     pub async fn create(
         &self,
         parent: u64,
@@ -2907,71 +2739,24 @@ impl VirtualFs {
         // Fetch remote children so we can detect name collisions (also validates parent)
         self.ensure_children_loaded(parent).await?;
 
-        let now = SystemTime::now();
-        // Re-check parent + EEXIST + insert under one write lock (TOCTOU guard)
-        let (ino, full_path, dirty_gen) = {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            let parent_entry = match inodes.get(parent) {
-                Some(e) if e.kind == InodeKind::Directory => e,
-                Some(_) => return Err(libc::ENOTDIR),
-                None => return Err(libc::ENOENT),
-            };
-            let full_path = inode::child_path(&parent_entry.full_path, name);
-            if inodes.lookup_child(parent, name).is_some() {
-                return Err(libc::EEXIST);
-            }
-            // Insert as dirty — content lives in local staging until flushed
-            let ino = inodes.insert(
-                parent,
-                name.to_string(),
-                full_path.clone(),
-                InodeKind::File,
-                0,
-                now,
-                None,
-                mode,
-                caller_uid,
-                caller_gid,
-            );
-            let dirty_gen = if let Some(entry) = inodes.get_mut(ino) {
-                entry.set_dirty();
-                entry.dirty_generation
-            } else {
-                0
-            };
-            inodes.touch_parent(parent, now);
-            inodes.touch(ino);
-            (ino, full_path, dirty_gen)
-        };
-
-        self.negative_cache_remove(&full_path);
-        if let Some(fm) = &self.flush_manager {
-            fm.cancel_delete(&full_path);
+        let name = name.to_owned();
+        let (created, namespace) = self
+            .change_namespace(move |vfs| vfs.create_entry(parent, name, InodeKind::File, mode, caller_uid, caller_gid))
+            .await?;
+        let ino = created.ino;
+        if let Some(file) = created.overlay_file {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            return self.register_created_local_file(&inodes, ino, file);
         }
-
+        drop(namespace);
+        let full_path = created.path;
+        let dirty_gen = created.dirty_generation;
         if self.advanced_writes {
-            // Advanced mode: staging file on disk + async flush (or overlay file in overlay mode).
+            // Non-overlay staging files are keyed by inode and may be opened outside the namespace lock.
             match self.open_local_backing_file(ino, &full_path, true, true, true, true) {
                 Ok(file) => {
-                    if let Err(e) = self.set_local_backing_mode(&full_path, mode) {
-                        error!("Failed to set local backing mode for {}: {}", full_path, e);
-                        self.inode_table.write().expect("inodes poisoned").remove(ino);
-                        return Err(libc::EIO);
-                    }
-                    let file_handle = self.alloc_file_handle();
                     let inodes = self.inode_table.read().expect("inodes poisoned");
-                    inodes.bump_open_handles(ino);
-                    self.open_files.write().expect("open_files poisoned").insert(
-                        file_handle,
-                        OpenFile::Local {
-                            ino,
-                            file: Arc::new(file),
-                            writable: true,
-                        },
-                    );
-
-                    let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
-                    Ok((attr, file_handle))
+                    self.register_created_local_file(&inodes, ino, file)
                 }
                 Err(e) => {
                     error!("Failed to create staging file: {}", e);
@@ -2984,7 +2769,7 @@ impl VirtualFs {
             let snapshot = InodeSnapshot {
                 xet_hash: None,
                 size: 0,
-                mtime: now,
+                mtime: SystemTime::now(),
                 pending_deletes: Vec::new(),
                 existed_before: false,
             };
@@ -3029,65 +2814,13 @@ impl VirtualFs {
         // Fetch remote children so we can detect name collisions (also validates parent)
         self.ensure_children_loaded(parent).await?;
 
-        let now = SystemTime::now();
-        // Re-check parent + EEXIST + insert under one write lock (TOCTOU guard)
-        let (ino, full_path) = {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            let parent_entry = match inodes.get(parent) {
-                Some(e) if e.kind == InodeKind::Directory => e,
-                Some(_) => return Err(libc::ENOTDIR),
-                None => return Err(libc::ENOENT),
-            };
-            let full_path = inode::child_path(&parent_entry.full_path, name);
-            if inodes.lookup_child(parent, name).is_some() {
-                return Err(libc::EEXIST);
-            }
-            // New dir starts with children_loaded=true (empty, nothing to fetch)
-            let ino = inodes.insert(
-                parent,
-                name.to_string(),
-                full_path.clone(),
-                InodeKind::Directory,
-                0,
-                now,
-                None,
-                mode,
-                caller_uid,
-                caller_gid,
-            );
-            if let Some(entry) = inodes.get_mut(ino) {
-                entry.children_loaded_at = Some(Instant::now());
-                entry.created_locally = true;
-                // children_from_remote stays false: a freshly-mkdir'd dir has
-                // no remote presence yet, so lookup-miss can serve ENOENT
-                // without HEAD/list_tree probes.
-                if self.overlay() {
-                    entry.set_dirty();
-                }
-            }
-            // nlink already incremented by insert()
-            inodes.touch_parent(parent, now);
-            (ino, full_path)
-        };
-
-        self.negative_cache_remove(&full_path);
-
-        // Overlay: persist directory to disk.
-        if let Some(overlay) = &self.overlay_backing {
-            if let Err(e) = overlay.create_parent_dirs(&full_path) {
-                error!("Failed to create overlay parent directories for {}: {}", full_path, e);
-                self.inode_table.write().expect("inodes poisoned").remove(ino);
-                return Err(libc::EIO);
-            }
-            if let Err(e) = overlay.create_dir(&full_path, mode) {
-                error!("Failed to create overlay directory {}: {}", full_path, e);
-                self.inode_table.write().expect("inodes poisoned").remove(ino);
-                return Err(crate::error::io_errno(&e));
-            }
-        }
-
-        let inodes = self.inode_table.read().expect("inodes poisoned");
-        Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
+        let name = name.to_owned();
+        let (created, _namespace) = self
+            .change_namespace(move |vfs| {
+                vfs.create_entry(parent, name, InodeKind::Directory, mode, caller_uid, caller_gid)
+            })
+            .await?;
+        self.getattr(created.ino)
     }
 
     /// Phase-1a source read for `link()`: `Ok(None)` means the source exists
@@ -3438,31 +3171,33 @@ impl VirtualFs {
         // Remote succeeded (or no remote needed) — now unlink locally.
         // unlink_one decrements nlink; the inode stays in the table with nlink=0
         // so open file handles can still fstat() it.
-        let inode_fully_removed = {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            let last_link = inodes
-                .unlink_one(parent, name)
-                .map(|(removed, _)| removed)
-                .unwrap_or(false);
-            // Update parent mtime/ctime (POSIX: directory was modified)
-            let now = SystemTime::now();
-            inodes.touch_parent(parent, now);
-            // If last link gone and no open handles, remove the orphan immediately.
-            // Otherwise leave it for release() so an open fd can keep writing
-            // (POSIX unlink-while-open) without us yanking the staging file +
-            // debiting the budget twice.
-            let no_handles = !inodes.has_open_handles(ino);
-            if last_link && no_handles {
-                inodes.remove_orphan(ino);
-            }
-            last_link && no_handles
-        };
-
-        // Seed the negative cache before any await: with the inode already
-        // gone from the table, a concurrent lookup under a stale parent would
-        // otherwise HEAD the still-existing remote (the delete is only queued)
-        // and resurrect this name locally during the drop_locked await window.
-        self.negative_cache_insert(full_path.clone());
+        let name = name.to_owned();
+        let path = full_path.clone();
+        let (inode_fully_removed, namespace) = self
+            .change_namespace(move |vfs| {
+                let mut inodes = vfs.inode_table.write().expect("inodes poisoned");
+                let entry = inodes.lookup_child(parent, &name).ok_or(libc::ENOENT)?;
+                if entry.inode != ino || entry.full_path.as_ref() != path {
+                    return Err(libc::ENOENT);
+                }
+                if let Some(overlay) = &vfs.overlay_mount {
+                    if vfs.is_overlay_immutable(entry) {
+                        return Err(libc::EPERM);
+                    }
+                    (inodes, ()) = vfs.overlay_io(inodes, &[parent], || {
+                        namespace::allow_missing(overlay.backing.remove_file(&path))
+                    })?;
+                }
+                let last_link = inodes.unlink_one(parent, &name).is_some_and(|(last, _)| last);
+                inodes.touch_parent(parent, SystemTime::now());
+                // Open descriptors keep their orphan until release().
+                let removed = last_link && !inodes.has_open_handles(ino) && inodes.remove_orphan(ino);
+                drop(inodes);
+                vfs.negative_cache_insert(path);
+                Ok(removed)
+            })
+            .await?;
+        drop(namespace);
 
         // The commit/creation serialization is complete (remote delete and
         // local unlink both done); release the per-inode lock before
@@ -3478,15 +3213,7 @@ impl VirtualFs {
         // open fd, drop_staging waits until release() so writes through the
         // surviving fd can still update bytes_used coherently.
         if inode_fully_removed {
-            if self.overlay() {
-                if let Err(e) = self.remove_local_backing_file(ino, &full_path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!("Failed to remove overlay file for ino={}: {}", ino, e);
-                }
-            } else {
-                self.staging.drop_locked(ino).await;
-            }
+            self.staging.drop_locked(ino).await;
         }
 
         info!("Deleted file: {}", full_path);
@@ -3510,6 +3237,7 @@ impl VirtualFs {
 
         self.ensure_children_loaded(parent).await?;
 
+        let _namespace = self.overlay_read_guard().await;
         let now = SystemTime::now();
         let (ino, full_path) = {
             let mut inodes = self.inode_table.write().expect("inodes poisoned");
@@ -3591,29 +3319,31 @@ impl VirtualFs {
         // Load remote children so we don't miss any before the emptiness check
         self.ensure_children_loaded(ino).await?;
 
-        // Overlay: remove on-disk dir before mutating the inode table so a
-        // failure can't leave the inode tree out of sync with the backing.
-        if let Some(overlay) = &self.overlay_backing
-            && let Err(e) = overlay.remove_dir(&full_path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(crate::error::io_errno(&e));
-        }
-
-        // Re-check ENOTEMPTY + remove under a single write lock to prevent
-        // a concurrent create/mkdir from inserting a child in between.
-        {
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            match inodes.get(ino) {
-                Some(entry) if !entry.children.is_empty() => return Err(libc::ENOTEMPTY),
-                None => return Err(libc::ENOENT),
-                _ => {}
+        let name = name.to_owned();
+        self.change_namespace(move |vfs| {
+            let mut inodes = vfs.inode_table.write().expect("inodes poisoned");
+            let entry = inodes.lookup_child(parent, &name).ok_or(libc::ENOENT)?;
+            if entry.inode != ino || entry.full_path.as_ref() != full_path {
+                return Err(libc::ENOENT);
+            }
+            if !entry.children.is_empty() {
+                return Err(libc::ENOTEMPTY);
+            }
+            if let Some(overlay) = &vfs.overlay_mount {
+                if vfs.is_overlay_immutable(entry) {
+                    return Err(libc::EPERM);
+                }
+                (inodes, ()) = vfs.overlay_io(inodes, &[parent, ino], || {
+                    namespace::allow_missing(overlay.backing.remove_dir(&full_path))
+                })?;
             }
             inodes.remove(ino);
-            // nlink adjusted by remove()
             inodes.touch_parent(parent, SystemTime::now());
-        }
-        self.negative_cache_insert(full_path);
+            drop(inodes);
+            vfs.negative_cache_insert(full_path);
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 
@@ -3699,8 +3429,8 @@ impl VirtualFs {
         // Phase 1: validate, mark the entries, collect everything we need
         let info = self.rename_validate(parent, name, newparent, newname, no_replace)?;
         // Held until the entries are moved locally: see `InodeTable::renames`.
-        let _renaming = RenameMark {
-            inode_table: &self.inode_table,
+        let renaming = RenameMark {
+            inode_table: self.inode_table.clone(),
             old_path: info.old_path.clone(),
             new_path: info.new_full_path.clone(),
         };
@@ -3726,46 +3456,30 @@ impl VirtualFs {
         };
         let old_path = info.old_path.clone();
 
-        // Overlay: move the on-disk file to match the new path.
-        if let Some(overlay) = &self.overlay_backing {
-            let old_exists = overlay.exists(&info.old_path).map_err(|e| {
-                error!("Overlay rename: failed to stat {}: {}", info.old_path, e);
-                libc::EIO
-            })?;
-            if !old_exists {
-                return Err(libc::EPERM);
-            }
-            if let Err(e) = overlay.create_parent_dirs(&info.new_full_path) {
-                error!("Overlay rename: failed to create destination parents: {}", e);
-                return Err(crate::error::io_errno(&e));
-            }
-            if let Err(e) = overlay.rename(&info.old_path, &info.new_full_path) {
-                error!(
-                    "Overlay rename {} -> {} failed: {}",
-                    info.old_path, info.new_full_path, e
-                );
-                return Err(crate::error::io_errno(&e));
-            }
-        }
-
         // Phase 3: apply to local inode table under write lock.
         // If Phase 2 mutated the remote and Phase 3 fails with ENOENT (source
         // concurrently unlinked), swallow the error and let poll reconcile.
         // Destination-conflict errors (EEXIST, EISDIR, etc.) are propagated
         // since poll may not fix a dirty local inode at the destination path.
-        match self.rename_apply_local(info, parent, name, newparent, newname, no_replace) {
-            Ok(replaced_staging_ino) => {
-                // Seed the negative cache before any await: with the source
-                // already moved locally, a concurrent lookup of `old_path`
-                // would otherwise HEAD the still-existing remote object
-                // during the drop_locked await window and resurrect it.
-                self.negative_cache_insert(old_path);
+        let name = name.to_owned();
+        let newname = newname.to_owned();
+        let applied = self
+            .change_namespace(move |vfs| {
+                let _renaming = renaming;
+                let replaced = vfs.rename_apply_local(info, parent, &name, newparent, &newname, no_replace)?;
+                vfs.negative_cache_insert(old_path);
+                Ok(replaced)
+            })
+            .await;
+        match applied {
+            Ok((replaced_staging_ino, namespace)) => {
+                drop(namespace);
                 if let Some(ino) = replaced_staging_ino {
                     self.staging.drop_locked(ino).await;
                 }
                 Ok(())
             }
-            Err(libc::ENOENT) if remote_mutated || self.overlay() => {
+            Err(libc::ENOENT) if remote_mutated => {
                 warn!("rename: source gone after rename; next dir load will reconcile");
                 // Invalidate parents so the next lookup re-fetches from remote
                 // instead of trusting the stale children_loaded state.
@@ -3969,7 +3683,10 @@ impl VirtualFs {
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
 
         // Re-validate source still exists (could have been unlinked concurrently)
-        if inodes.get(info.ino).is_none() {
+        if !inodes
+            .lookup_child(parent, oldname)
+            .is_some_and(|entry| entry.inode == info.ino && entry.full_path.as_ref() == info.old_path)
+        {
             return Err(libc::ENOENT);
         }
 
@@ -3997,6 +3714,25 @@ impl VirtualFs {
         } else {
             None
         };
+        if let Some(overlay) = &self.overlay_mount {
+            let dest_parent = inodes.get(newparent).ok_or(libc::ENOENT)?;
+            if inode::child_path(&dest_parent.full_path, newname) != info.new_full_path {
+                return Err(libc::ENOENT);
+            }
+            if info.kind == InodeKind::Directory && inodes.has_clean_descendants(info.ino) {
+                return Err(libc::EPERM);
+            }
+            (inodes, ()) = self.overlay_io(inodes, &[parent, newparent], || {
+                let backing = &overlay.backing;
+                if !backing.exists(&info.old_path).map_err(|e| crate::error::io_errno(&e))? {
+                    return Err(libc::EPERM);
+                }
+                backing
+                    .create_parent_dirs(&info.new_full_path)
+                    .and_then(|()| backing.rename(&info.old_path, &info.new_full_path))
+                    .map_err(|e| crate::error::io_errno(&e))
+            })?;
+        }
         let mut replaced_staging_ino: Option<u64> = None;
         if let Some((existing_ino, existing_kind)) = replace_target {
             if existing_kind == InodeKind::Directory {
@@ -4083,6 +3819,13 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
+        let changes_metadata = mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
+        if size.is_none() && !changes_metadata {
+            return self.getattr(ino);
+        }
+        let _namespace = self.overlay_read_guard().await;
+        let unlinked_file = self.unlinked_overlay_handle(ino, size.is_some())?;
+
         if let Some(new_size) = size {
             // Validate inode exists and is a file before any side effects
             let full_path = {
@@ -4102,10 +3845,11 @@ impl VirtualFs {
                 let staging_mutex = self.staging.lock(ino);
                 let _staging_guard = staging_mutex.lock().await;
 
-                let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
-                    error!("Failed to check local backing file for ino={}: {}", ino, e);
-                    crate::error::io_errno(&e)
-                })?;
+                let local_exists = unlinked_file.is_some()
+                    || self.local_backing_exists(ino, &full_path).map_err(|e| {
+                        error!("Failed to check local backing file for ino={}: {}", ino, e);
+                        crate::error::io_errno(&e)
+                    })?;
 
                 if self.overlay() && !local_exists {
                     return Err(libc::EPERM);
@@ -4153,7 +3897,9 @@ impl VirtualFs {
                 // Apply the size change under the same write lock so write() cannot
                 // race between the local truncate and inode metadata update.
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                let size_result = if new_size == 0 {
+                let size_result = if let Some(file) = &unlinked_file {
+                    file.set_len(new_size)
+                } else if new_size == 0 {
                     self.open_local_backing_file(ino, &full_path, true, true, true, true)
                         .map(|_| ())
                 } else {
@@ -4173,7 +3919,7 @@ impl VirtualFs {
                     entry.size = new_size;
                     entry.mtime = SystemTime::now();
                     entry.ctime = entry.mtime;
-                    entry.set_dirty();
+                    self.mark_local_dirty(entry);
                     if new_size == 0 {
                         entry.xet_hash = None;
                     }
@@ -4188,7 +3934,7 @@ impl VirtualFs {
         }
 
         // Apply metadata-only changes (mode, uid, gid, atime, mtime)
-        if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
+        if changes_metadata {
             if self.overlay() {
                 let full_path = {
                     let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -4197,18 +3943,20 @@ impl VirtualFs {
                 // Reject any metadata-only mutation on a clean remote entry:
                 // there is no local backing to record it on, and the change
                 // would silently disappear at the next remote refresh.
-                let local_exists = self.local_backing_exists(ino, &full_path).map_err(|e| {
-                    error!("Failed to check local backing file for ino={}: {}", ino, e);
-                    crate::error::io_errno(&e)
-                })?;
+                let local_exists = unlinked_file.is_some()
+                    || self.local_backing_exists(ino, &full_path).map_err(|e| {
+                        error!("Failed to check local backing file for ino={}: {}", ino, e);
+                        crate::error::io_errno(&e)
+                    })?;
                 if !local_exists {
                     return Err(libc::EPERM);
                 }
                 if let Some(new_mode) = mode {
-                    self.set_local_backing_mode(&full_path, new_mode).map_err(|e| {
-                        error!("Failed to update local backing mode for ino={}: {}", ino, e);
-                        crate::error::io_errno(&e)
-                    })?;
+                    self.set_local_backing_mode(&full_path, new_mode, unlinked_file.as_deref())
+                        .map_err(|e| {
+                            error!("Failed to update local backing mode for ino={}: {}", ino, e);
+                            crate::error::io_errno(&e)
+                        })?;
                 }
             }
 
@@ -4229,6 +3977,9 @@ impl VirtualFs {
                 if let Some(m) = mtime {
                     entry.mtime = m;
                 }
+                if self.overlay() {
+                    self.mark_local_dirty(entry);
+                }
                 entry.ctime = SystemTime::now();
             }
         }
@@ -4244,7 +3995,7 @@ impl VirtualFs {
     fn get_file_entry(&self, ino: u64) -> VirtualFsResult<FileEntry> {
         let inodes = self.inode_table.read().expect("inodes poisoned");
         let entry = match inodes.get(ino) {
-            Some(e) if e.kind == InodeKind::File => e,
+            Some(e) if e.kind == InodeKind::File && (!self.overlay() || e.nlink != 0) => e,
             _ => return Err(libc::ENOENT),
         };
         Ok(FileEntry {
@@ -4311,11 +4062,15 @@ pub struct PendingUploads {
     pub failed_files: usize,
 }
 
+/// An entry returned by the public full-directory listing.
+pub type VirtualFsDirEntry = DirectoryEntry<String>;
+
+/// A directory entry with either an owned name or one shared with the inode table.
 #[derive(Debug)]
-pub struct VirtualFsDirEntry {
+pub struct DirectoryEntry<Name> {
     pub ino: u64,
     pub kind: InodeKind,
-    pub name: String,
+    pub name: Name,
 }
 
 /// Snapshot of rename state collected under read lock (phase 1),
@@ -4334,13 +4089,13 @@ struct RenameInfo {
 
 /// Unregisters the rename `rename_validate` registered (`InodeTable::renames`)
 /// when dropped, also on error.
-struct RenameMark<'a> {
-    inode_table: &'a RwLock<InodeTable>,
+struct RenameMark {
+    inode_table: Arc<RwLock<InodeTable>>,
     old_path: String,
     new_path: String,
 }
 
-impl Drop for RenameMark<'_> {
+impl Drop for RenameMark {
     fn drop(&mut self) {
         self.inode_table
             .write()
@@ -4440,6 +4195,56 @@ impl StreamingChannel {
     }
 }
 
+/// A rename replaces the path Arc, even when an ancestor moves away and back.
+/// Keep the allocation alive until a path-based read publishes its result.
+struct DirectoryPath {
+    ino: u64,
+    path: Arc<str>,
+}
+
+impl DirectoryPath {
+    fn new(entry: &InodeEntry) -> Self {
+        Self {
+            ino: entry.inode,
+            path: entry.full_path.clone(),
+        }
+    }
+
+    fn current<'a>(&self, table: &'a InodeTable) -> DirectoryReadResult<&'a InodeEntry> {
+        let entry = table.get(self.ino).ok_or(libc::ENOENT)?;
+        if Arc::ptr_eq(&self.path, &entry.full_path) {
+            Ok(entry)
+        } else {
+            Err(DirectoryReadError::Moved)
+        }
+    }
+}
+
+enum DirectoryReadError {
+    Moved,
+    Errno(i32),
+}
+
+impl From<i32> for DirectoryReadError {
+    fn from(errno: i32) -> Self {
+        Self::Errno(errno)
+    }
+}
+
+type DirectoryReadResult<T> = Result<T, DirectoryReadError>;
+
+async fn retry_directory_read<T, F: Future<Output = DirectoryReadResult<T>>>(
+    mut read: impl FnMut() -> F,
+) -> VirtualFsResult<T> {
+    loop {
+        match read().await {
+            Ok(value) => return Ok(value),
+            Err(DirectoryReadError::Errno(errno)) => return Err(errno),
+            Err(DirectoryReadError::Moved) => tokio::task::yield_now().await,
+        }
+    }
+}
+
 /// Outcome of `VirtualFs::head_probe`.
 enum HeadProbe {
     File(crate::hub_api::HeadFileInfo),
@@ -4462,10 +4267,22 @@ fn channel_is_terminal(channel: &StreamingChannel) -> bool {
     terminal_result(channel).is_some()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalHandleKind {
+    BackingRead,
+    BackingWrite,
+    /// A downloaded remote file may be shared by other inodes or mounts.
+    CachedRead,
+}
+
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.
 enum OpenFile {
-    /// Local file (staging for writes, or dirty reads).
-    Local { ino: u64, file: Arc<File>, writable: bool },
+    /// A staging, overlay, or cache file.
+    Local {
+        ino: u64,
+        file: Arc<File>,
+        kind: LocalHandleKind,
+    },
     /// Lazy remote: data fetched on demand, with read-ahead.
     Lazy { ino: u64, reader: Arc<RemoteReader> },
     /// Streaming append-only writer (default write mode).
