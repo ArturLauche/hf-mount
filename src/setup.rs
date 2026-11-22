@@ -16,6 +16,7 @@ use crate::cached_xet_client::CachedXetClient;
 use crate::file_cache::FileCache;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::overlay::OverlayBacking;
+use crate::quota::QuotaCache;
 use crate::virtual_fs::{VfsConfig, VirtualFs};
 use crate::window_plans::{WindowPlans, WindowPlansMode};
 use crate::xet::{StagingDir, XetSessions};
@@ -336,6 +337,7 @@ pub struct MountSetup {
     /// across all volumes — see `build_with_runtime`).
     _owned_runtime: Option<tokio::runtime::Runtime>,
     pub virtual_fs: Arc<VirtualFs>,
+    pub quota: QuotaCache,
     pub mount_point: PathBuf,
     pub read_only: bool,
     pub advanced_writes: bool,
@@ -898,7 +900,7 @@ pub fn try_build_with_runtime(
 
     let virtual_fs = VirtualFs::new(
         runtime.clone(),
-        hub_client,
+        hub_client.clone(),
         xet_sessions,
         staging_dir,
         file_cache,
@@ -937,11 +939,16 @@ pub fn try_build_with_runtime(
         },
     );
 
+    let quota = match backend {
+        Backend::Fuse | Backend::WinFsp => QuotaCache::start(&runtime, hub_client),
+        Backend::Nfs => QuotaCache::default(),
+    };
     let resolved_source = hub_client_source;
     Ok(MountSetup {
         runtime,
         _owned_runtime: None,
         virtual_fs,
+        quota,
         mount_point,
         read_only,
         advanced_writes,

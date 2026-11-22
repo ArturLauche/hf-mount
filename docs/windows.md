@@ -82,6 +82,12 @@ and vice versa, and drives keep working after the window or the app closes.
   full, folder not writable), the file's data is left in the drive's staging
   folder in the cache, with `hf-mount-unsaved.txt` naming each file, and the
   unmount report says where.
+* **Drive capacity.** Explorer shows an estimate of included private storage
+  and remaining space for supported namespaces. Public mounts and mounts whose
+  quota is unavailable use a 42 PiB placeholder. The estimate updates in the
+  background every 15 minutes by default. Set `HF_MOUNT_QUOTA_REFRESH_SECS` in
+  the supervisor environment to change the interval. See the
+  [quota API details](storage-quota.md).
 * **Names.** The drive is case-sensitive and case-preserving, so `README.md`
   and `readme.md` stay two different files. On read-only drives a path typed
   in a different case still opens the file when exactly one file matches.

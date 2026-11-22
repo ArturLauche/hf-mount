@@ -238,6 +238,16 @@ By default, `hf-mount` uses NFS. Pass `--fuse` for tighter kernel integration (p
 hf-mount start --fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
 ```
 
+### Drive capacity
+
+WinFsp and FUSE use the Hugging Face namespace and visibility of the mounted
+repo or bucket to report capacity. For supported private mounts, capacity is
+estimated from the plan's included allowance and the namespace's private
+storage usage. Public mounts and unavailable estimates use a 42 PiB
+placeholder. The cache refreshes in the background every 15 minutes by
+default. Set `HF_MOUNT_QUOTA_REFRESH_SECS` in the mount process environment to
+change the interval. See [Hub storage quota research](docs/storage-quota.md).
+
 ### Foreground mode
 
 For scripts, containers, or debugging, use the backend binaries directly (they run in the foreground):

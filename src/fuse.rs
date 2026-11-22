@@ -18,6 +18,7 @@ use futures::FutureExt;
 use tracing::{error, info, warn};
 
 use crate::daemon::DaemonGuard;
+use crate::quota::QuotaCache;
 use crate::setup::{FS_NAME, MountSetup, unmount_fuse};
 use crate::virtual_fs::inode::InodeKind;
 use crate::virtual_fs::{InvalKind, VirtualFs, VirtualFsAttr, VirtualFsResult};
@@ -28,6 +29,7 @@ const GENERATION: Generation = Generation(0);
 pub struct FuseAdapter {
     runtime: tokio::runtime::Handle,
     virtual_fs: Arc<VirtualFs>,
+    quota: QuotaCache,
     directories: Mutex<HashMap<FileHandle, Arc<directory::OpenDirectory>>>,
     /// Kernel metadata cache TTL. Short enough to detect remote changes quickly,
     /// long enough to avoid cascade re-lookups in the kernel.
@@ -53,6 +55,7 @@ impl FuseAdapter {
         Self {
             runtime,
             virtual_fs,
+            quota: QuotaCache::default(),
             directories: Mutex::new(HashMap::new()),
             metadata_ttl,
             read_only,
@@ -563,16 +566,18 @@ impl Filesystem for FuseAdapter {
         }
     }
 
-    /// Filesystem statistics (df). Reports 42 PB for fun
+    /// Filesystem statistics (df), in whole blocks.
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         const BLOCK_SIZE: u32 = 512;
-        const BLOCKS: u64 = 42 * 1024 * 1024 * 1024 * 1024 * 1024 / BLOCK_SIZE as u64; // 42 PB
-        //           blocks, bfree,  bavail, files, ffree, bsize,      namelen, frsize
-        reply.statfs(BLOCKS, BLOCKS, BLOCKS, 0, 0, BLOCK_SIZE, 255, 0);
+        let (total, free) = self.quota.volume_bytes();
+        let blocks = total / u64::from(BLOCK_SIZE);
+        let free = free / u64::from(BLOCK_SIZE);
+        reply.statfs(blocks, free, free, 0, 0, BLOCK_SIZE, 255, BLOCK_SIZE);
     }
 
     /// Called on unmount. Flushes pending writes and stops background tasks.
     fn destroy(&mut self) {
+        self.quota.stop();
         self.virtual_fs.shutdown();
     }
 }
@@ -581,6 +586,7 @@ impl Filesystem for FuseAdapter {
 /// this is returned. Call `wait()` to block until the session ends.
 pub struct FuseSession {
     bg: fuser::BackgroundSession,
+    quota: QuotaCache,
     virtual_fs: Arc<VirtualFs>,
     mount_point: PathBuf,
     runtime: tokio::runtime::Handle,
@@ -612,6 +618,7 @@ impl FuseSession {
             error!("FUSE session error: {}", err);
         }
         session_ended.store(true, Ordering::Release);
+        self.quota.stop();
         // Safety net: flush after FUSE session ends. Covers external unmount
         // (e.g. `fusermount -u`) where destroy() may not fire.
         self.virtual_fs.shutdown();
@@ -639,6 +646,7 @@ pub fn mount_fuse(
         setup.advanced_writes,
         setup.direct_io,
     );
+    adapter.quota = setup.quota.clone();
     let mount_point = &setup.mount_point;
 
     let mut config = adapter.mount_config(if setup.fuse_owner_only {
@@ -802,6 +810,7 @@ pub fn mount_fuse(
 
     Ok(FuseSession {
         bg,
+        quota: setup.quota.clone(),
         virtual_fs: setup.virtual_fs.clone(),
         mount_point: mount_point.to_path_buf(),
         runtime: setup.runtime.clone(),

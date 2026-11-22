@@ -61,6 +61,7 @@ fn config(letter: &str, read_only: bool) -> MountConfig {
     MountConfig {
         mount_point: letter.to_string(),
         volume_label: "hf-mount test".to_string(),
+        quota: Default::default(),
         read_only,
         case_insensitive_fallback: read_only,
         file_info_timeout: Duration::from_millis(500),

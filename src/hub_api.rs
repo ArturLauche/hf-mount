@@ -11,6 +11,7 @@ use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
 use crate::error::{Error, Result, is_retryable_status, is_transient_http};
 
+pub(crate) mod pagination;
 mod tree;
 pub use tree::TreeEntry;
 
@@ -306,6 +307,7 @@ pub struct HubApiClient {
     /// Cached token from `token_file`, refreshed every 30s.
     token_file_cache: std::sync::Mutex<Option<(std::time::Instant, String)>>,
     source: SourceKind,
+    source_private: Option<bool>,
     /// Some older Hub deployments omit sha from revision metadata. Remember
     /// whether the commit-history endpoint can supply the mounted ref's head.
     commit_history: Mutex<CommitHistory>,
@@ -530,7 +532,7 @@ impl HubApiClient {
         let (client, head_client, follow_client) = make_clients(backend);
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
-        let (source, last_modified) = match source {
+        let (source, last_modified, source_private) = match source {
             SourceKind::Repo {
                 repo_id,
                 repo_type,
@@ -555,6 +557,7 @@ impl HubApiClient {
                         revision,
                     },
                     last_modified,
+                    body["private"].as_bool(),
                 )
             }
             SourceKind::Bucket { bucket_id } => {
@@ -584,7 +587,11 @@ impl HubApiClient {
                     };
                 let body: serde_json::Value = resp.json().await?;
                 let last_modified = body["updatedAt"].as_str().map(mtime_from_str).unwrap_or(UNIX_EPOCH);
-                (SourceKind::Bucket { bucket_id }, last_modified)
+                (
+                    SourceKind::Bucket { bucket_id },
+                    last_modified,
+                    body["private"].as_bool(),
+                )
             }
         };
 
@@ -598,6 +605,7 @@ impl HubApiClient {
             token_file,
             token_file_cache: std::sync::Mutex::new(None),
             source,
+            source_private,
             last_modified,
             path_prefix,
         }))
@@ -618,13 +626,13 @@ impl HubApiClient {
             source: SourceKind::Bucket {
                 bucket_id: bucket_id.to_string(),
             },
+            source_private: None,
             last_modified: UNIX_EPOCH,
             path_prefix: String::new(),
         })
     }
 
-    /// Attach bearer auth to a request if a token is configured.
-    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn cached_file_token(&self) -> Option<String> {
         if let Some(path) = &self.token_file {
             // Check TTL under lock, but do file I/O outside it to avoid
             // blocking concurrent requests on slow storage.
@@ -644,13 +652,52 @@ impl HubApiClient {
             }
             let cache = self.token_file_cache.lock().expect("token_file_cache poisoned");
             if let Some((_, ref token)) = *cache {
-                return req.bearer_auth(token);
+                return Some(token.clone());
             }
         }
-        match &self.token {
+        None
+    }
+
+    /// Attach bearer auth to a request if a token is configured.
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let file_token = self.cached_file_token();
+        match file_token.as_deref().or(self.token.as_deref()) {
             Some(t) => req.bearer_auth(t),
             None => req,
         }
+    }
+
+    pub(crate) async fn quota_token(self: &Arc<Self>) -> Option<String> {
+        if self.token_file.is_none() {
+            return self.token.clone();
+        }
+        let hub = self.clone();
+        tokio::task::spawn_blocking(move || hub.cached_file_token().or_else(|| hub.token.clone()))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub(crate) fn quota_context(&self) -> (&Client, &str, Option<bool>) {
+        (&self.head_client, &self.endpoint, self.source_private)
+    }
+
+    pub(crate) fn visibility_request(&self, token: &str) -> reqwest::RequestBuilder {
+        let url = match &self.source {
+            SourceKind::Repo {
+                repo_id,
+                repo_type,
+                revision,
+            } => format!(
+                "{}/api/{}/{}/revision/{}?expand=private",
+                self.endpoint,
+                repo_type.api_prefix(),
+                encode_url_path(repo_id),
+                encode_url_revision(revision),
+            ),
+            SourceKind::Bucket { bucket_id } => format!("{}/api/buckets/{}", self.endpoint, encode_url_path(bucket_id)),
+        };
+        self.head_client.get(url).bearer_auth(token)
     }
 
     pub fn source(&self) -> &SourceKind {
@@ -1382,6 +1429,7 @@ mod tests {
             source: SourceKind::Bucket {
                 bucket_id: "user/bucket".to_string(),
             },
+            source_private: None,
             last_modified: UNIX_EPOCH,
             path_prefix: prefix.to_string(),
         }
