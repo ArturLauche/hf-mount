@@ -6898,6 +6898,26 @@ fn overlay_slow_create_keeps_cached_reads_available_and_finishes_after_cancellat
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn overlay_parent_pins_are_released_when_a_rename_worker_panics() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("source"), b"contents").unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        *t.vfs.overlay_mount.as_ref().unwrap().before_io.lock().unwrap() =
+            Some(Box::new(|| panic!("injected namespace I/O panic")));
+        let rename = || t.vfs.rename(ROOT_INODE, "source", ROOT_INODE, "dest", false);
+        assert_eq!(rename().await, Err(libc::EIO));
+        // Same-directory rename pins the root once for each parent argument.
+        assert!(!t.vfs.has_open_handles(ROOT_INODE));
+        assert_eq!(std::fs::read(root.path().join("source")).unwrap(), b"contents");
+        rename().await.unwrap();
+        assert!(!t.vfs.has_open_handles(ROOT_INODE));
+        assert_eq!(std::fs::read(root.path().join("dest")).unwrap(), b"contents");
+    });
+}
+
 /// Rename of a remote-only file returns EPERM in overlay mode.
 #[test]
 fn overlay_rename_remote_only_eperm() {

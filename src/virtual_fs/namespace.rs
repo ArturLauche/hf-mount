@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLockWriteGuard, Weak};
+use std::sync::{Arc, RwLock, RwLockWriteGuard, Weak};
 use std::time::{Instant, SystemTime};
 
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock as AsyncRwLock, RwLockReadGuard};
@@ -73,6 +73,29 @@ pub(super) struct CreatedEntry {
     pub path: String,
     pub dirty_generation: u64,
     pub overlay_file: Option<File>,
+}
+
+/// Hold the parent inodes across blocking I/O, including worker unwinding.
+struct ParentPins<'a> {
+    table: &'a RwLock<InodeTable>,
+    parents: &'a [u64],
+}
+
+impl ParentPins<'_> {
+    fn release(&mut self, table: &InodeTable) {
+        for &ino in std::mem::take(&mut self.parents) {
+            table.drop_open_handles(ino);
+        }
+    }
+}
+
+impl Drop for ParentPins<'_> {
+    fn drop(&mut self) {
+        if !self.parents.is_empty() {
+            let table = self.table.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.release(&table);
+        }
+    }
 }
 
 pub(super) fn allow_missing(result: std::io::Result<()>) -> VirtualFsResult<()> {
@@ -167,24 +190,28 @@ impl VirtualFs {
         for &ino in parents {
             table.bump_open_handles(ino);
         }
+        let mut pins = ParentPins {
+            table: &self.inode_table,
+            parents,
+        };
         drop(table);
         #[cfg(test)]
-        if let Some(pause) = self
-            .overlay_mount
-            .as_ref()
-            .expect("mounted overlay")
-            .before_io
-            .lock()
-            .unwrap()
-            .take()
         {
-            pause();
+            let pause = self
+                .overlay_mount
+                .as_ref()
+                .expect("mounted overlay")
+                .before_io
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(pause) = pause {
+                pause();
+            }
         }
         let result = io();
         let table = self.inode_table.write().expect("inodes poisoned");
-        for &ino in parents {
-            table.drop_open_handles(ino);
-        }
+        pins.release(&table);
         Ok((table, result?))
     }
 
