@@ -226,7 +226,7 @@ async fn repo_poll_lists_the_probed_commit_while_the_mounted_ref_moves() {
             if probes == 2 {
                 head = "commit-b"; // After the poll probe and before either tree page.
             }
-            return (String::new(), info);
+            return (reqwest::StatusCode::OK, String::new(), info);
         }
         let commit = if target.contains("/tree/commit-a?") {
             "commit-a"
@@ -241,6 +241,7 @@ async fn repo_poll_lists_the_probed_commit_while_the_mounted_ref_moves() {
             ("Link: <?cursor=2>; rel=next\r\n", "one")
         };
         (
+            reqwest::StatusCode::OK,
             headers.into(),
             format!(r#"[{{"path":"{path}","type":"file","size":1,"oid":"{commit}"}}]"#),
         )

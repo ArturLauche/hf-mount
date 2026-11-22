@@ -259,6 +259,35 @@ pub struct CasTokenInfo {
 /// How often the token file is re-read from disk.
 const TOKEN_FILE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
+// Give older Hub deployments a break between optional commit-history requests.
+const COMMIT_HISTORY_RETRY_POLLS: u8 = 8;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum CommitHistory {
+    #[default]
+    Unknown,
+    Available,
+    Unavailable {
+        polls_left: u8,
+    },
+}
+
+impl CommitHistory {
+    fn next_poll(&mut self) -> Self {
+        let current = *self;
+        if let Self::Unavailable { polls_left } = current {
+            *self = if polls_left <= 1 {
+                Self::Unknown
+            } else {
+                Self::Unavailable {
+                    polls_left: polls_left - 1,
+                }
+            };
+        }
+        current
+    }
+}
+
 pub struct HubApiClient {
     client: Client,
     /// Client that does NOT follow redirects — used for HEAD requests where we
@@ -279,7 +308,7 @@ pub struct HubApiClient {
     source: SourceKind,
     /// Some older Hub deployments omit sha from revision metadata. Remember
     /// whether the commit-history endpoint can supply the mounted ref's head.
-    commit_history_available: Mutex<Option<bool>>,
+    commit_history: Mutex<CommitHistory>,
     /// Last modification time (from repo/bucket info endpoint).
     /// Used as default mtime when per-file mtime is unavailable.
     last_modified: SystemTime,
@@ -560,7 +589,7 @@ impl HubApiClient {
         };
 
         Ok(Arc::new(Self {
-            commit_history_available: Mutex::new(None),
+            commit_history: Mutex::default(),
             client,
             head_client,
             follow_client,
@@ -578,7 +607,7 @@ impl HubApiClient {
     pub fn new(endpoint: &str, token: Option<&str>, bucket_id: &str, backend: &str) -> Arc<Self> {
         let (client, head_client, follow_client) = make_clients(backend);
         Arc::new(Self {
-            commit_history_available: Mutex::new(None),
+            commit_history: Mutex::default(),
             client,
             head_client,
             follow_client,
@@ -722,7 +751,9 @@ impl HubApiClient {
         let result: Result<Option<String>> = async {
             let response = self.auth(self.client.get(url)).send().await?;
             if matches!(response.status().as_u16(), 404 | 405 | 501) {
-                *self.commit_history_available.lock().expect("commit history poisoned") = Some(false);
+                *self.commit_history.lock().expect("commit history poisoned") = CommitHistory::Unavailable {
+                    polls_left: COMMIT_HISTORY_RETRY_POLLS,
+                };
                 return Ok(None);
             }
             let commits: Vec<Commit> = response.error_for_status()?.json().await?;
@@ -732,7 +763,7 @@ impl HubApiClient {
                 .map(|c| c.id)
                 .filter(|id| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit()));
             if head.is_some() {
-                *self.commit_history_available.lock().expect("commit history poisoned") = Some(true);
+                *self.commit_history.lock().expect("commit history poisoned") = CommitHistory::Available;
             }
             Ok(head)
         }
@@ -1106,8 +1137,8 @@ impl HubOps for HubApiClient {
         else {
             return Ok(None);
         };
-        let history = *self.commit_history_available.lock().expect("commit history poisoned");
-        if history == Some(true)
+        let history = self.commit_history.lock().expect("commit history poisoned").next_poll();
+        if history == CommitHistory::Available
             && let Some(head) = self.history_head(*repo_type, repo_id, revision).await
         {
             return Ok(Some(head));
@@ -1116,7 +1147,7 @@ impl HubOps for HubApiClient {
         if let Some(sha) = probe.sha.filter(|sha| !sha.is_empty()) {
             return Ok(Some(sha));
         }
-        if history.is_none() && probe.last_modified.is_some() {
+        if history == CommitHistory::Unknown && probe.last_modified.is_some() {
             return Ok(self.history_head(*repo_type, repo_id, revision).await);
         }
         Ok(None)
@@ -1340,7 +1371,7 @@ mod tests {
     fn make_test_client(prefix: &str, token_file: Option<PathBuf>) -> HubApiClient {
         let (client, head_client, follow_client) = make_clients("test");
         HubApiClient {
-            commit_history_available: Mutex::new(None),
+            commit_history: Mutex::default(),
             client,
             head_client,
             follow_client,

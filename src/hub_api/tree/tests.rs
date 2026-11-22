@@ -125,6 +125,65 @@ async fn repo_timestamp_is_not_a_commit_and_a_pinned_listing_cannot_switch_back_
 }
 
 #[tokio::test]
+async fn timestamp_only_repo_recovers_commit_pinning_after_history_is_unavailable() {
+    use crate::hub_api::COMMIT_HISTORY_RETRY_POLLS;
+    use crate::test_mocks::serve_hub_requests;
+    use reqwest::StatusCode;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    let info = r#"{"id":"org/model","lastModified":"2025-01-01T00:00:00Z"}"#;
+    for unavailable in [
+        StatusCode::NOT_FOUND,
+        StatusCode::METHOD_NOT_ALLOWED,
+        StatusCode::NOT_IMPLEMENTED,
+    ] {
+        let mut history_calls = 0;
+        let (url, requests) = serve_hub_requests(usize::from(COMMIT_HISTORY_RETRY_POLLS) + 6, move |target| {
+            if target == "/api/models/org/model/commits/feature?limit=1" {
+                history_calls += 1;
+                if history_calls == 1 {
+                    return (unavailable, String::new(), String::new());
+                }
+                return (StatusCode::OK, String::new(), format!(r#"[{{"id":"{SHA}"}}]"#));
+            }
+            assert_eq!(
+                target,
+                "/api/models/org/model/revision/feature?expand=sha&expand=lastModified"
+            );
+            (StatusCode::OK, String::new(), info.into())
+        })
+        .await;
+        let client = HubApiClient::from_source(
+            &url,
+            None,
+            None,
+            SourceKind::Repo {
+                repo_id: "org/model".into(),
+                repo_type: RepoType::Model,
+                revision: "feature".into(),
+            },
+            String::new(),
+            "test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.probe_repo_commit().await.unwrap(), None);
+        for _ in 0..COMMIT_HISTORY_RETRY_POLLS {
+            assert_eq!(client.probe_repo_commit().await.unwrap(), None);
+        }
+        assert_eq!(client.probe_repo_commit().await.unwrap().as_deref(), Some(SHA));
+        assert_eq!(client.probe_repo_commit().await.unwrap().as_deref(), Some(SHA));
+        let requests = requests.await.unwrap();
+        assert!(
+            requests[3..3 + usize::from(COMMIT_HISTORY_RETRY_POLLS)]
+                .iter()
+                .all(|r| r.contains("/revision/feature?"))
+        );
+        assert!(requests.last().unwrap().contains("/commits/feature?limit=1 "));
+    }
+}
+
+#[tokio::test]
 async fn pinned_pages_accept_equivalent_paths_but_keep_segment_boundaries() {
     let (url, requests) = serve_hub_responses(&[
         ("", r#"{"id":"org/model","sha":"commit-a"}"#),

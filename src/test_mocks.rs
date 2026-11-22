@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use reqwest::StatusCode;
 use xet_data::processing::XetFileInfo;
 
 use crate::error::{Error, Result};
@@ -19,7 +20,7 @@ use crate::xet::{DownloadStreamOps, StagingDir, StreamingWriterOps, XetOps};
 pub(crate) async fn serve_hub_responses(pages: &[(&str, &str)]) -> (String, tokio::task::JoinHandle<Vec<String>>) {
     let mut pages = pages
         .iter()
-        .map(|(h, b)| (h.to_string(), b.to_string()))
+        .map(|(h, b)| (StatusCode::OK, h.to_string(), b.to_string()))
         .collect::<Vec<_>>()
         .into_iter();
     serve_hub_requests(pages.len(), move |_| pages.next().unwrap()).await
@@ -27,7 +28,7 @@ pub(crate) async fn serve_hub_responses(pages: &[(&str, &str)]) -> (String, toki
 
 pub(crate) async fn serve_hub_requests(
     expected: usize,
-    mut respond: impl FnMut(&str) -> (String, String) + Send + 'static,
+    mut respond: impl FnMut(&str) -> (StatusCode, String, String) + Send + 'static,
 ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
@@ -45,9 +46,11 @@ pub(crate) async fn serve_hub_requests(
                     assert_ne!(input.read_line(&mut request).await.unwrap(), 0);
                 }
                 let target = request.split_ascii_whitespace().nth(1).unwrap();
-                let (headers, body) = respond(target);
+                let (status, headers, body) = respond(target);
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+                    "HTTP/1.1 {} {}\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or(""),
                     body.len()
                 );
                 input.into_inner().write_all(response.as_bytes()).await.unwrap();
