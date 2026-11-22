@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use super::security::{SecurityDescriptor, current_user_sid, volume_sddl};
 use super::util::{from_wide_ptr, wide};
 use super::winfsp::{LoadError, WinFspApi};
+use crate::quota::QuotaCache;
 use crate::virtual_fs::inode::{InodeKind, ROOT_INODE};
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
 use crate::winfs::dirlist::DirSnapshot;
@@ -34,10 +35,6 @@ use crate::winfs::{file_info_for, names, time};
 /// Upper bound on a path WinFsp hands us (`FSP_FSCTL_TRANSACT_PATH_SIZEMAX`).
 const MAX_PATH_UNITS: usize = 1024;
 
-/// Capacity reported to Windows. The Hub has no meaningful quota to show;
-/// this matches what the FUSE backend reports for `statfs` (42 PB).
-const VOLUME_BYTES: u64 = 42 * 1024 * 1024 * 1024 * 1024 * 1024;
-
 /// How a volume is mounted.
 #[derive(Debug, Clone)]
 pub struct MountConfig {
@@ -45,6 +42,7 @@ pub struct MountConfig {
     pub mount_point: String,
     /// Volume label shown by File Explorer (truncated to 32 characters).
     pub volume_label: String,
+    pub quota: QuotaCache,
     pub read_only: bool,
     /// On a miss, accept a case-insensitive match when it is unambiguous.
     pub case_insensitive_fallback: bool,
@@ -150,6 +148,7 @@ impl AdapterStats {
 struct Adapter {
     api: &'static WinFspApi,
     vfs: Arc<VirtualFs>,
+    quota: QuotaCache,
     rt: tokio::runtime::Handle,
     read_only: bool,
     case_fallback: bool,
@@ -459,8 +458,7 @@ unsafe extern "system" fn get_volume_info(fs: *mut FspFileSystem, vi: *mut Volum
     guarded(fs, "GetVolumeInfo", |a| {
         // SAFETY: WinFsp passes a valid out pointer.
         let vi = unsafe { &mut *vi };
-        vi.total_size = VOLUME_BYTES;
-        vi.free_size = VOLUME_BYTES;
+        (vi.total_size, vi.free_size) = a.quota.volume_bytes();
         let n = a.label.len().min(32);
         vi.volume_label[..n].copy_from_slice(&a.label[..n]);
         vi.volume_label_length = (n * 2) as u16;
@@ -1165,6 +1163,7 @@ impl WinFspMount {
         let adapter = Box::into_raw(Box::new(Adapter {
             api,
             vfs,
+            quota: config.quota,
             rt,
             read_only: config.read_only,
             case_fallback: config.case_insensitive_fallback,
@@ -1253,6 +1252,8 @@ impl WinFspMount {
             (self.api.remove_mount_point)(self.fs);
             (self.api.stop_dispatcher)(self.fs);
         }
+        // SAFETY: the adapter lives until WinFspMount::drop.
+        unsafe { &*self.adapter }.quota.stop();
         *unmounted = true;
         info!("WinFsp volume {} unmounted", self.mount_point);
     }

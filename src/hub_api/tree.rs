@@ -9,7 +9,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use super::{HubApiClient, SourceKind, encode_url_path, encode_url_revision, send_with_retry, strict_descendant_rel};
 use crate::error::{Error, Result};
 
-mod pagination;
+use super::pagination;
 
 /// Unified tree entry exposed to the rest of the codebase.
 #[derive(Debug, Clone, Deserialize)]

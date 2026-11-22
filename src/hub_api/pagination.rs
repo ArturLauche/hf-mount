@@ -5,9 +5,8 @@ use reqwest::{Response, Url, header::LINK};
 
 use crate::error::{Error, Result};
 
-/// Validate every link before returning a continuation. Polling uses a
-/// successful end of listing as evidence that missing children were deleted.
-pub(super) fn next_page(response: &Response) -> Result<Option<Url>> {
+/// Validate pagination links before returning a continuation.
+pub(crate) fn next_page(response: &Response) -> Result<Option<Url>> {
     let mut next = None;
     for header in response.headers().get_all(LINK) {
         let header = header

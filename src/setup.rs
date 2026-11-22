@@ -16,6 +16,7 @@ use crate::cached_xet_client::CachedXetClient;
 use crate::file_cache::FileCache;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::overlay::OverlayBacking;
+use crate::quota::QuotaCache;
 use crate::virtual_fs::{VfsConfig, VirtualFs};
 use crate::window_plans::{WindowPlans, WindowPlansMode};
 use crate::xet::{StagingDir, XetSessions};
@@ -336,6 +337,7 @@ pub struct MountSetup {
     /// across all volumes — see `build_with_runtime`).
     _owned_runtime: Option<tokio::runtime::Runtime>,
     pub virtual_fs: Arc<VirtualFs>,
+    pub quota: QuotaCache,
     pub mount_point: PathBuf,
     pub read_only: bool,
     pub advanced_writes: bool,
@@ -389,6 +391,12 @@ impl Backend {
     /// drive letter (or directory junction) itself and requires it to be absent.
     fn mounts_on_existing_dir(self) -> bool {
         !matches!(self, Backend::WinFsp)
+    }
+
+    /// Overlay writes stay in the local backing directory, so Hub quota is not
+    /// the volume's capacity.
+    fn uses_hub_quota(self, overlay: bool) -> bool {
+        !overlay && matches!(self, Backend::Fuse | Backend::WinFsp)
     }
 }
 
@@ -898,7 +906,7 @@ pub fn try_build_with_runtime(
 
     let virtual_fs = VirtualFs::new(
         runtime.clone(),
-        hub_client,
+        hub_client.clone(),
         xet_sessions,
         staging_dir,
         file_cache,
@@ -937,11 +945,19 @@ pub fn try_build_with_runtime(
         },
     );
 
+    // Keep the placeholder for overlay mounts instead of reporting a remote
+    // quota that may block local writes.
+    let quota = if backend.uses_hub_quota(options.overlay) {
+        QuotaCache::start(&runtime, hub_client)
+    } else {
+        QuotaCache::default()
+    };
     let resolved_source = hub_client_source;
     Ok(MountSetup {
         runtime,
         _owned_runtime: None,
         virtual_fs,
+        quota,
         mount_point,
         read_only,
         advanced_writes,
@@ -1246,8 +1262,8 @@ pub(crate) fn unmount_fuse(mount_point: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        XET_UPLOAD_CONCURRENCY_CAP, defers_to_fixed_concurrency, mountinfo_has_hf_mount, parse_mode, validate_revision,
-        xet_env_defaults,
+        Backend, XET_UPLOAD_CONCURRENCY_CAP, defers_to_fixed_concurrency, mountinfo_has_hf_mount, parse_mode,
+        validate_revision, xet_env_defaults,
     };
     use std::path::Path;
     use xet_runtime::config::XetConfig;
@@ -1323,6 +1339,14 @@ mod tests {
         for bad in ["", "8", "0x1ff", "rwx", "10000"] {
             assert!(parse_mode(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn overlay_mounts_keep_the_placeholder_capacity() {
+        assert!(Backend::Fuse.uses_hub_quota(false));
+        assert!(Backend::WinFsp.uses_hub_quota(false));
+        assert!(!Backend::Fuse.uses_hub_quota(true));
+        assert!(!Backend::Nfs.uses_hub_quota(false));
     }
 
     #[test]

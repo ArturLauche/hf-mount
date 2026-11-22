@@ -23,6 +23,7 @@ pub mod manager;
 #[cfg(feature = "nfs")]
 pub mod nfs;
 pub mod overlay;
+pub mod quota;
 pub mod setup;
 pub mod virtual_fs;
 pub mod window_plans;

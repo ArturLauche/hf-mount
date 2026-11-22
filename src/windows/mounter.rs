@@ -179,6 +179,7 @@ impl Mounter for WinFspMounter {
         let config = MountConfig {
             mount_point: spec.target.clone(),
             volume_label: spec.volume_label(),
+            quota: setup.quota.clone(),
             read_only: setup.read_only,
             case_insensitive_fallback: setup.read_only,
             file_info_timeout: metadata_ttl,
