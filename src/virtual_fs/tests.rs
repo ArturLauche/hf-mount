@@ -6690,6 +6690,46 @@ fn overlay_reread_does_not_bump_dirty_generation() {
     });
 }
 
+/// A scan can discover new names while an existing descriptor is writing.
+/// Only the metadata for the file changed since the scan should be discarded.
+#[cfg(unix)]
+#[test]
+fn overlay_directory_scan_preserves_a_concurrent_write_and_chmod() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("mode-only"), b"existing").unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        let (file, fh) = t.vfs.create(ROOT_INODE, "live", 0o644, 1000, 1000, None).await.unwrap();
+        let mode_only = t.vfs.lookup(ROOT_INODE, "mode-only").await.unwrap();
+        let new_mode = mode_only.perm ^ 0o040;
+        std::fs::write(root.path().join("discovered"), b"also here").unwrap();
+        let _namespace = t.vfs.overlay_read_guard().await;
+        let scan = t
+            .vfs
+            .overlay_mount
+            .as_ref()
+            .unwrap()
+            .entries(String::new(), None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        write_blocking(&t.vfs, file.ino, fh, 0, b"later").await.unwrap();
+        t.vfs
+            .setattr(mode_only.ino, None, Some(new_mode), None, None, None, None)
+            .await
+            .unwrap();
+        {
+            let mut table = t.vfs.inode_table.write().unwrap();
+            t.vfs.merge_overlay_entries(&mut table, ROOT_INODE, scan);
+            assert_eq!(table.get(file.ino).unwrap().size, 5);
+            assert_eq!(table.get(mode_only.ino).unwrap().mode, new_mode);
+            assert_eq!(table.lookup_child(ROOT_INODE, "discovered").unwrap().size, 9);
+        }
+        t.vfs.release(fh).await.unwrap();
+    });
+}
+
 /// Unlink of a remote-only file returns EPERM in overlay mode.
 #[test]
 fn overlay_unlink_remote_only_eperm() {
@@ -6735,7 +6775,15 @@ fn overlay_unlink_local_file_ok() {
             .await
             .unwrap();
         write_blocking(&t.vfs, new.ino, new_fh, 0, b"new").await.unwrap();
+        assert_eq!(t.vfs.open(attr.ino, true, true, None).await.unwrap_err(), libc::ENOENT);
         assert_eq!(&t.vfs.read(fh, 0, 4).await.unwrap().0[..], b"data");
+        t.vfs
+            .setattr(attr.ino, Some(2), Some(0o600), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(t.vfs.read(fh, 0, 4).await.unwrap().0.as_ref(), b"da");
+        assert_eq!(t.vfs.getattr(new.ino).unwrap().size, 3);
+        assert_eq!(t.vfs.getattr(new.ino).unwrap().perm, 0o644);
         t.vfs.release(fh).await.unwrap();
         t.vfs.release(new_fh).await.unwrap();
         assert_eq!(std::fs::read(t.overlay_root.join("local.txt")).unwrap(), b"new");
@@ -6743,6 +6791,53 @@ fn overlay_unlink_local_file_ok() {
 
     let log = hub.take_batch_log();
     assert!(log.is_empty(), "unlink should not send remote ops in overlay: {log:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_chmod_on_an_orphan_cannot_modify_a_cached_remote_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let hub = MockHub::new();
+    hub.add_file("shadow", 1, None, Some("remote"));
+    let t = make_overlay_test_vfs_with_root(hub, MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "shadow").unwrap().ino;
+        let cached_handle = t.vfs.open(ino, false, false, None).await.unwrap();
+        let cached_file = {
+            let handles = t.vfs.open_files.read().unwrap();
+            let Some(OpenFile::Local { file, .. }) = handles.get(&cached_handle) else {
+                panic!("expected a downloaded HTTP cache file");
+            };
+            file.clone()
+        };
+        let mode = || cached_file.metadata().unwrap().permissions().mode() & 0o777;
+        let original_mode = mode();
+        let changed_mode = (original_mode ^ 0o040) as u16;
+
+        // The same inode now shadows the remote file. Its old cached
+        // descriptor and its new overlay descriptor refer to different files.
+        std::fs::write(root.path().join("shadow"), b"local").unwrap();
+        t.vfs.inode_table.write().unwrap().invalidate_children(ROOT_INODE);
+        t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let local = t.vfs.open(ino, false, false, None).await.unwrap();
+        t.vfs.unlink(ROOT_INODE, "shadow").await.unwrap();
+        t.vfs
+            .setattr(ino, None, Some(changed_mode), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(mode(), original_mode);
+        t.vfs.release(local).await.unwrap();
+        let result = t
+            .vfs
+            .setattr(ino, None, Some(changed_mode), None, None, None, None)
+            .await;
+        assert_eq!(result.unwrap_err(), libc::EBADF);
+        assert_eq!(mode(), original_mode);
+        t.vfs.release(cached_handle).await.unwrap();
+    });
 }
 
 #[cfg(unix)]
@@ -6757,6 +6852,49 @@ fn overlay_create_preserves_a_backing_file_added_after_the_directory_listing() {
         let result = t.vfs.create(ROOT_INODE, "occupied", 0o644, 1000, 1000, None).await;
         assert_eq!(result.unwrap_err(), libc::EEXIST);
         assert_eq!(std::fs::read(path).unwrap(), b"existing");
+    });
+}
+
+/// Pause a real create at the disk boundary. Cached operations must still
+/// finish, and cancelling the creator must leave exactly one published file.
+#[cfg(unix)]
+#[test]
+fn overlay_slow_create_keeps_cached_reads_available_and_finishes_after_cancellation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("other"), b"cached").unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        let other = t.vfs.lookup(ROOT_INODE, "other").await.unwrap();
+        let fh = t.vfs.open(other.ino, false, false, None).await.unwrap();
+
+        let (started, at_disk) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *t.vfs.overlay_mount.as_ref().unwrap().before_io.lock().unwrap() = Some(Box::new(move || {
+            started.send(()).unwrap();
+            paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+        let vfs = t.vfs.clone();
+        let creator = tokio::spawn(async move { vfs.create(ROOT_INODE, "new", 0o644, 1000, 1000, None).await });
+        tokio::time::timeout(Duration::from_secs(5), at_disk)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(t.vfs.inode_table.try_write().is_ok(), "disk I/O held the inode table");
+        assert_eq!(t.vfs.getattr(other.ino).unwrap().size, 6);
+        assert_eq!(t.vfs.lookup(ROOT_INODE, "other").await.unwrap().ino, other.ino);
+        assert_eq!(t.vfs.read(fh, 0, 6).await.unwrap().0.as_ref(), b"cached");
+
+        creator.abort();
+        assert!(creator.await.unwrap_err().is_cancelled());
+        let competing = t.vfs.create(ROOT_INODE, "new", 0o644, 1000, 1000, None);
+        tokio::pin!(competing);
+        assert!(futures::poll!(competing.as_mut()).is_pending());
+        resume.send(()).unwrap();
+        assert_eq!(competing.await.unwrap_err(), libc::EEXIST);
+        let new = t.vfs.lookup(ROOT_INODE, "new").await.unwrap();
+        assert_eq!(std::fs::metadata(root.path().join("new")).unwrap().len(), new.size);
+        assert!(!t.vfs.has_open_handles(new.ino), "cancelled create leaked its handle");
+        t.vfs.release(fh).await.unwrap();
     });
 }
 
@@ -7105,6 +7243,10 @@ fn overlay_type_conflict_local_dir_wins() {
             .expect("conflict should exist");
         // Local directory should win over remote file
         assert_eq!(entry.kind, InodeKind::Directory);
+        t.vfs.inode_table.write().unwrap().invalidate_children(ROOT_INODE);
+        let reloaded = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let same_dir = reloaded.iter().find(|e| e.name == "conflict").unwrap();
+        assert_eq!((same_dir.ino, same_dir.kind), (entry.ino, InodeKind::Directory));
     });
 }
 
