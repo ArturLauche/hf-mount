@@ -499,29 +499,25 @@ impl VirtualFs {
     /// On hit, re-runs `merge_overlay_entries` on the parent so the entry
     /// shows up in the inode table even when it was added to the backing
     /// after the parent's listing was loaded.
-    async fn overlay_lookup_takes_precedence(&self, parent: u64, full_path: &str) -> VirtualFsResult<bool> {
+    async fn overlay_lookup_takes_precedence(
+        &self,
+        parent: &DirectoryPath,
+        full_path: &str,
+    ) -> DirectoryReadResult<bool> {
         let Some(overlay) = &self.overlay_mount else {
             return Ok(false);
         };
         let _namespace = self.overlay_read_guard().await;
-        let parent_path = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            inodes.get(parent).ok_or(libc::ENOENT)?.full_path.clone()
-        };
-        if full_path.rsplit_once('/').map_or("", |(dir, _)| dir) != parent_path.as_ref() {
-            return Err(libc::EAGAIN);
-        }
+        parent.current(&self.inode_table.read().expect("inodes poisoned"))?;
         let Some(entries) = overlay
-            .entries(parent_path.to_string(), Some(full_path.to_owned()))
+            .entries(parent.path.to_string(), Some(full_path.to_owned()))
             .await?
         else {
             return Ok(false);
         };
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        if inodes.get(parent).is_none() {
-            return Err(libc::ENOENT);
-        }
-        self.merge_overlay_entries(&mut inodes, parent, entries);
+        parent.current(&inodes)?;
+        self.merge_overlay_entries(&mut inodes, parent.ino, entries);
         Ok(true)
     }
 
@@ -822,43 +818,44 @@ impl VirtualFs {
         // Serialize concurrent loads for the same directory.
         let dir_lock = self.dir_loading_lock(parent_ino);
         let _guard = dir_lock.lock().await;
+        retry_directory_read(|| self.load_children_once(parent_ino)).await
+    }
 
+    async fn load_children_once(&self, parent_ino: u64) -> DirectoryReadResult<bool> {
         // Re-check: another task may have loaded while we waited.
-        let prefix = {
+        let directory = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
-            match inodes.get(parent_ino) {
-                Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-                Some(e) if self.listing_is_fresh(e) => return Ok(false),
-                Some(e) => e.full_path.clone(),
-                None => return Err(libc::ENOENT),
+            let entry = inodes.get(parent_ino).ok_or(libc::ENOENT)?;
+            if self.listing_is_fresh(entry) {
+                return Ok(false);
             }
+            DirectoryPath::new(entry)
         };
 
-        let entries = match self.hub_client.list_tree(&prefix).await {
+        let prefix = directory.path.as_ref();
+        let entries = match self.hub_client.list_tree(prefix).await {
             Ok(entries) => entries,
             Err(e) => {
+                directory.current(&self.inode_table.read().expect("inodes poisoned"))?;
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
                 // Preserve the error semantics: a 429 after client-side retries
                 // must surface as EAGAIN (transient), not EIO — EIO reads as
                 // hard data loss and aborts whole distributed jobs on a single
                 // rate-limited stat().
-                return Err(e.to_errno());
+                return Err(e.to_errno().into());
             }
         };
 
         let _namespace = self.overlay_read_guard().await;
         let local_entries = match &self.overlay_mount {
-            Some(overlay) => overlay.entries(prefix.to_string(), None).await?,
-            None => None,
+            Some(overlay) => overlay.entries(prefix.to_string(), None).await,
+            None => Ok(None),
         };
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(parent_ino) {
-            Some(e) if !Arc::ptr_eq(&e.full_path, &prefix) => return Err(libc::EAGAIN),
-            Some(e) if self.listing_is_fresh(e) => return Ok(false),
-            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-            None => return Err(libc::ENOENT),
-            _ => {}
+        if self.listing_is_fresh(directory.current(&inodes)?) {
+            return Ok(false);
         }
+        let local_entries = local_entries?;
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Entries skipped for a rename in flight: the listing stays stale, so
@@ -876,7 +873,7 @@ impl VirtualFs {
             let rel_path = if prefix.is_empty() {
                 entry.path.clone()
             } else {
-                match crate::hub_api::strict_descendant_rel(&entry.path, &prefix) {
+                match crate::hub_api::strict_descendant_rel(&entry.path, prefix) {
                     Some(rel) => rel.to_string(),
                     // list_tree guarantees strict descendants; skip defensively.
                     None => continue,
@@ -1336,200 +1333,119 @@ impl VirtualFs {
     pub async fn lookup(&self, parent: u64, name: &str) -> VirtualFsResult<VirtualFsAttr> {
         debug!("lookup: parent={}, name={}", parent, name);
 
-        // Fast path: children already loaded → lookup directly, no allocation needed.
-        // Revalidation info extracted from the lock scope so we can await outside it.
-        enum FastResult {
-            Hit(VirtualFsAttr),
-            NeedsRevalidation(FileRevalidation),
-            Miss {
-                full_path: String,
-                /// True when the parent has no remote presence (locally
-                /// created in this session); HEAD/list_tree probes are
-                /// pointless and can be skipped.
-                local_only: bool,
-            },
-            NotLoaded,
-        }
-        let fast = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let parent_entry = inodes.get(parent).ok_or(libc::ENOENT)?;
+        retry_directory_read(|| self.lookup_once(parent, name)).await
+    }
 
-            if parent_entry.kind != InodeKind::Directory {
-                return Err(libc::ENOTDIR);
+    async fn lookup_once(&self, parent: u64, name: &str) -> DirectoryReadResult<VirtualFsAttr> {
+        enum Lookup {
+            Revalidate(FileRevalidation),
+            Probe { full_path: String, listed: bool },
+        }
+        let (directory, lookup) = {
+            let inodes = self.inode_table.read().expect("inodes poisoned");
+            let entry = inodes.get(parent).ok_or(libc::ENOENT)?;
+            if entry.kind != InodeKind::Directory {
+                return Err(libc::ENOTDIR.into());
             }
 
-            // Try in-memory first regardless of a fresh listing: an inode
-            // inserted via the HEAD point-lookup path or still present after
-            // a partial eviction can be served without a full re-list.
-            //
-            // For directories we still require a fresh listing to trust the
-            // cached entry: without the parent listing, we can't tell whether
-            // the dir was removed or replaced remotely (files revalidate
-            // individually via HEAD, dirs don't).
-            match inodes.lookup_child(parent, name) {
-                Some(entry) if entry.kind == InodeKind::File => {
+            let lookup = match inodes.lookup_child(parent, name) {
+                Some(child) if child.kind == InodeKind::File => {
                     let fresh = self.serve_lookup_from_cache
-                        && entry
+                        && child
                             .last_revalidated
                             .is_some_and(|last| last.elapsed() < self.metadata_ttl);
-                    if entry.is_dirty() || fresh {
-                        FastResult::Hit(self.make_vfs_attr(entry))
-                    } else {
-                        FastResult::NeedsRevalidation(FileRevalidation::new(entry))
+                    if child.is_dirty() || fresh {
+                        return Ok(self.make_vfs_attr(child));
                     }
+                    Lookup::Revalidate(FileRevalidation::new(child))
                 }
-                Some(entry) if self.listing_is_fresh(parent_entry) => FastResult::Hit(self.make_vfs_attr(entry)),
-                // Cached non-file under an unloaded or stale parent: we can't
-                // HEAD-probe a directory to check it still exists (resolve
-                // endpoint only serves files), so defer to the slow path which lists.
-                Some(_) => FastResult::NotLoaded,
-                // No cached entry but the parent listing is authoritative →
-                // the name really doesn't exist; populate the negative cache.
-                None if self.listing_is_fresh(parent_entry) => {
-                    let parent_path = &parent_entry.full_path;
-                    let full_path = if parent_path.is_empty() {
-                        name.to_string()
-                    } else {
-                        format!("{}/{}", parent_path, name)
-                    };
-                    // Skip the HEAD-on-miss revalidation when the listing was
-                    // just refreshed: workloads that rapidly look up unique
-                    // names (tarball extract, build systems, xfstests) would
-                    // otherwise pay one HEAD + list_tree per name despite the
-                    // cache being authoritative.
-                    FastResult::Miss {
-                        full_path,
-                        local_only: !parent_entry.children_from_remote,
+                child => {
+                    let listed = self.listing_is_fresh(entry);
+                    if listed {
+                        if let Some(child) = child {
+                            return Ok(self.make_vfs_attr(child));
+                        }
+                        // A locally created directory has no remote names to discover.
+                        if !entry.children_from_remote {
+                            return Err(libc::ENOENT.into());
+                        }
                     }
-                }
-                // No entry, no listing → slow path (HEAD then list_tree).
-                None => FastResult::NotLoaded,
-            }
-        }; // inodes lock dropped here
-
-        match fast {
-            FastResult::Hit(attr) => return Ok(attr),
-            FastResult::NeedsRevalidation(check) => {
-                check.run(self).await;
-                // A remote unlink can keep the original inode alive for an open
-                // fd. A lookup must resolve the name again after the request.
-                let inodes = self.inode_table.read().expect("inodes poisoned");
-                return inodes
-                    .lookup_child(parent, name)
-                    .map(|entry| self.make_vfs_attr(entry))
-                    .ok_or(libc::ENOENT);
-            }
-            FastResult::Miss { full_path, local_only } => {
-                // A cached listing can still hide entries added remotely after
-                // we listed. Re-validate before serving ENOENT, gated by the
-                // negative cache so repeated misses stay free.
-                if self.negative_cache_check(&full_path) {
-                    return Err(libc::ENOENT);
-                }
-                // Skip HEAD/list probes for purely-local directories
-                // (locally-mkdir'd this session, never seen on remote):
-                // there's no remote state to discover, so the cached listing
-                // is authoritative. Hot path for tarball extract / xfstests
-                // creating thousands of unique names under fresh dirs.
-                //
-                // Do NOT seed the global negative cache here — remote churn
-                // could materialize these names while the entry hides them.
-                // The listing itself is the cache for these misses.
-                if local_only {
-                    return Err(libc::ENOENT);
-                }
-                // Overlay precedence: a file added to the overlay backing
-                // after the parent listing was loaded must shadow whatever the
-                // remote HEAD returns. Otherwise a clean remote inode wins,
-                // and a later open(write) would truncate the local backing.
-                if self.overlay_lookup_takes_precedence(parent, &full_path).await? {
-                    let inodes = self.inode_table.read().expect("inodes poisoned");
-                    return inodes
-                        .lookup_child(parent, name)
-                        .map(|e| self.make_vfs_attr(e))
-                        .ok_or(libc::ENOENT);
-                }
-                match self.head_probe(&full_path).await {
-                    HeadProbe::File(head) => return self.insert_file_from_head(parent, name, &full_path, head).await,
-                    HeadProbe::Transient(e) => return Err(e.to_errno()),
-                    HeadProbe::Inconclusive => {}
-                }
-                // HEAD can miss a remotely added directory. A single real child
-                // proves it exists even if the full listing spans many pages.
-                match self.hub_client.has_children(&full_path).await {
-                    Ok(true) => return self.insert_dir(parent, name, &full_path).await,
-                    Ok(false) => {}
-                    // Repos return 404 for a missing directory; buckets return an empty list.
-                    Err(e) if e.status() == Some(404) => {}
-                    Err(e) => {
-                        debug!("list miss-probe {} failed: {}", full_path, e);
-                        return Err(e.to_errno());
+                    let full_path = inode::child_path(&entry.full_path, name);
+                    if self.negative_cache_check(&full_path) {
+                        return Err(libc::ENOENT.into());
                     }
+                    Lookup::Probe { full_path, listed }
                 }
-                self.negative_cache_insert(full_path);
-                return Err(libc::ENOENT);
-            }
-            FastResult::NotLoaded => {} // fall through to slow path
-        }
-
-        // Slow path: children not loaded yet, fetch from Hub API.
-        let full_path = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            match inodes.get(parent) {
-                Some(e) => inode::child_path(&e.full_path, name),
-                None => return Err(libc::ENOENT),
-            }
+            };
+            (DirectoryPath::new(entry), lookup)
         };
 
-        if self.negative_cache_check(&full_path) {
-            debug!("negative cache hit: {}", full_path);
-            return Err(libc::ENOENT);
-        }
+        let (full_path, listed) = match lookup {
+            Lookup::Revalidate(check) => {
+                check.run(self).await;
+                // An open descriptor can outlive a remote unlink. Resolve the name again.
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                directory.current(&inodes)?;
+                return inodes
+                    .lookup_child(parent, name)
+                    .map(|e| self.make_vfs_attr(e))
+                    .ok_or(libc::ENOENT.into());
+            }
+            Lookup::Probe { full_path, listed } => (full_path, listed),
+        };
 
-        // Overlay precedence (see FastResult::Miss): defer to the parent
-        // listing + merge so the local entry is what we resolve.
-        if self.overlay_lookup_takes_precedence(parent, &full_path).await? {
-            self.ensure_children_loaded(parent).await?;
+        // A file added to the backing after the listing still shadows the remote.
+        if self.overlay_lookup_takes_precedence(&directory, &full_path).await? {
+            if !listed {
+                self.ensure_children_loaded(parent).await?;
+            }
             let inodes = self.inode_table.read().expect("inodes poisoned");
+            directory.current(&inodes)?;
             return inodes
                 .lookup_child(parent, name)
                 .map(|e| self.make_vfs_attr(e))
-                .ok_or(libc::ENOENT);
+                .ok_or(libc::ENOENT.into());
         }
 
-        // Resolve the single requested path via HEAD instead of listing the
-        // whole parent — for point-access workloads (no `readdir`) this keeps
-        // the inode table scoped to what the caller actually touches.
-        let head_probe = match self.head_probe(&full_path).await {
-            HeadProbe::File(head) => return self.insert_file_from_head(parent, name, &full_path, head).await,
+        let head = match self.head_probe(&full_path).await {
+            HeadProbe::File(head) => return self.insert_file_from_head(&directory, name, &full_path, head).await,
             other => other,
         };
 
-        let freshly_listed = self.ensure_children_loaded(parent).await?;
-
-        let inodes = self.inode_table.read().expect("inodes poisoned");
-        match inodes.lookup_child(parent, name) {
-            Some(entry) => Ok(self.make_vfs_attr(entry)),
-            None => {
-                drop(inodes);
-                // A fresh listing is authoritative regardless of the HEAD
-                // outcome: the miss is real and safe to cache.
-                if freshly_listed {
-                    self.negative_cache_insert(full_path);
-                    return Err(libc::ENOENT);
-                }
-                // The listing was loaded earlier (or by a concurrent task)
-                // and may predate a remote commit: an inconclusive probe is
-                // not authoritative enough to negative-cache (uncached ENOENT
-                // lets the next lookup retry against a fresher listing), and
-                // a rate-limited probe surfaces its errno instead of a false
-                // ENOENT.
-                match head_probe {
-                    HeadProbe::Transient(e) => Err(e.to_errno()),
-                    _ => Err(libc::ENOENT),
+        // A cached listing can predate a remote commit. A single child proves
+        // the missing name is a directory, even if its full listing spans pages.
+        let authoritative = if listed {
+            if let HeadProbe::Transient(e) = head {
+                directory.current(&self.inode_table.read().expect("inodes poisoned"))?;
+                return Err(e.to_errno().into());
+            }
+            match self.hub_client.has_children(&full_path).await {
+                Ok(true) => return self.insert_dir(&directory, name, &full_path).await,
+                Ok(false) => true,
+                Err(e) if e.status() == Some(404) => true,
+                Err(e) => {
+                    directory.current(&self.inode_table.read().expect("inodes poisoned"))?;
+                    debug!("list miss-probe {} failed: {}", full_path, e);
+                    return Err(e.to_errno().into());
                 }
             }
+        } else {
+            self.ensure_children_loaded(parent).await?
+        };
+
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        directory.current(&inodes)?;
+        if let Some(child) = inodes.lookup_child(parent, name) {
+            return Ok(self.make_vfs_attr(child));
         }
+        if authoritative {
+            // Keep the path stable until its negative cache entry has been published.
+            self.negative_cache_insert(full_path);
+        } else if let HeadProbe::Transient(e) = head {
+            // Another caller's older listing cannot overrule a rate-limited HEAD.
+            return Err(e.to_errno().into());
+        }
+        Err(libc::ENOENT.into())
     }
 
     /// HEAD-probe `full_path` for a remotely-added file; both lookup miss
@@ -1563,11 +1479,11 @@ impl VirtualFs {
     /// `false` so a later `readdir` still triggers a full listing.
     async fn insert_file_from_head(
         &self,
-        parent: u64,
+        directory: &DirectoryPath,
         name: &str,
         full_path: &str,
         head: crate::hub_api::HeadFileInfo,
-    ) -> VirtualFsResult<VirtualFsAttr> {
+    ) -> DirectoryReadResult<VirtualFsAttr> {
         let size = head.size.unwrap_or(0);
         let mtime = head
             .last_modified
@@ -1577,14 +1493,8 @@ impl VirtualFs {
 
         let _namespace = self.overlay_read_guard().await;
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(parent) {
-            None => return Err(libc::ENOENT),
-            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-            Some(e) if full_path.rsplit_once('/').map_or("", |(dir, _)| dir) != e.full_path.as_ref() => {
-                return Err(libc::EAGAIN);
-            }
-            Some(_) => {}
-        }
+        directory.current(&inodes)?;
+        let parent = directory.ino;
         if let Some(existing) = inodes.lookup_child(parent, name) {
             // A concurrent HEAD lookup may have just inserted the same file —
             // return its attr instead of redoing the work.
@@ -1621,7 +1531,7 @@ impl VirtualFs {
         }
         match inodes.get(ino) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
-            None => Err(libc::EIO),
+            None => Err(libc::EIO.into()),
         }
     }
 
@@ -1629,17 +1539,16 @@ impl VirtualFs {
     /// touching siblings. Mirrors `insert_file_from_head` for the dir case.
     /// Parent's `children_loaded` stays as-is so a later `readdir` still
     /// triggers a full listing.
-    async fn insert_dir(&self, parent: u64, name: &str, full_path: &str) -> VirtualFsResult<VirtualFsAttr> {
+    async fn insert_dir(
+        &self,
+        directory: &DirectoryPath,
+        name: &str,
+        full_path: &str,
+    ) -> DirectoryReadResult<VirtualFsAttr> {
         let _namespace = self.overlay_read_guard().await;
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(parent) {
-            None => return Err(libc::ENOENT),
-            Some(e) if e.kind != InodeKind::Directory => return Err(libc::ENOTDIR),
-            Some(e) if full_path.rsplit_once('/').map_or("", |(dir, _)| dir) != e.full_path.as_ref() => {
-                return Err(libc::EAGAIN);
-            }
-            Some(_) => {}
-        }
+        directory.current(&inodes)?;
+        let parent = directory.ino;
         if let Some(existing) = inodes.lookup_child(parent, name) {
             return Ok(self.make_vfs_attr(existing));
         }
@@ -1657,7 +1566,7 @@ impl VirtualFs {
         );
         match inodes.get(ino) {
             Some(entry) => Ok(self.make_vfs_attr(entry)),
-            None => Err(libc::EIO),
+            None => Err(libc::EIO.into()),
         }
     }
 
@@ -4283,6 +4192,56 @@ impl StreamingChannel {
     /// O_TRUNC writer bumped the generation, or after commit/revert reset it.
     fn owns_generation(&self, inode_dirty_generation: u64) -> bool {
         self.dirty_generation_at_open.load(Ordering::Relaxed) == inode_dirty_generation
+    }
+}
+
+/// A rename replaces the path Arc, even when an ancestor moves away and back.
+/// Keep the allocation alive until a path-based read publishes its result.
+struct DirectoryPath {
+    ino: u64,
+    path: Arc<str>,
+}
+
+impl DirectoryPath {
+    fn new(entry: &InodeEntry) -> Self {
+        Self {
+            ino: entry.inode,
+            path: entry.full_path.clone(),
+        }
+    }
+
+    fn current<'a>(&self, table: &'a InodeTable) -> DirectoryReadResult<&'a InodeEntry> {
+        let entry = table.get(self.ino).ok_or(libc::ENOENT)?;
+        if Arc::ptr_eq(&self.path, &entry.full_path) {
+            Ok(entry)
+        } else {
+            Err(DirectoryReadError::Moved)
+        }
+    }
+}
+
+enum DirectoryReadError {
+    Moved,
+    Errno(i32),
+}
+
+impl From<i32> for DirectoryReadError {
+    fn from(errno: i32) -> Self {
+        Self::Errno(errno)
+    }
+}
+
+type DirectoryReadResult<T> = Result<T, DirectoryReadError>;
+
+async fn retry_directory_read<T, F: Future<Output = DirectoryReadResult<T>>>(
+    mut read: impl FnMut() -> F,
+) -> VirtualFsResult<T> {
+    loop {
+        match read().await {
+            Ok(value) => return Ok(value),
+            Err(DirectoryReadError::Errno(errno)) => return Err(errno),
+            Err(DirectoryReadError::Moved) => tokio::task::yield_now().await,
+        }
     }
 }
 

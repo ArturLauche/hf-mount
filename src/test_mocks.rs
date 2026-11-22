@@ -68,12 +68,33 @@ pub(crate) async fn serve_hub_requests(
 
 // ── MockHub ───────────────────────────────────────────────────────────
 
+/// Suspend a single response after the mock has captured its contents.
+#[derive(Default)]
+pub struct ReadPause(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+impl ReadPause {
+    pub fn arm(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        assert!(self.0.lock().unwrap().replace(paused).is_none());
+        resume
+    }
+
+    async fn wait(&self) {
+        let paused = self.0.lock().unwrap().take();
+        if let Some(paused) = paused {
+            paused.await.unwrap();
+        }
+    }
+}
+
 pub struct MockHub {
     tree: Mutex<Vec<TreeEntry>>,
     head_responses: Mutex<HashMap<String, Option<HeadFileInfo>>>,
     pub batch_log: Mutex<Vec<Vec<BatchOp>>>,
     batch_fail_count: AtomicU32,
     batch_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    pub head_pause: ReadPause,
+    pub tree_pause: ReadPause,
     /// HTTP status for the next list_tree failure.
     list_tree_fail_status: Mutex<Option<u16>>,
     /// HTTP status for the next head_file failure (used with head_fail).
@@ -115,6 +136,8 @@ impl MockHub {
             batch_log: Mutex::new(Vec::new()),
             batch_fail_count: AtomicU32::new(0),
             batch_barrier: Mutex::new(None),
+            head_pause: ReadPause::default(),
+            tree_pause: ReadPause::default(),
             list_tree_fail_status: Mutex::new(None),
             head_fail_status: Mutex::new(None),
             head_fail: AtomicBool::new(false),
@@ -274,27 +297,8 @@ impl MockHub {
     pub fn follow_connect_log(&self) -> Vec<(Option<String>, Option<String>)> {
         self.follow_connects.lock().unwrap().clone()
     }
-}
 
-/// Build a mock Hub error, carrying `status` when one is configured.
-fn mock_error(status: Option<u16>, msg: &str) -> Error {
-    match status {
-        Some(status) => Error::hub_status(status, msg),
-        None => Error::hub(msg),
-    }
-}
-
-#[async_trait::async_trait]
-impl HubOps for MockHub {
-    async fn probe_repo_commit(&self) -> Result<Option<String>> {
-        self.probe_revision().await.map(Some)
-    }
-
-    async fn list_tree_at_commit(&self, prefix: &str, _commit: &str) -> Result<Vec<TreeEntry>> {
-        self.list_tree(prefix).await
-    }
-
-    async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
+    fn tree_response(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
         self.list_tree_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(status) = self.list_tree_fail_status.lock().unwrap().take() {
             return Err(Error::hub_status(status, "mock list_tree failure"));
@@ -345,7 +349,7 @@ impl HubOps for MockHub {
         Ok(result)
     }
 
-    async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+    fn head_response(&self, path: &str) -> Result<Option<HeadFileInfo>> {
         self.head_file_calls.fetch_add(1, Ordering::SeqCst);
         if self.head_fail.swap(false, Ordering::SeqCst) {
             let status = self.head_fail_status.lock().unwrap().take();
@@ -361,6 +365,37 @@ impl HubOps for MockHub {
             })),
             None => Ok(None),
         }
+    }
+}
+
+/// Build a mock Hub error, carrying `status` when one is configured.
+fn mock_error(status: Option<u16>, msg: &str) -> Error {
+    match status {
+        Some(status) => Error::hub_status(status, msg),
+        None => Error::hub(msg),
+    }
+}
+
+#[async_trait::async_trait]
+impl HubOps for MockHub {
+    async fn probe_repo_commit(&self) -> Result<Option<String>> {
+        self.probe_revision().await.map(Some)
+    }
+
+    async fn list_tree_at_commit(&self, prefix: &str, _commit: &str) -> Result<Vec<TreeEntry>> {
+        self.list_tree(prefix).await
+    }
+
+    async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
+        let result = self.tree_response(prefix);
+        self.tree_pause.wait().await;
+        result
+    }
+
+    async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+        let result = self.head_response(path);
+        self.head_pause.wait().await;
+        result
     }
 
     async fn batch_operations(&self, ops: &[BatchOp]) -> Result<()> {

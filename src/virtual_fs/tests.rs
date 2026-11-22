@@ -6918,6 +6918,41 @@ fn overlay_parent_pins_are_released_when_a_rename_worker_panics() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn overlay_lookup_waiting_for_a_parent_rename_finds_the_local_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("old")).unwrap();
+    let t = make_overlay_test_vfs_with_root(MockHub::new(), MockXet::new(), root.path().into());
+    t.runtime.block_on(async {
+        let dir = t.vfs.lookup(ROOT_INODE, "old").await.unwrap().ino;
+        t.vfs.readdir(dir).await.unwrap();
+        let (started, at_disk) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *t.vfs.overlay_mount.as_ref().unwrap().before_io.lock().unwrap() = Some(Box::new(move || {
+            started.send(()).unwrap();
+            paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+        let vfs = t.vfs.clone();
+        let rename = tokio::spawn(async move { vfs.rename(ROOT_INODE, "old", ROOT_INODE, "new", false).await });
+        tokio::time::timeout(Duration::from_secs(5), at_disk)
+            .await
+            .unwrap()
+            .unwrap();
+        let lookup = t.vfs.lookup(dir, "added");
+        tokio::pin!(lookup);
+        assert!(futures::poll!(lookup.as_mut()).is_pending());
+        std::fs::write(root.path().join("old/added"), b"local").unwrap();
+        resume.send(()).unwrap();
+        rename.await.unwrap().unwrap();
+        let file = lookup.await.unwrap();
+        assert_eq!(file.size, 5);
+        let fh = t.vfs.open(file.ino, false, false, None).await.unwrap();
+        assert_eq!(t.vfs.read(fh, 0, 5).await.unwrap().0.as_ref(), b"local");
+        t.vfs.release(fh).await.unwrap();
+    });
+}
+
 /// Rename of a remote-only file returns EPERM in overlay mode.
 #[test]
 fn overlay_rename_remote_only_eperm() {
@@ -7907,6 +7942,113 @@ fn listing_during_rename_does_not_take_the_destination() {
         let inodes = vfs.inode_table.read().unwrap();
         assert!(inodes.get_by_path("b.txt").is_some());
     });
+}
+
+#[test]
+fn lookup_discards_old_path_responses_when_the_parent_moves() {
+    #[derive(Clone, Copy, Debug)]
+    enum OldResponse {
+        File,
+        FileAfterRoundTripRename,
+        Directory,
+        EmptyDirectory,
+        MissingDirectory,
+        RateLimited,
+    }
+
+    use OldResponse::*;
+    for response in [
+        File,
+        FileAfterRoundTripRename,
+        Directory,
+        EmptyDirectory,
+        MissingDirectory,
+        RateLimited,
+    ] {
+        let hub = MockHub::new();
+        hub.add_file("old/known", 1, Some("known"), None);
+        let (rt, vfs) = vfs_simple(&hub, &MockXet::new());
+        rt.block_on(async {
+            let parent = vfs.lookup(ROOT_INODE, "old").await.unwrap().ino;
+            vfs.readdir(parent).await.unwrap();
+            let resume = match response {
+                File | FileAfterRoundTripRename => {
+                    hub.add_file("old/target", 2, Some("old"), None);
+                    hub.head_pause.arm()
+                }
+                Directory => {
+                    hub.add_file("old/target/leaf", 1, Some("leaf"), None);
+                    hub.tree_pause.arm()
+                }
+                EmptyDirectory => hub.tree_pause.arm(),
+                MissingDirectory => {
+                    hub.fail_next_list_tree_with_status(404);
+                    hub.tree_pause.arm()
+                }
+                RateLimited => {
+                    hub.fail_next_head_with_status(429);
+                    hub.head_pause.arm()
+                }
+            };
+            let lookup = vfs.lookup(parent, "target");
+            tokio::pin!(lookup);
+            assert!(futures::poll!(lookup.as_mut()).is_pending(), "{response:?}");
+            vfs.rename(ROOT_INODE, "old", ROOT_INODE, "new", false).await.unwrap();
+            let path = if matches!(response, FileAfterRoundTripRename) {
+                vfs.rename(ROOT_INODE, "new", ROOT_INODE, "old", false).await.unwrap();
+                hub.remove_file("old/target");
+                "old/target"
+            } else {
+                "new/target"
+            };
+            hub.add_file(path, 77, Some("current"), None);
+            resume.send(()).unwrap();
+            let attr = lookup.await.unwrap();
+            assert_eq!(attr.size, 77, "{response:?}");
+            let inodes = vfs.inode_table.read().unwrap();
+            assert_eq!(inodes.get_by_path(path).unwrap().inode, attr.ino);
+            assert!(!vfs.negative_cache_check("old/target"));
+        });
+    }
+}
+
+#[test]
+fn readdir_reloads_the_new_path_after_a_parent_rename() {
+    for stale_error in [None, Some(404), Some(429)] {
+        let hub = MockHub::new();
+        hub.add_file("old/known", 1, Some("known"), None);
+        let (rt, vfs) = vfs_simple(&hub, &MockXet::new());
+        rt.block_on(async {
+            let dir = vfs.lookup(ROOT_INODE, "old").await.unwrap().ino;
+            vfs.readdir(dir).await.unwrap();
+            // Start a normal rename and let a reader request a fresh listing
+            // after rename has loaded the subtree but before it moves the inodes.
+            let committing = Arc::new(tokio::sync::Barrier::new(2));
+            hub.set_batch_barrier(committing.clone());
+            let rename = vfs.rename(ROOT_INODE, "old", ROOT_INODE, "new", false);
+            tokio::pin!(rename);
+            assert!(futures::poll!(rename.as_mut()).is_pending());
+            vfs.inode_table.write().unwrap().invalidate_children(dir);
+            hub.add_file("old/stale", 1, Some("stale"), None);
+            if let Some(status) = stale_error {
+                hub.fail_next_list_tree_with_status(status);
+            }
+            let resume = hub.tree_pause.arm();
+            let listing = vfs.readdir(dir);
+            tokio::pin!(listing);
+            assert!(futures::poll!(listing.as_mut()).is_pending());
+            tokio::time::timeout(Duration::from_secs(5), committing.wait())
+                .await
+                .unwrap();
+            rename.await.unwrap();
+            hub.add_file("new/current", 1, Some("current"), None);
+            resume.send(()).unwrap();
+            let names: Vec<_> = listing.await.unwrap().into_iter().map(|e| e.name).collect();
+            assert!(names.iter().any(|n| n == "current"), "{stale_error:?}: {names:?}");
+            assert!(!names.iter().any(|n| n == "stale"));
+            assert!(vfs.inode_table.read().unwrap().get_by_path("old/stale").is_none());
+        });
+    }
 }
 
 /// While a rename is between its Hub commit and its local move: a remote
