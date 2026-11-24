@@ -71,27 +71,27 @@ async fn windows_status() {
 
     let identity = pipe::Identity::current().unwrap();
     let mut reader = StatusConnections::default();
-    let (hosts, error) = reader.list(&identity).await;
-    assert!(error.is_none(), "{error:?}");
+    let status = reader.list(&identity).await;
+    assert!(!status.is_incomplete(), "{:?}", status.supervisor_error);
     eprintln!(
         "{} hosts, {} mounts",
-        hosts.len(),
-        ops::overview_from_hosts(hosts).mounts.len()
+        status.hosts.len(),
+        ops::overview_from_hosts(status.hosts).mounts.len()
     );
 
     for _ in 0..5 {
         let start = Instant::now();
         for _ in 0..READS {
-            let (hosts, error) = reader.list(&identity).await;
-            assert!(error.is_none(), "{error:?}");
-            black_box(ops::overview_from_hosts(hosts));
+            let status = reader.list(&identity).await;
+            assert!(!status.is_incomplete(), "{:?}", status.supervisor_error);
+            black_box(ops::overview_from_hosts(status.hosts));
         }
         let overview = start.elapsed() / READS;
         let start = Instant::now();
         for _ in 0..READS {
-            let (hosts, error) = reader.list(&identity).await;
-            assert!(error.is_none(), "{error:?}");
-            black_box(hosts);
+            let status = reader.list(&identity).await;
+            assert!(!status.is_incomplete(), "{:?}", status.supervisor_error);
+            black_box(status.hosts);
         }
         let list = start.elapsed() / READS;
         let discovery = time_reads(|| pipe::list_host_pipes(&identity));

@@ -86,39 +86,57 @@ pub struct StatusConnections {
     pipes: HashMap<String, Connection>,
 }
 
+/// Live responses and any gaps in the host list. A foreground failure does
+/// not imply the supervisor is unreachable.
+#[derive(Default)]
+pub struct HostStatus {
+    pub hosts: Vec<HostSummary>,
+    pub supervisor_error: Option<ErrorInfo>,
+    pub foreground_unavailable: bool,
+}
+
+impl HostStatus {
+    pub fn is_incomplete(&self) -> bool {
+        self.supervisor_error.is_some() || self.foreground_unavailable
+    }
+}
+
 impl StatusConnections {
-    pub async fn list(&mut self, identity: &Identity) -> (Vec<HostSummary>, Option<ErrorInfo>) {
+    pub async fn list(&mut self, identity: &Identity) -> HostStatus {
+        self.list_pipes(identity, host_pipes(identity)).await
+    }
+
+    async fn list_pipes(&mut self, identity: &Identity, pipes: Vec<String>) -> HostStatus {
         let mut previous = std::mem::take(&mut self.pipes);
-        let queries = host_pipes(identity).into_iter().map(|pipe| {
+        // host_pipes always puts the well-known supervisor pipe first.
+        let queries = pipes.into_iter().enumerate().map(|(index, pipe)| {
             let existing = previous.remove(&pipe);
-            list_host(identity, pipe, existing)
+            async move { (index, list_host(identity, pipe, existing).await) }
         });
         let mut queries = stream::iter(queries).buffered(4);
-        let mut hosts = Vec::new();
-        let mut error = None;
-        while let Some(result) = queries.next().await {
+        let mut status = HostStatus::default();
+        while let Some((index, result)) = queries.next().await {
             match result {
                 Ok(Some((host, conn))) => {
                     self.pipes.insert(host.pipe.clone(), conn);
-                    hosts.push(host);
+                    status.hosts.push(host);
                 }
                 Ok(None) => {}
-                Err(e) => {
-                    error.get_or_insert(e);
-                }
+                Err(e) if index == 0 => status.supervisor_error = Some(e),
+                Err(_) => status.foreground_unavailable = true,
             }
         }
-        (hosts, error)
+        status
     }
 }
 
 /// A one-shot query from the CLI or tray.
-pub async fn list_hosts_with_error(identity: &Identity) -> (Vec<HostSummary>, Option<ErrorInfo>) {
+pub async fn read_host_status(identity: &Identity) -> HostStatus {
     StatusConnections::default().list(identity).await
 }
 
 pub async fn list_hosts(identity: &Identity) -> Vec<HostSummary> {
-    list_hosts_with_error(identity).await.0
+    read_host_status(identity).await.hosts
 }
 
 /// A journal left behind by a supervisor that did not exit cleanly (no
@@ -224,6 +242,58 @@ mod tests {
     use super::*;
     use crate::manager::protocol::{HostKind, PROTOCOL_VERSION, decode, encode};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+
+    fn serve_status(
+        identity: &Identity,
+        pipe: &str,
+        first_instance: bool,
+        kind: HostKind,
+        incarnation: &str,
+        lists: Vec<Result<(), ErrorInfo>>,
+    ) -> (oneshot::Sender<()>, JoinHandle<()>) {
+        let (server, _sd) = super::super::pipe::bind(pipe, &identity.sid, first_instance).unwrap();
+        let (done, stop) = oneshot::channel();
+        let host = HostInfo {
+            kind,
+            pid: std::process::id(),
+            started_at: incarnation.into(),
+            protocol: PROTOCOL_VERSION,
+            version: "test".into(),
+            elevated: false,
+            winfsp_version: None,
+        };
+        let serving = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let (read, mut write) = tokio::io::split(server);
+            let mut lines = BufReader::new(read).lines();
+            let line = lines.next_line().await.unwrap().unwrap();
+            assert!(matches!(
+                decode::<Request>(&line).unwrap(),
+                Request::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    ..
+                }
+            ));
+            let response = Response::Hello { host: host.clone() };
+            write.write_all(encode(&response).as_bytes()).await.unwrap();
+            for status in lists {
+                let line = lines.next_line().await.unwrap().unwrap();
+                assert!(matches!(decode::<Request>(&line).unwrap(), Request::List));
+                let response = match status {
+                    Ok(()) => Response::Mounts {
+                        host: host.clone(),
+                        mounts: vec![],
+                    },
+                    Err(error) => Response::Error { error },
+                };
+                write.write_all(encode(&response).as_bytes()).await.unwrap();
+            }
+            stop.await.unwrap();
+        });
+        (done, serving)
+    }
 
     #[tokio::test]
     async fn visible_reader_reuses_handshake_and_detects_supervisor_restart() {
@@ -232,61 +302,83 @@ mod tests {
         let pipe = identity.supervisor_pipe();
         let mut reader = StatusConnections::default();
         tokio::time::timeout(Duration::from_secs(10), async {
-            let (hosts, error) = reader.list(&identity).await;
-            assert!(hosts.is_empty() && error.is_none());
+            let status = reader.list(&identity).await;
+            assert!(status.hosts.is_empty() && !status.is_incomplete());
 
             // Each new host accepts just one connection. Two reads must share
-            // that handshake and both must observe the live List responses.
+            // that handshake. The replacement is listening while the reader
+            // still holds the closed connection to the first instance.
             for incarnation in ["first", "replacement"] {
-                let (server, _sd) = super::super::pipe::bind(&pipe, &identity.sid, true).unwrap();
-                let (done, stop) = tokio::sync::oneshot::channel();
-                let host = HostInfo {
-                    kind: HostKind::Supervisor,
-                    pid: std::process::id(),
-                    started_at: incarnation.into(),
-                    protocol: PROTOCOL_VERSION,
-                    version: "test".into(),
-                    elevated: false,
-                    winfsp_version: None,
-                };
-                let serving = tokio::spawn(async move {
-                    server.connect().await.unwrap();
-                    let (read, mut write) = tokio::io::split(server);
-                    let mut lines = BufReader::new(read).lines();
-                    for i in 0..3 {
-                        let line = lines.next_line().await.unwrap().unwrap();
-                        let request = decode::<Request>(&line).unwrap();
-                        let response = if i == 0 {
-                            assert!(matches!(
-                                request,
-                                Request::Hello {
-                                    protocol: PROTOCOL_VERSION,
-                                    ..
-                                }
-                            ));
-                            Response::Hello { host: host.clone() }
-                        } else {
-                            assert!(matches!(request, Request::List));
-                            Response::Mounts {
-                                host: host.clone(),
-                                mounts: vec![],
-                            }
-                        };
-                        write.write_all(encode(&response).as_bytes()).await.unwrap();
-                    }
-                    stop.await.unwrap();
-                });
+                let (done, serving) = serve_status(
+                    &identity,
+                    &pipe,
+                    incarnation == "first",
+                    HostKind::Supervisor,
+                    incarnation,
+                    vec![Ok(()), Ok(())],
+                );
                 for _ in 0..2 {
-                    let (hosts, error) = reader.list(&identity).await;
-                    assert!(error.is_none(), "{error:?}");
-                    assert_eq!(hosts.len(), 1);
-                    assert_eq!(hosts[0].host.started_at, incarnation);
+                    let status = reader.list(&identity).await;
+                    assert!(!status.is_incomplete(), "{:?}", status.supervisor_error);
+                    assert_eq!(status.hosts.len(), 1);
+                    assert_eq!(status.hosts[0].host.started_at, incarnation);
                 }
                 done.send(()).unwrap();
                 serving.await.unwrap();
-                let (hosts, error) = reader.list(&identity).await;
-                assert!(hosts.is_empty() && error.is_none(), "{error:?}");
+                assert!(reader.pipes.contains_key(&pipe));
             }
+            let status = reader.list(&identity).await;
+            assert!(
+                status.hosts.is_empty() && !status.is_incomplete(),
+                "{:?}",
+                status.supervisor_error
+            );
+            assert!(reader.pipes.is_empty());
+        })
+        .await
+        .expect("status reader did not complete");
+    }
+
+    #[tokio::test]
+    async fn a_foreground_timeout_leaves_the_supervisor_healthy() {
+        let mut identity = Identity::current().unwrap();
+        identity.session = uuid::Uuid::new_v4().as_u128() as u32;
+        let supervisor = identity.supervisor_pipe();
+        let foreground = identity.foreground_pipe(std::process::id());
+        let timeout = ErrorInfo::new(ErrorCode::Timeout, "mount host timed out");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (done_supervisor, serving_supervisor) = serve_status(
+                &identity,
+                &supervisor,
+                true,
+                HostKind::Supervisor,
+                "supervisor",
+                vec![Ok(()), Err(timeout.clone())],
+            );
+            let (done_foreground, serving_foreground) = serve_status(
+                &identity,
+                &foreground,
+                true,
+                HostKind::Foreground,
+                "foreground",
+                vec![Err(timeout.clone())],
+            );
+            let mut reader = StatusConnections::default();
+            let status = reader.list_pipes(&identity, vec![supervisor.clone(), foreground]).await;
+            assert_eq!(status.hosts.len(), 1);
+            assert_eq!(status.hosts[0].host.kind, HostKind::Supervisor);
+            assert!(status.foreground_unavailable);
+            assert!(status.supervisor_error.is_none());
+
+            let status = reader.list_pipes(&identity, vec![supervisor]).await;
+            assert!(status.hosts.is_empty());
+            assert!(!status.foreground_unavailable);
+            assert_eq!(status.supervisor_error, Some(timeout));
+
+            done_supervisor.send(()).unwrap();
+            done_foreground.send(()).unwrap();
+            serving_supervisor.await.unwrap();
+            serving_foreground.await.unwrap();
         })
         .await
         .expect("status reader did not complete");

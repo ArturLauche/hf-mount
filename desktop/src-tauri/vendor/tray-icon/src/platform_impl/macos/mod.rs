@@ -106,7 +106,12 @@ impl TrayIcon {
     pub fn set_icon(&mut self, icon: Option<Icon>) -> crate::Result<()> {
         if let (Some(ns_status_item), Some(tray_target)) = (&self.ns_status_item, &self.tray_target)
         {
-            set_icon_for_ns_status_item_button(ns_status_item, icon.as_ref(), false, self.mtm)?;
+            set_icon_for_ns_status_item_button(
+                ns_status_item,
+                icon.as_ref(),
+                self.attrs.icon_is_template,
+                self.mtm,
+            )?;
             tray_target.update_dimensions();
         }
         self.attrs.icon = icon;

@@ -948,8 +948,7 @@ mod tests {
     #[test]
     fn passive_clients_do_not_extend_idle_lifetime() {
         let (r, _) = registry();
-        let timeout = Duration::from_secs(600);
-        lock(&r.clients).last = Instant::now() - timeout;
+        let last = lock(&r.clients).last;
         for _ in 0..10 {
             r.handle(Request::Hello {
                 protocol: PROTOCOL_VERSION,
@@ -958,7 +957,8 @@ mod tests {
             r.handle(Request::List);
             r.handle(Request::Activity { limit: 300 });
         }
-        assert_eq!(r.idle_shutdown_delay(timeout), Some(Duration::ZERO));
+        assert_eq!(lock(&r.clients).last, last);
+        assert_eq!(r.idle_shutdown_delay(Duration::ZERO), Some(Duration::ZERO));
         assert!(r.shutdown_requested());
         assert!(matches!(r.handle(mount_req("acme/late", "H:")), Response::Error { .. }));
     }
@@ -968,8 +968,11 @@ mod tests {
         let (r, _) = registry();
         let timeout = Duration::from_secs(600);
         r.handle(mount_req("acme/active", "H:"));
-        lock(&r.clients).last = Instant::now() - timeout;
-        assert_eq!(r.idle_shutdown_delay(timeout), None);
+        assert_eq!(r.idle_shutdown_delay(Duration::ZERO), None);
+        let mounted = lock(&r.clients).last;
+        // Ensure an implementation that leaves the timestamp at mount time
+        // cannot pass even on a clock with coarse resolution.
+        std::thread::sleep(Duration::from_millis(20));
         assert!(matches!(
             r.handle(Request::Unmount {
                 target: "H:".into(),
@@ -977,6 +980,7 @@ mod tests {
             }),
             Response::Unmounted { .. }
         ));
+        assert!(lock(&r.clients).last > mounted);
         assert!(r.idle_shutdown_delay(timeout).unwrap() > timeout / 2);
         assert!(!r.shutdown_requested());
     }

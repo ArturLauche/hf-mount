@@ -4,14 +4,22 @@
 
 mod icon;
 mod util;
-use std::{mem::size_of, ptr};
+use std::{
+    cell::{Cell, RefCell},
+    io,
+    mem::size_of,
+    ptr,
+    rc::Rc,
+};
 
 use once_cell::sync::Lazy;
 use windows_sys::{
     core::GUID,
     s,
     Win32::{
-        Foundation::{FALSE, HWND, LPARAM, LRESULT, POINT, RECT, S_OK, TRUE, WPARAM},
+        Foundation::{
+            GetLastError, SetLastError, HWND, LPARAM, LRESULT, POINT, RECT, S_OK, WPARAM,
+        },
         UI::{
             Shell::{
                 Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_MESSAGE,
@@ -21,11 +29,10 @@ use windows_sys::{
             WindowsAndMessaging::{
                 ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
                 GetCursorPos, KillTimer, PostMessageW, RegisterClassW, RegisterWindowMessageA,
-                SendMessageW, SetForegroundWindow, SetTimer, TrackPopupMenu, CREATESTRUCTW,
-                CW_USEDEFAULT, GWL_USERDATA, HICON, HMENU, MSGFLT_ALLOW, TPM_BOTTOMALIGN,
-                TPM_LEFTALIGN, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+                SetForegroundWindow, SetTimer, TrackPopupMenu, CW_USEDEFAULT, GWL_USERDATA, HMENU,
+                MSGFLT_ALLOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
                 WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-                WM_NCCREATE, WM_NULL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+                WM_NCDESTROY, WM_NULL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
                 WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
                 WS_OVERLAPPED,
             },
@@ -41,13 +48,10 @@ use crate::{
 pub(crate) use self::icon::WinIcon as PlatformIcon;
 
 const WM_USER_TRAYICON: u32 = 6002;
-const WM_USER_UPDATE_TRAYMENU: u32 = 6003;
-const WM_USER_UPDATE_TRAYICON: u32 = 6004;
-const WM_USER_SHOW_TRAYICON: u32 = 6005;
-const WM_USER_UPDATE_TRAYTOOLTIP: u32 = 6006;
-const WM_USER_LEAVE_TIMER_ID: u32 = 6007;
-const WM_USER_SHOW_MENU_ON_LEFT_CLICK: u32 = 6008;
-const WM_USER_SHOW_MENU_ON_RIGHT_CLICK: u32 = 6009;
+const LEAVE_TIMER_ID: usize = 6007;
+const REGISTER_TIMER_ID: usize = 6010;
+const INITIAL_REGISTER_RETRY_MS: u32 = 1_000;
+const MAX_REGISTER_RETRY_MS: u32 = 30_000;
 /// When the taskbar is created, it registers a message with the "TaskbarCreated" string and then broadcasts this message to all top-level windows
 /// When the application receives this message, it should assume that any taskbar icons it added have been removed and add them again.
 static S_U_TASKBAR_RESTART: Lazy<u32> =
@@ -57,39 +61,113 @@ struct TrayUserData {
     internal_id: u32,
     guid: Option<GUID>,
     id: TrayIconId,
-    hwnd: HWND,
-    hpopupmenu: Option<HMENU>,
-    icon: Option<Icon>,
-    tooltip: Option<String>,
-    entered: bool,
-    last_position: Option<PhysicalPosition<f64>>,
-    menu_on_left_click: bool,
-    menu_on_right_click: bool,
-    visible: bool,
+    hpopupmenu: Cell<Option<HMENU>>,
+    icon: RefCell<Option<Icon>>,
+    tooltip: RefCell<Option<String>>,
+    last_position: Cell<Option<PhysicalPosition<f64>>>,
+    menu_on_left_click: Cell<bool>,
+    menu_on_right_click: Cell<bool>,
+    visible: Cell<bool>,
+    next_retry_ms: Cell<u32>,
 }
 
 impl TrayUserData {
-    fn set_tray_visible(&mut self, visible: bool) {
-        self.visible = visible;
+    fn is_attached(&self, hwnd: HWND) -> bool {
+        unsafe { util::get_window_long(hwnd, GWL_USERDATA) == self as *const Self as isize }
+    }
+
+    fn notification(&self, hwnd: HWND, flags: u32) -> NOTIFYICONDATAW {
         let mut nid = NOTIFYICONDATAW {
-            uFlags: NIF_STATE,
-            hWnd: self.hwnd,
+            uFlags: flags,
+            hWnd: hwnd,
             uID: self.internal_id,
-            dwState: if visible { 0 } else { NIS_HIDDEN },
-            dwStateMask: NIS_HIDDEN,
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             ..Default::default()
         };
         apply_guid(&mut nid, self.guid);
-        unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+        nid
+    }
+
+    fn cancel_registration_retry(&self, hwnd: HWND) {
+        if self.next_retry_ms.replace(0) != 0 {
+            unsafe { KillTimer(hwnd, REGISTER_TIMER_ID) };
+        }
+    }
+
+    fn hover_event(
+        &self,
+        hwnd: HWND,
+        rect: Rect,
+        position: PhysicalPosition<f64>,
+    ) -> Option<TrayIconEvent> {
+        match self.last_position.get() {
+            Some(last) if last == position => None,
+            Some(_) => {
+                self.last_position.set(Some(position));
+                Some(TrayIconEvent::Move {
+                    id: self.id.clone(),
+                    rect,
+                    position,
+                })
+            }
+            None => {
+                // A single mouse move must be followed by a leave check so
+                // the next visit sends Enter again.
+                if unsafe { SetTimer(hwnd, LEAVE_TIMER_ID, 15, None) } != 0 {
+                    self.last_position.set(Some(position));
+                }
+                Some(TrayIconEvent::Enter {
+                    id: self.id.clone(),
+                    rect,
+                    position,
+                })
+            }
+        }
+    }
+
+    fn register_or_retry(&self, hwnd: HWND) -> crate::Result<()> {
+        let mut nid = self.notification(hwnd, NIF_MESSAGE | NIF_STATE);
+        nid.uCallbackMessage = WM_USER_TRAYICON;
+        nid.dwState = if self.visible.get() { 0 } else { NIS_HIDDEN };
+        nid.dwStateMask = NIS_HIDDEN;
+        // Hold the icon handle alive without retaining a RefCell borrow when
+        // the shell call can reenter this window's procedure.
+        let icon = self.icon.borrow().clone();
+        if let Some(icon) = &icon {
+            nid.uFlags |= NIF_ICON;
+            nid.hIcon = icon.inner.as_raw_handle();
+        }
+        if let Some(tooltip) = self.tooltip.borrow().as_deref() {
+            nid.uFlags |= NIF_TIP;
+            nid.szTip = encode_tooltip(tooltip);
+        }
+        let registered = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) } != 0;
+        self.update_registration_retry(hwnd, registered)
+    }
+
+    fn update_registration_retry(&self, hwnd: HWND, registered: bool) -> crate::Result<()> {
+        if registered {
+            self.cancel_registration_retry(hwnd);
+            return Ok(());
+        }
+        // Explorer may still be starting. Only poll for an absent icon;
+        // success stops the timer, including after TaskbarCreated.
+        let delay = self.next_retry_ms.get().max(INITIAL_REGISTER_RETRY_MS);
+        if unsafe { SetTimer(hwnd, REGISTER_TIMER_ID, delay, None) } == 0 {
+            let error = io::Error::last_os_error();
+            self.cancel_registration_retry(hwnd);
+            return Err(error.into());
+        }
+        self.next_retry_ms
+            .set((delay * 2).min(MAX_REGISTER_RETRY_MS));
+        Ok(())
     }
 }
 
 pub struct TrayIcon {
     hwnd: HWND,
     menu: Option<Box<dyn menu::ContextMenu>>,
-    internal_id: u32,
-    guid: Option<GUID>,
+    data: Rc<TrayUserData>,
 }
 
 impl TrayIcon {
@@ -109,21 +187,6 @@ impl TrayIcon {
             };
 
             RegisterClassW(&wnd_class);
-
-            let traydata = TrayUserData {
-                id,
-                internal_id,
-                guid,
-                hwnd: std::ptr::null_mut(),
-                hpopupmenu: attrs.menu.as_ref().map(|m| m.hpopupmenu() as _),
-                icon: attrs.icon.clone(),
-                tooltip: attrs.tooltip.clone(),
-                entered: false,
-                last_position: None,
-                menu_on_left_click: attrs.menu_on_left_click,
-                menu_on_right_click: attrs.menu_on_right_click,
-                visible: true,
-            };
 
             let hwnd = CreateWindowExW(
                 WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED |
@@ -145,63 +208,64 @@ impl TrayIcon {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 hinstance,
-                Box::into_raw(Box::new(traydata)) as _,
+                ptr::null(),
             );
             if hwnd.is_null() {
-                return Err(crate::Error::OsError(std::io::Error::last_os_error()));
+                return Err(io::Error::last_os_error().into());
+            }
+
+            let data = Rc::new(TrayUserData {
+                id,
+                internal_id,
+                guid,
+                hpopupmenu: Cell::new(attrs.menu.as_ref().map(|m| m.hpopupmenu() as _)),
+                icon: RefCell::new(attrs.icon),
+                tooltip: RefCell::new(attrs.tooltip),
+                last_position: Cell::new(None),
+                menu_on_left_click: Cell::new(attrs.menu_on_left_click),
+                menu_on_right_click: Cell::new(attrs.menu_on_right_click),
+                visible: Cell::new(true),
+                next_retry_ms: Cell::new(0),
+            });
+            // Attach a reference only after CreateWindowExW succeeds. Both
+            // the tray and its HWND use this state on their owning UI thread.
+            let window_data = Rc::into_raw(data.clone());
+            SetLastError(0);
+            if util::set_window_long(hwnd, GWL_USERDATA, window_data as isize) == 0
+                && GetLastError() != 0
+            {
+                let error = io::Error::last_os_error();
+                drop(Rc::from_raw(window_data));
+                DestroyWindow(hwnd);
+                return Err(error.into());
             }
 
             // Allow "TaskbarCreated" through UIPI so elevated apps can re-register on explorer restart.
             ChangeWindowMessageFilterEx(hwnd, *S_U_TASKBAR_RESTART, MSGFLT_ALLOW, ptr::null_mut());
 
-            let hicon = attrs.icon.as_ref().map(|i| i.inner.as_raw_handle());
-
-            if !register_tray_icon(hwnd, internal_id, guid, &hicon, &attrs.tooltip, true) {
-                // Explorer/taskbar may not be ready yet (e.g., app starts before explorer.exe).
-                // Keep the window alive and wait for TaskbarCreated to re-register.
-            }
-
             if let Some(menu) = &attrs.menu {
                 menu.attach_menu_subclass_for_hwnd(hwnd as _);
             }
 
-            Ok(Self {
+            let tray = Self {
                 hwnd,
-                internal_id,
-                guid,
+                data,
                 menu: attrs.menu,
-            })
+            };
+            tray.data.register_or_retry(hwnd)?;
+            Ok(tray)
         }
     }
 
     pub fn set_icon(&mut self, icon: Option<Icon>) -> crate::Result<()> {
-        unsafe {
-            let mut nid = NOTIFYICONDATAW {
-                uFlags: NIF_ICON,
-                hWnd: self.hwnd,
-                uID: self.internal_id,
-                cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-                ..std::mem::zeroed()
-            };
-
-            if let Some(hicon) = icon.as_ref().map(|i| i.inner.as_raw_handle()) {
-                nid.hIcon = hicon;
-            }
-            apply_guid(&mut nid, self.guid);
-
-            if Shell_NotifyIconW(NIM_MODIFY, &nid) == 0 {
-                return Err(crate::Error::OsError(std::io::Error::last_os_error()));
-            }
-
-            // send the new icon to the subclass proc to store it in the tray data
-            SendMessageW(
-                self.hwnd,
-                WM_USER_UPDATE_TRAYICON,
-                Box::into_raw(Box::new(icon)) as _,
-                0,
-            );
+        let mut nid = self.data.notification(self.hwnd, NIF_ICON);
+        if let Some(icon) = &icon {
+            nid.hIcon = icon.inner.as_raw_handle();
         }
-
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) } == 0 {
+            return Err(io::Error::other("Windows rejected the tray icon update").into());
+        }
+        self.data.icon.replace(icon);
         Ok(())
     }
 
@@ -214,79 +278,40 @@ impl TrayIcon {
             unsafe { menu.attach_menu_subclass_for_hwnd(self.hwnd as _) };
         }
 
-        unsafe {
-            // send the new menu to the subclass proc where we will update there
-            SendMessageW(
-                self.hwnd,
-                WM_USER_UPDATE_TRAYMENU,
-                Box::into_raw(Box::new(menu.as_ref().map(|m| m.hpopupmenu()))) as _,
-                0,
-            );
-        }
-
+        self.data
+            .hpopupmenu
+            .set(menu.as_ref().map(|m| m.hpopupmenu() as _));
         self.menu = menu;
     }
 
     pub fn set_tooltip<S: AsRef<str>>(&mut self, tooltip: Option<S>) -> crate::Result<()> {
-        unsafe {
-            let mut nid = NOTIFYICONDATAW {
-                uFlags: NIF_TIP,
-                hWnd: self.hwnd,
-                uID: self.internal_id,
-                cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-                ..std::mem::zeroed()
-            };
-            if let Some(tooltip) = &tooltip {
-                let tip = util::encode_wide(tooltip.as_ref());
-                #[allow(clippy::manual_memcpy)]
-                for i in 0..tip.len().min(128) {
-                    nid.szTip[i] = tip[i];
-                }
-            }
-
-            if Shell_NotifyIconW(NIM_MODIFY, &nid) == 0 {
-                return Err(crate::Error::OsError(std::io::Error::last_os_error()));
-            }
-
-            // send the new tooltip to the subclass proc to store it in the tray data
-            SendMessageW(
-                self.hwnd,
-                WM_USER_UPDATE_TRAYTOOLTIP,
-                Box::into_raw(Box::new(tooltip.map(|t| t.as_ref().to_string()))) as _,
-                0,
-            );
+        let mut nid = self.data.notification(self.hwnd, NIF_TIP);
+        if let Some(tooltip) = &tooltip {
+            nid.szTip = encode_tooltip(tooltip.as_ref());
         }
-
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) } == 0 {
+            return Err(io::Error::other("Windows rejected the tray tooltip update").into());
+        }
+        self.data
+            .tooltip
+            .replace(tooltip.map(|t| t.as_ref().to_owned()));
         Ok(())
     }
 
     pub fn set_show_menu_on_left_click(&mut self, enable: bool) {
-        unsafe {
-            SendMessageW(
-                self.hwnd,
-                WM_USER_SHOW_MENU_ON_LEFT_CLICK,
-                enable as usize,
-                0,
-            );
-        }
+        self.data.menu_on_left_click.set(enable);
     }
 
     pub fn set_show_menu_on_right_click(&mut self, enable: bool) {
-        unsafe {
-            SendMessageW(
-                self.hwnd,
-                WM_USER_SHOW_MENU_ON_RIGHT_CLICK,
-                enable as usize,
-                0,
-            );
-        }
+        self.data.menu_on_right_click.set(enable);
     }
 
     pub fn show_menu(&self) {
         if let Some(menu) = &self.menu {
             unsafe {
-                if let Some(rect) = get_tray_rect(self.internal_id, self.guid, self.hwnd) {
-                    show_tray_menu(self.hwnd, menu.hpopupmenu() as _, rect.left, rect.top);
+                let mut cursor = POINT::default();
+                if GetCursorPos(&mut cursor) != 0 {
+                    show_tray_menu(self.hwnd, menu.hpopupmenu() as _, cursor.x, cursor.y);
                 }
             }
         }
@@ -295,14 +320,19 @@ impl TrayIcon {
     pub fn set_title<S: AsRef<str>>(&mut self, _title: Option<S>) {}
 
     pub fn set_visible(&mut self, visible: bool) -> crate::Result<()> {
-        unsafe {
-            SendMessageW(self.hwnd, WM_USER_SHOW_TRAYICON, visible as usize, 0);
+        // Keep the desired state for registration after an Explorer restart.
+        self.data.visible.set(visible);
+        let mut nid = self.data.notification(self.hwnd, NIF_STATE);
+        nid.dwState = if visible { 0 } else { NIS_HIDDEN };
+        nid.dwStateMask = NIS_HIDDEN;
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) } == 0 {
+            return Err(io::Error::other("Windows rejected the tray visibility change").into());
         }
         Ok(())
     }
 
     pub fn rect(&self) -> Option<Rect> {
-        get_tray_rect(self.internal_id, self.guid, self.hwnd).map(Into::into)
+        get_tray_rect(self.data.internal_id, self.data.guid, self.hwnd).map(Into::into)
     }
 
     pub fn hwnd(&self) -> HWND {
@@ -312,8 +342,12 @@ impl TrayIcon {
 
 impl Drop for TrayIcon {
     fn drop(&mut self) {
+        if !self.data.is_attached(self.hwnd) {
+            return;
+        }
         unsafe {
-            remove_tray_icon(self.hwnd, self.internal_id, self.guid);
+            release_window_data(self.hwnd);
+            Shell_NotifyIconW(NIM_DELETE, &self.data.notification(self.hwnd, 0));
 
             if let Some(menu) = &self.menu {
                 menu.detach_menu_subclass_from_hwnd(self.hwnd as _);
@@ -325,65 +359,49 @@ impl Drop for TrayIcon {
     }
 }
 
+/// The HWND slot owns one reference between attachment and destruction.
+unsafe fn release_window_data(hwnd: HWND) {
+    let data = util::set_window_long(hwnd, GWL_USERDATA, 0) as *const TrayUserData;
+    if !data.is_null() {
+        drop(Rc::from_raw(data));
+    }
+}
+
 unsafe extern "system" fn tray_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let userdata_ptr = unsafe { util::get_window_long(hwnd, GWL_USERDATA) };
-    let userdata_ptr = match (userdata_ptr, msg) {
-        (0, WM_NCCREATE) => {
-            let createstruct = unsafe { &mut *(lparam as *mut CREATESTRUCTW) };
-            let userdata = unsafe { &mut *(createstruct.lpCreateParams as *mut TrayUserData) };
-            userdata.hwnd = hwnd;
-            util::set_window_long(hwnd, GWL_USERDATA, createstruct.lpCreateParams as _);
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
-        }
-        // Getting here should quite frankly be impossible,
-        // but we'll make window creation fail here just in case.
-        (0, WM_CREATE) => return -1,
-        (_, WM_CREATE) => return DefWindowProcW(hwnd, msg, wparam, lparam),
-        (0, _) => return DefWindowProcW(hwnd, msg, wparam, lparam),
-        _ => userdata_ptr as *mut TrayUserData,
-    };
+    if msg == WM_NCDESTROY {
+        release_window_data(hwnd);
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let data = util::get_window_long(hwnd, GWL_USERDATA) as *const TrayUserData;
+    if data.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
 
-    let userdata = &mut *(userdata_ptr);
-
+    // Keep the state alive if an event handler closes the tray within this
+    // call. Event dispatch does not hold any of the RefCell borrows.
+    Rc::increment_strong_count(data);
+    let userdata = Rc::from_raw(data);
     match msg {
-        WM_DESTROY => {
-            drop(Box::from_raw(userdata_ptr));
+        _ if msg == *S_U_TASKBAR_RESTART => {
+            Shell_NotifyIconW(NIM_DELETE, &userdata.notification(hwnd, 0));
+            userdata.cancel_registration_retry(hwnd);
+            if let Err(error) = userdata.register_or_retry(hwnd) {
+                eprintln!("could not schedule restoring the system tray icon: {error}");
+            }
             return 0;
         }
-        WM_USER_UPDATE_TRAYMENU => {
-            let hpopupmenu = Box::from_raw(wparam as *mut Option<isize>);
-            userdata.hpopupmenu = (*hpopupmenu).map(|h| h as *mut _);
-        }
-        WM_USER_UPDATE_TRAYICON => {
-            let icon = Box::from_raw(wparam as *mut Option<Icon>);
-            userdata.icon = *icon;
-        }
-        WM_USER_SHOW_TRAYICON => userdata.set_tray_visible(wparam as i32 == TRUE),
-        WM_USER_UPDATE_TRAYTOOLTIP => {
-            let tooltip = Box::from_raw(wparam as *mut Option<String>);
-            userdata.tooltip = *tooltip;
-        }
-        _ if msg == *S_U_TASKBAR_RESTART => {
-            remove_tray_icon(userdata.hwnd, userdata.internal_id, userdata.guid);
-            register_tray_icon(
-                userdata.hwnd,
-                userdata.internal_id,
-                userdata.guid,
-                &userdata.icon.as_ref().map(|i| i.inner.as_raw_handle()),
-                &userdata.tooltip,
-                userdata.visible,
-            );
-        }
-        WM_USER_SHOW_MENU_ON_LEFT_CLICK => {
-            userdata.menu_on_left_click = wparam != 0;
-        }
-        WM_USER_SHOW_MENU_ON_RIGHT_CLICK => {
-            userdata.menu_on_right_click = wparam != 0;
+        WM_TIMER if wparam == REGISTER_TIMER_ID => {
+            if userdata.next_retry_ms.get() != 0 {
+                if let Err(error) = userdata.register_or_retry(hwnd) {
+                    eprintln!("could not reschedule restoring the system tray icon: {error}");
+                }
+            }
+            return 0;
         }
 
         WM_USER_TRAYICON
@@ -406,14 +424,20 @@ unsafe extern "system" fn tray_proc(
                 return 0;
             }
 
-            let id = userdata.id.clone();
             let position = PhysicalPosition::new(cursor.x as f64, cursor.y as f64);
 
             let rect = match get_tray_rect(userdata.internal_id, userdata.guid, hwnd) {
                 Some(rect) => Rect::from(rect),
                 None => return 0,
             };
+            if lparam as u32 == WM_MOUSEMOVE {
+                if let Some(event) = userdata.hover_event(hwnd, rect, position) {
+                    TrayIconEvent::send(event);
+                }
+                return 0;
+            }
 
+            let id = userdata.id.clone();
             let event = match lparam as u32 {
                 WM_LBUTTONDOWN => TrayIconEvent::Click {
                     id,
@@ -475,42 +499,25 @@ unsafe extern "system" fn tray_proc(
                     position,
                     button: MouseButton::Middle,
                 },
-                WM_MOUSEMOVE if !userdata.entered => {
-                    userdata.entered = true;
-                    TrayIconEvent::Enter { id, rect, position }
-                }
-                WM_MOUSEMOVE if userdata.entered => {
-                    // handle extra WM_MOUSEMOVE events, ignore if position hasn't changed
-                    let cursor_moved = userdata.last_position != Some(position);
-                    userdata.last_position = Some(position);
-                    if cursor_moved {
-                        // Set or update existing timer, where we check if cursor left
-                        SetTimer(hwnd, WM_USER_LEAVE_TIMER_ID as _, 15, Some(tray_timer_proc));
-
-                        TrayIconEvent::Move { id, rect, position }
-                    } else {
-                        return 0;
-                    }
-                }
-
                 _ => unreachable!(),
             };
 
             TrayIconEvent::send(event);
 
-            if (userdata.menu_on_right_click && lparam as u32 == WM_RBUTTONUP)
-                || (userdata.menu_on_left_click && lparam as u32 == WM_LBUTTONUP)
-            {
-                if let Some(menu) = userdata.hpopupmenu {
+            let show_menu = match lparam as u32 {
+                WM_RBUTTONUP => userdata.menu_on_right_click.get(),
+                WM_LBUTTONUP => userdata.menu_on_left_click.get(),
+                _ => false,
+            };
+            if show_menu && userdata.is_attached(hwnd) {
+                if let Some(menu) = userdata.hpopupmenu.get() {
                     show_tray_menu(hwnd, menu, cursor.x, cursor.y);
                 }
             }
         }
 
-        WM_TIMER if wparam as u32 == WM_USER_LEAVE_TIMER_ID => {
-            let Some(position) = userdata.last_position else {
-                KillTimer(hwnd, WM_USER_LEAVE_TIMER_ID as _);
-                userdata.entered = false;
+        WM_TIMER if wparam == LEAVE_TIMER_ID => {
+            let Some(position) = userdata.last_position.get() else {
                 return 0;
             };
 
@@ -529,9 +536,8 @@ unsafe extern "system" fn tray_proc(
                 });
 
             if !inside {
-                KillTimer(hwnd, WM_USER_LEAVE_TIMER_ID as _);
-                userdata.entered = false;
-                userdata.last_position = None;
+                KillTimer(hwnd, LEAVE_TIMER_ID);
+                userdata.last_position.set(None);
 
                 TrayIconEvent::send(TrayIconEvent::Leave {
                     id: userdata.id.clone(),
@@ -547,10 +553,6 @@ unsafe extern "system" fn tray_proc(
     }
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-unsafe extern "system" fn tray_timer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: u32) {
-    tray_proc(hwnd, msg, wparam, lparam as _);
 }
 
 #[inline]
@@ -573,71 +575,87 @@ unsafe fn show_tray_menu(hwnd: HWND, menu: HMENU, x: i32, y: i32) {
     PostMessageW(hwnd, WM_NULL, 0, 0);
 }
 
-#[inline]
-unsafe fn register_tray_icon(
-    hwnd: HWND,
-    tray_id: u32,
-    guid: Option<GUID>,
-    hicon: &Option<HICON>,
-    tooltip: &Option<String>,
-    visible: bool,
-) -> bool {
-    let mut h_icon = std::ptr::null_mut();
-    let mut flags = NIF_MESSAGE;
-    let mut sz_tip: [u16; 128] = [0; 128];
-
-    if let Some(hicon) = hicon {
-        flags |= NIF_ICON;
-        h_icon = *hicon;
-    }
-
-    if let Some(tooltip) = tooltip {
-        flags |= NIF_TIP;
-        let tip = util::encode_wide(tooltip);
-        #[allow(clippy::manual_memcpy)]
-        for i in 0..tip.len().min(128) {
-            sz_tip[i] = tip[i];
+fn encode_tooltip(tooltip: &str) -> [u16; 128] {
+    let mut encoded = [0; 128];
+    let mut offset = 0;
+    for ch in tooltip.chars() {
+        let end = offset + ch.len_utf16();
+        if ch == '\0' || end >= encoded.len() {
+            break;
         }
+        ch.encode_utf16(&mut encoded[offset..end]);
+        offset = end;
     }
-
-    #[allow(non_snake_case)]
-    let dwState = if !visible {
-        flags |= NIF_STATE;
-        NIS_HIDDEN
-    } else {
-        0
-    };
-
-    let mut nid = NOTIFYICONDATAW {
-        uFlags: flags,
-        hWnd: hwnd,
-        uID: tray_id,
-        uCallbackMessage: WM_USER_TRAYICON,
-        hIcon: h_icon,
-        szTip: sz_tip,
-        dwState,
-        dwStateMask: dwState,
-        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-        ..std::mem::zeroed()
-    };
-    apply_guid(&mut nid, guid);
-
-    Shell_NotifyIconW(NIM_ADD, &mut nid as _) == TRUE
+    encoded
 }
 
-#[inline]
-unsafe fn remove_tray_icon(hwnd: HWND, id: u32, guid: Option<GUID>) {
-    let mut nid = NOTIFYICONDATAW {
-        uFlags: NIF_ICON,
-        hWnd: hwnd,
-        uID: id,
-        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-        ..std::mem::zeroed()
-    };
-    apply_guid(&mut nid, guid);
+#[test]
+fn tooltip_reserves_terminator_without_splitting_surrogates() {
+    let ascii = encode_tooltip(&"a".repeat(128));
+    assert_eq!(&ascii[..127], &[b'a' as u16; 127]);
+    assert_eq!(ascii[127], 0);
 
-    if Shell_NotifyIconW(NIM_DELETE, &nid) == FALSE {
-        eprintln!("Error removing system tray icon");
+    let fits = format!("{}😀", "a".repeat(125));
+    let encoded = encode_tooltip(&fits);
+    assert_eq!(String::from_utf16(&encoded[..127]).unwrap(), fits);
+    assert_eq!(encoded[127], 0);
+
+    let truncated = encode_tooltip(&format!("{}😀", "a".repeat(126)));
+    assert_eq!(truncated[126..], [0, 0]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    #[test]
+    fn first_hover_arms_leave_tracking_and_extra_motion_is_ignored() {
+        let tray = TrayIcon::new(TrayIconId::new_unique(), TrayIconAttributes::default()).unwrap();
+        let rect = Rect::default();
+        let position = PhysicalPosition::new(100.0, 100.0);
+        assert!(matches!(
+            tray.data.hover_event(tray.hwnd, rect, position),
+            Some(TrayIconEvent::Enter { .. })
+        ));
+        assert!(tray.data.hover_event(tray.hwnd, rect, position).is_none());
+        // KillTimer only succeeds if the first event really armed the timer.
+        assert_ne!(unsafe { KillTimer(tray.hwnd, LEAVE_TIMER_ID) }, 0);
+    }
+
+    #[test]
+    fn failed_registration_backs_off_and_success_stops_the_timer() {
+        let tray = TrayIcon::new(TrayIconId::new_unique(), TrayIconAttributes::default()).unwrap();
+        let (data, hwnd) = (&tray.data, tray.hwnd);
+        data.cancel_registration_retry(hwnd);
+        data.update_registration_retry(hwnd, false).unwrap();
+        assert_eq!(data.next_retry_ms.get(), INITIAL_REGISTER_RETRY_MS * 2);
+        assert_ne!(unsafe { KillTimer(hwnd, REGISTER_TIMER_ID) }, 0);
+        for _ in 0..6 {
+            data.update_registration_retry(hwnd, false).unwrap();
+        }
+        assert_eq!(data.next_retry_ms.get(), MAX_REGISTER_RETRY_MS);
+        data.update_registration_retry(hwnd, true).unwrap();
+        assert_eq!(data.next_retry_ms.get(), 0);
+        assert_eq!(unsafe { KillTimer(hwnd, REGISTER_TIMER_ID) }, 0);
+    }
+
+    #[test]
+    fn destroying_the_tray_window_releases_its_state() {
+        for destroy_first in [false, true] {
+            let tray =
+                TrayIcon::new(TrayIconId::new_unique(), TrayIconAttributes::default()).unwrap();
+            let hwnd = tray.hwnd;
+            let data = Rc::downgrade(&tray.data);
+            assert_eq!(Rc::strong_count(&tray.data), 2);
+            if destroy_first {
+                assert_ne!(unsafe { DestroyWindow(hwnd) }, 0);
+                assert_eq!(Rc::strong_count(&tray.data), 1);
+            }
+            drop(tray);
+            assert!(data.upgrade().is_none());
+            assert_eq!(unsafe { IsWindow(hwnd) }, 0);
+        }
     }
 }
 

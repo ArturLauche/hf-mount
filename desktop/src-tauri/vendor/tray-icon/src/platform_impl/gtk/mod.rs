@@ -15,7 +15,7 @@ pub struct TrayIcon {
     id: TrayIconId,
     indicator: AppIndicator,
     temp_dir_path: Option<PathBuf>,
-    path: PathBuf,
+    path: Option<PathBuf>,
     counter: u32,
     menu: Option<Box<dyn muda::ContextMenu>>,
 }
@@ -23,16 +23,6 @@ pub struct TrayIcon {
 impl TrayIcon {
     pub fn new(id: TrayIconId, attrs: TrayIconAttributes) -> crate::Result<Self> {
         let mut indicator = AppIndicator::new(&format!("tray-icon tray app {}", id.as_ref()), "");
-        indicator.set_status(AppIndicatorStatus::Active);
-
-        let (parent_path, icon_path) = temp_icon_path(attrs.temp_dir_path.as_ref(), &id, 0)?;
-
-        if let Some(icon) = attrs.icon {
-            icon.inner.write_to_png(&icon_path)?;
-        }
-
-        indicator.set_icon_theme_path(&parent_path.to_string_lossy());
-        indicator.set_icon_full(&icon_path.to_string_lossy(), "icon");
 
         if let Some(menu) = &attrs.menu {
             indicator.set_menu(&mut menu.gtk_context_menu());
@@ -42,33 +32,37 @@ impl TrayIcon {
             indicator.set_label(title.as_str(), "");
         }
 
-        Ok(Self {
+        let mut tray = Self {
             id,
             indicator,
-            path: icon_path,
+            path: None,
             temp_dir_path: attrs.temp_dir_path,
             counter: 0,
             menu: attrs.menu,
-        })
+        };
+        tray.set_icon(attrs.icon)?;
+        tray.indicator.set_status(AppIndicatorStatus::Active);
+        Ok(tray)
     }
     pub fn set_icon(&mut self, icon: Option<Icon>) -> crate::Result<()> {
-        let _ = std::fs::remove_file(&self.path);
-
-        self.counter += 1;
-
-        let (parent_path, icon_path) =
-            temp_icon_path(self.temp_dir_path.as_ref(), &self.id, self.counter)?;
-
-        if let Some(icon) = icon {
+        let path = if let Some(icon) = icon {
+            let counter = self.counter.wrapping_add(1);
+            let (parent_path, icon_path) =
+                temp_icon_path(self.temp_dir_path.as_deref(), &self.id, counter)?;
             icon.inner.write_to_png(&icon_path)?;
+            self.indicator
+                .set_icon_theme_path(&parent_path.to_string_lossy());
+            self.indicator
+                .set_icon_full(&icon_path.to_string_lossy(), "tray icon");
+            self.counter = counter;
+            Some(icon_path)
+        } else {
+            self.indicator.set_icon_full("", "tray icon");
+            None
+        };
+        if let Some(previous) = std::mem::replace(&mut self.path, path) {
+            let _ = std::fs::remove_file(previous);
         }
-
-        self.indicator
-            .set_icon_theme_path(&parent_path.to_string_lossy());
-        self.indicator
-            .set_icon_full(&icon_path.to_string_lossy(), "tray icon");
-        self.path = icon_path;
-
         Ok(())
     }
 
@@ -114,46 +108,53 @@ impl TrayIcon {
 impl Drop for TrayIcon {
     fn drop(&mut self) {
         self.indicator.set_status(AppIndicatorStatus::Passive);
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
 /// Generates an icon path in one of the following dirs:
 /// 1. If `temp_icon_dir` is `Some` use that.
 /// 2. `$XDG_RUNTIME_DIR/tray-icon`
-/// 3. `/tmp/tray-icon`
+/// 3. The system temporary directory joined with `tray-icon`
 fn temp_icon_path(
-    temp_icon_dir: Option<&PathBuf>,
+    temp_icon_dir: Option<&Path>,
     id: &TrayIconId,
     counter: u32,
 ) -> std::io::Result<(PathBuf, PathBuf)> {
-    let parent_path = match temp_icon_dir.as_ref() {
-        Some(path) => path.to_path_buf(),
-        None => dirs::runtime_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("tray-icon"),
-    };
+    let parent_path = icon_dir(temp_icon_dir, dirs::runtime_dir, std::env::temp_dir);
 
     std::fs::create_dir_all(&parent_path)?;
     let icon_path = parent_path.join(format!("tray-icon-{}-{}.png", id.as_ref(), counter));
     Ok((parent_path, icon_path))
 }
 
+fn icon_dir(
+    override_dir: Option<&Path>,
+    runtime_dir: impl FnOnce() -> Option<PathBuf>,
+    temp_dir: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    override_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| runtime_dir().unwrap_or_else(temp_dir).join("tray-icon"))
+}
+
 #[test]
 fn temp_icon_path_preference_order() {
-    let runtime_dir = option_env!("XDG_RUNTIME_DIR");
-    let override_dir = PathBuf::from("/tmp/tao-tests");
-
-    let (dir1, _file1) = temp_icon_path(Some(&override_dir), &"00".into(), 00).unwrap();
-    let (dir2, _file1) = temp_icon_path(None, &"00".into(), 00).unwrap();
-    std::env::remove_var("XDG_RUNTIME_DIR");
-    let (dir3, _file2) = temp_icon_path(None, &"00".into(), 00).unwrap();
-
-    assert_eq!(dir1, override_dir);
-    if let Some(runtime_dir) = runtime_dir {
-        std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
-        assert_eq!(dir2, PathBuf::from(format!("{}/tray-icon", runtime_dir)));
-    }
-
-    assert_eq!(dir3, PathBuf::from("/tmp/tray-icon"));
+    let override_dir = Path::new("/override");
+    let runtime_dir = || Some(PathBuf::from("/runtime"));
+    let temp_dir = || PathBuf::from("/temp");
+    assert_eq!(
+        icon_dir(Some(override_dir), runtime_dir, temp_dir),
+        override_dir
+    );
+    assert_eq!(
+        icon_dir(None, runtime_dir, temp_dir),
+        Path::new("/runtime/tray-icon")
+    );
+    assert_eq!(
+        icon_dir(None, || None, temp_dir),
+        Path::new("/temp/tray-icon")
+    );
 }

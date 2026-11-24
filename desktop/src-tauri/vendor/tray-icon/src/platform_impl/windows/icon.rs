@@ -4,7 +4,7 @@
 
 // taken from https://github.com/rust-windowing/winit/blob/92fdf5ba85f920262a61cee4590f4a11ad5738d1/src/platform_impl/windows/icon.rs
 
-use std::{fmt, io, mem, path::Path, sync::Arc};
+use std::{fmt, io, path::Path, sync::Arc};
 
 use windows_sys::{
     core::PCWSTR,
@@ -17,24 +17,20 @@ use crate::icon::*;
 
 use super::util;
 
-impl Pixel {
-    fn convert_to_bgra(&mut self) {
-        mem::swap(&mut self.r, &mut self.b);
-    }
-}
-
 impl RgbaIcon {
     fn into_windows_icon(self) -> Result<WinIcon, BadIcon> {
-        let rgba = self.rgba;
-        let pixel_count = rgba.len() / PIXEL_SIZE;
-        let mut and_mask = Vec::with_capacity(pixel_count);
-        let pixels =
-            unsafe { std::slice::from_raw_parts_mut(rgba.as_ptr() as *mut Pixel, pixel_count) };
-        for pixel in pixels {
-            and_mask.push(pixel.a.wrapping_sub(u8::MAX)); // invert alpha channel
-            pixel.convert_to_bgra();
+        if self.width == 0
+            || self.height == 0
+            || self.width > i32::MAX as u32
+            || self.height > i32::MAX as u32
+        {
+            return Err(BadIcon::OsError(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "icon dimensions must be positive 32-bit integers",
+            )));
         }
-        assert_eq!(and_mask.len(), pixel_count);
+        let mut rgba = self.rgba;
+        let and_mask = prepare_pixels(&mut rgba, self.width as usize);
         let handle = unsafe {
             CreateIcon(
                 std::ptr::null_mut(),
@@ -52,6 +48,41 @@ impl RgbaIcon {
             Err(BadIcon::OsError(io::Error::last_os_error()))
         }
     }
+}
+
+fn prepare_pixels(rgba: &mut [u8], width: usize) -> Vec<u8> {
+    // CreateIcon takes a monochrome AND mask with word-aligned scanlines.
+    let stride = width.div_ceil(16) * 2;
+    let row_bytes = width * PIXEL_SIZE;
+    let mut and_mask = vec![0; (rgba.len() / row_bytes) * stride];
+    for (row, mask) in rgba
+        .chunks_exact_mut(row_bytes)
+        .zip(and_mask.chunks_exact_mut(stride))
+    {
+        let (pixels, _) = row.as_chunks_mut::<PIXEL_SIZE>();
+        for (x, pixel) in pixels.iter_mut().enumerate() {
+            if pixel[3] == 0 {
+                mask[x / 8] |= 0x80 >> (x % 8);
+            }
+            pixel.swap(0, 2); // RGBA to BGRA
+        }
+    }
+    and_mask
+}
+
+#[test]
+fn monochrome_mask_packs_each_row_and_preserves_color_alpha() {
+    assert_eq!(prepare_pixels(&mut [1, 2, 3, 0], 1), [0x80, 0]);
+    let mut rgba = [1, 2, 3, 255].repeat(34);
+    rgba[3] = 0;
+    rgba[16 * PIXEL_SIZE + 3] = 0;
+    rgba[18 * PIXEL_SIZE + 3] = 128;
+    rgba[24 * PIXEL_SIZE + 3] = 0;
+    assert_eq!(
+        prepare_pixels(&mut rgba, 17),
+        [0x80, 0, 0x80, 0, 0x01, 0, 0, 0]
+    );
+    assert_eq!(&rgba[18 * PIXEL_SIZE..19 * PIXEL_SIZE], &[3, 2, 1, 128]);
 }
 
 #[derive(Debug)]

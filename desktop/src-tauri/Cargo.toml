@@ -12,7 +12,7 @@ publish = false
 [workspace]
 exclude = ["vendor/tray-icon"]
 
-# Remove this patch once Tauri can resolve a release containing tray-icon #393.
+# The Windows tray fixes and criteria for dropping this patch are in vendor/tray-icon/PATCHES.md.
 [patch.crates-io]
 tray-icon = { path = "vendor/tray-icon" }
 

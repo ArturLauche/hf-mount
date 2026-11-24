@@ -203,7 +203,7 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
         {overviewError && (
           <Banner
             tone="danger"
-            title={errorTitle(overviewError)}
+            title="Could not refresh drive status"
             actions={
               <Button size="sm" onClick={() => void refresh()}>
                 Retry
@@ -211,6 +211,12 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
             }
           >
             {sentence(overviewError.message)}
+          </Banner>
+        )}
+
+        {overview?.foreground_unavailable && !overviewError && (
+          <Banner tone="warn" title="Some foreground drives are unavailable">
+            One or more foreground mount hosts did not respond. Drives from other hosts are shown below.
           </Banner>
         )}
 
@@ -265,7 +271,7 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
           </div>
         )}
 
-        {overview && rows.length === 0 && (
+        {overview && !overviewError && !overview.foreground_unavailable && rows.length === 0 && (
           <EmptyState onNew={(initial) => setDialog({ open: true, initial })} />
         )}
 

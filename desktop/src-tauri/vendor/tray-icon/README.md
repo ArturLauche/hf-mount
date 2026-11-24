@@ -117,9 +117,11 @@ so that the event loop is awakened on each tray icon event.
 Same can be done for menu events using [`MenuEvent::set_event_handler`].
 
 ```rust
+use winit::event_loop::EventLoop;
+
 enum UserEvent {
-  TrayIconEvent(tray_icon::TrayIconEvent)
-  MenuEvent(tray_icon::menu::MenuEvent)
+    TrayIconEvent(tray_icon::TrayIconEvent),
+    MenuEvent(tray_icon::menu::MenuEvent),
 }
 
 let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();

@@ -38,7 +38,7 @@ export function applyTheme(theme: Theme) {
 }
 
 const Visibility = createContext(false);
-const ActivityHosts = createContext<boolean | undefined>(undefined);
+const ActivityHosts = createContext<"unknown" | "available" | "empty" | "unavailable">("unknown");
 export const useActivityHosts = () => useContext(ActivityHosts);
 export const useWindowVisible = () => useContext(Visibility);
 
@@ -170,9 +170,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }),
     [overview, overviewError, profiles, settings, account, appInfo, refresh, refreshProfiles, updateSettings, refreshAccount],
   );
+  const activityHosts = overview?.has_hosts === true ? "available"
+    : overviewError || overview?.foreground_unavailable ? "unavailable"
+    : overview?.has_hosts === false ? "empty" : "unknown";
   return (
     <Visibility.Provider value={visible}>
-      <ActivityHosts.Provider value={overview?.has_hosts}>
+      <ActivityHosts.Provider value={activityHosts}>
         <Ctx.Provider value={value}>{children}</Ctx.Provider>
       </ActivityHosts.Provider>
     </Visibility.Provider>

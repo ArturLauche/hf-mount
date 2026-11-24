@@ -131,6 +131,33 @@ describe("desktop idle and restore", () => {
     ui.unmount();
   });
 
+  it("shows a foreground status failure without marking a healthy supervisor unreachable", async () => {
+    latest = { ...snapshot(["X:"]), foreground_unavailable: true };
+    const ui = render(<App />);
+    await nativeVisibility(true);
+    expect(ui.getByText("Some foreground drives are unavailable")).toBeInTheDocument();
+    expect(ui.getByText("Running · pid 12")).toBeInTheDocument();
+    expect(ui.getAllByRole("article")).toHaveLength(1);
+    expect(ui.queryByText("Mount service unreachable")).toBeNull();
+    ui.unmount();
+  });
+
+  it("waits for a live host before polling Activity again after a status failure", async () => {
+    latest = { ...snapshot(), status_error: { code: "timeout", message: "The mount host did not answer" } };
+    const ui = start(true);
+    await nativeVisibility(true);
+    expect(ui.getByText("Drive activity is unavailable until a mount host responds.")).toBeInTheDocument();
+    vi.mocked(api.activity).mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(api.activity).not.toHaveBeenCalled();
+
+    latest = snapshot(["X:"]);
+    vi.mocked(api.activity).mockResolvedValue([{ time: "now", level: "info", message: "Drive mounted" }]);
+    await act(async () => { await refresh(); });
+    expect(ui.getByText("Drive mounted")).toBeInTheDocument();
+    ui.unmount();
+  });
+
   it("defers startup while hidden and discovers an external mount and its events on restore", async () => {
     const ui = start(true);
     await nativeVisibility(false);

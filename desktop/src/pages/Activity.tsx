@@ -29,8 +29,9 @@ export function ActivityPage() {
   const followLog = useRef(true);
 
   const visible = useWindowVisible();
-  const hasHosts = useActivityHosts();
-  const empty = tab === "events" && hasHosts === false;
+  const hosts = useActivityHosts();
+  const noLiveHosts = hosts === "empty" || hosts === "unavailable";
+  const skipEvents = tab === "events" && noLiveHosts;
   const previous = useRef<{ events: ActivityEvent[] | null; log: string[] | null }>({ events: null, log: null });
   const read = useCallback(async (signal: AbortSignal) => {
     try {
@@ -60,13 +61,13 @@ export function ActivityPage() {
       return false;
     }
   }, [tab]);
-  const load = useVisiblePolling(visible && !empty, read, 3000, 9000);
+  const load = useVisiblePolling(visible && !skipEvents, read, 3000, 9000);
   useEffect(() => {
-    if (hasHosts === false) {
+    if (noLiveHosts) {
       previous.current.events = null;
       setEvents(null);
     }
-  }, [hasHosts]);
+  }, [noLiveHosts]);
 
   useEffect(() => {
     const box = logBox.current;
@@ -133,11 +134,13 @@ export function ActivityPage() {
         )}
       </div>
 
-      {loadError && !empty && <p className="mb-3 text-[13px] text-danger">{loadError}</p>}
+      {loadError && !skipEvents && <p className="mb-3 text-[13px] text-danger">{loadError}</p>}
 
       {tab === "events" && (
         <Card className="overflow-hidden">
-          {events === null && !empty ? (
+          {hosts === "unavailable" ? (
+            <p className="p-6 text-[13px] text-fg-3" role="status">Drive activity is unavailable until a mount host responds.</p>
+          ) : events === null && !skipEvents ? (
             <div className="flex items-center gap-2 p-6 text-[13px] text-fg-3" role="status">
               <Spinner /> Loading…
             </div>

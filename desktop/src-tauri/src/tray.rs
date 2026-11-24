@@ -105,15 +105,15 @@ fn refresh_on_hover(app: &AppHandle) {
         // the full control-request timeout just to populate a tooltip.
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            client::list_hosts_with_error(&state.identity),
+            client::read_host_status(&state.identity),
         )
         .await
         {
-            Ok((hosts, error)) => update_status(
+            Ok(status) => update_status(
                 &app,
                 ops::driver_status().installed,
-                hosts.iter().flat_map(|h| &h.mounts),
-                error.is_some(),
+                status.hosts.iter().flat_map(|h| &h.mounts),
+                status.is_incomplete(),
             ),
             Err(_) if !state.quitting.load(Ordering::Acquire) => {
                 set_status(&app, "hf-mount — mount status unavailable")

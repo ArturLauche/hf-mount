@@ -45,12 +45,18 @@ impl TrayIcon {
         let (menu_watcher_thread_shutdown_tx, menu_watcher_thread_shutdown_rx) = unbounded();
 
         // Spawn a thread to watch for menu changes and update the tray icon accordingly
-        let menu_watcher_thread = std::thread::Builder::new()
+        let menu_watcher_thread = match std::thread::Builder::new()
             .name("tray-icon-menu-watcher".into())
             .spawn({
                 let handle = handle.clone();
                 move || watch_menu_changes(handle, menu_watcher_thread_shutdown_rx)
-            })?;
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                handle.shutdown().wait();
+                return Err(error.into());
+            }
+        };
 
         Ok(Self {
             handle,

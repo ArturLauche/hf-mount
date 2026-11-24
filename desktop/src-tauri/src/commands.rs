@@ -55,6 +55,7 @@ pub(crate) struct DesktopOverview {
     has_hosts: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     status_error: Option<ErrorInfo>,
+    foreground_unavailable: bool,
 }
 
 #[derive(Default)]
@@ -82,10 +83,11 @@ impl OverviewReader {
 }
 
 async fn read_overview(app: &AppHandle, state: &AppState, reader: &mut OverviewReader) -> DesktopOverview {
-    let (hosts, status_error) = reader.hosts.list(&state.identity).await;
-    let has_hosts = !hosts.is_empty() || status_error.is_some();
-    let mut ov = ops::overview_from_hosts(hosts);
-    crate::tray::update_status(app, ov.driver.installed, ov.mounts.iter(), status_error.is_some());
+    let status = reader.hosts.list(&state.identity).await;
+    let has_hosts = !status.hosts.is_empty();
+    let incomplete = status.is_incomplete();
+    let mut ov = ops::overview_from_hosts(status.hosts);
+    crate::tray::update_status(app, ov.driver.installed, ov.mounts.iter(), incomplete);
     ov.driver.bundled_installer = *state.bundled_installer.get_or_init(|| bundled_winfsp(app).is_some());
     let mut lost = state.lost.lock().unwrap_or_else(|e| e.into_inner());
     if lost.is_none() && ov.supervisor.is_none() {
@@ -95,7 +97,8 @@ async fn read_overview(app: &AppHandle, state: &AppState, reader: &mut OverviewR
     DesktopOverview {
         overview: ov,
         has_hosts,
-        status_error,
+        status_error: status.supervisor_error,
+        foreground_unavailable: status.foreground_unavailable,
     }
 }
 
@@ -409,6 +412,7 @@ mod tests {
             },
             has_hosts: false,
             status_error: None,
+            foreground_unavailable: false,
         };
         let (first, _) = reader.since(None, next.clone()).unwrap();
         assert!(reader.since(Some(first), next.clone()).is_none());

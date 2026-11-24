@@ -260,10 +260,18 @@ impl Default for TrayIconAttributes {
 }
 
 /// [`TrayIcon`] builder struct and associated methods.
-#[derive(Default)]
 pub struct TrayIconBuilder {
     id: TrayIconId,
     attrs: TrayIconAttributes,
+}
+
+impl Default for TrayIconBuilder {
+    fn default() -> Self {
+        Self {
+            id: TrayIconId::new_unique(),
+            attrs: TrayIconAttributes::default(),
+        }
+    }
 }
 
 impl TrayIconBuilder {
@@ -271,10 +279,7 @@ impl TrayIconBuilder {
     ///
     /// See [`TrayIcon::new`] for more info.
     pub fn new() -> Self {
-        Self {
-            id: TrayIconId::new_unique(),
-            attrs: TrayIconAttributes::default(),
-        }
+        Self::default()
     }
 
     /// Sets the unique id to build the tray icon with.
@@ -759,6 +764,15 @@ impl TrayIconEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_and_new_builders_allocate_unique_ids() {
+        use super::TrayIconBuilder;
+        let a = TrayIconBuilder::default();
+        let b = TrayIconBuilder::default();
+        assert_ne!(a.id(), b.id());
+        assert_ne!(a.id(), TrayIconBuilder::new().id());
+        assert_eq!(a.with_id("explicit").id().as_ref(), "explicit");
+    }
 
     #[cfg(feature = "serde")]
     #[test]
