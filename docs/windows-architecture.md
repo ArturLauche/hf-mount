@@ -142,7 +142,10 @@ What this means, stated plainly (also in the README and the app):
   breakaway when allowed), without the caller's environment secrets and
   without inheriting the caller's standard handles, so closing the terminal
   or the app does not unmount anything and `hf-mount start | …` returns
-  immediately. It exits by itself after 10 minutes with no mounts.
+  immediately. With no active mounts it exits 10 minutes after the last
+  mount, unmount, recovery or other state-changing request finishes.
+  Status and activity reads leave this deadline alone. A dispatcher loss
+  wakes the host so it can drain uploads and recover files.
   `hf-mount shutdown` (hidden, used by the installer before an update or
   uninstall) unmounts everything and stops it, and returns only once the
   supervisor process has exited, so `hf-mount.exe` can be replaced. The
@@ -182,6 +185,9 @@ What this means, stated plainly (also in the README and the app):
 * **Shared operations.** `src/windows/ops.rs` holds the client-side
   operations (overview, mount, unmount, account, diagnostics) the desktop app
   calls; the CLI uses the same client and protocol, so both always agree.
+
+The desktop performance report includes idle measurements, live status timings
+and instructions for profiling a Windows session. [Desktop idle and filesystem performance](desktop-idle-performance.md)
 
 ## 4. Credentials and privacy
 

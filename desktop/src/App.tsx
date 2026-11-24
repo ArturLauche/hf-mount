@@ -1,6 +1,6 @@
 import * as RadixTooltip from "@radix-ui/react-tooltip";
 import { Activity, EyeOff, HardDrive, LogOut, Power, Settings as SettingsIcon, UserRound, type LucideIcon } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { BlockedUnmountDialog } from "./components/BlockedUnmountDialog";
 import { Logo } from "./components/common";
 import { Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger, ToastProvider, useToast } from "./components/ui/overlay";
@@ -8,10 +8,11 @@ import { Badge, cn, Kbd, Tooltip } from "./components/ui/primitives";
 import { api, errorInfo } from "./lib/api";
 import { hideWindow, onAppEvent } from "./lib/native";
 import { AppStateProvider, useApp } from "./lib/state";
-import { AccountPage } from "./pages/Account";
-import { ActivityPage } from "./pages/Activity";
 import { DrivesPage } from "./pages/Drives";
-import { SettingsPage } from "./pages/Settings";
+
+const ActivityPage = lazy(() => import("./pages/Activity").then((m) => ({ default: m.ActivityPage })));
+const AccountPage = lazy(() => import("./pages/Account").then((m) => ({ default: m.AccountPage })));
+const SettingsPage = lazy(() => import("./pages/Settings").then((m) => ({ default: m.SettingsPage })));
 
 export type Page = "drives" | "activity" | "account" | "settings";
 
@@ -76,10 +77,12 @@ function Shell() {
       <Sidebar page={page} onNavigate={setPage} />
       <main className="min-w-0 flex-1 overflow-y-auto" id="main">
         <div key={page} className="anim-fade mx-auto w-full max-w-[920px] px-8 pb-16 pt-9 max-[720px]:px-5">
-          {page === "drives" && <DrivesPage newDriveRequest={newDriveRequest} onNavigate={setPage} />}
-          {page === "activity" && <ActivityPage />}
-          {page === "account" && <AccountPage />}
-          {page === "settings" && <SettingsPage />}
+          <Suspense fallback={<span role="status">Loading…</span>}>
+            {page === "drives" && <DrivesPage newDriveRequest={newDriveRequest} onNavigate={setPage} />}
+            {page === "activity" && <ActivityPage />}
+            {page === "account" && <AccountPage />}
+            {page === "settings" && <SettingsPage />}
+          </Suspense>
         </div>
       </main>
       <BlockedUnmountDialog />

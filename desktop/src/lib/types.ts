@@ -181,6 +181,10 @@ export interface LostSession {
 }
 
 export interface Overview {
+  /** Includes foreground hosts that have not finished mounting. */
+  has_hosts?: boolean;
+  status_error?: ErrorInfo;
+  foreground_unavailable?: boolean;
   driver: DriverStatus;
   supervisor: HostInfo | null;
   mounts: MountInfo[];

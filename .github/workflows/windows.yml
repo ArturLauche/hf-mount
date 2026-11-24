@@ -136,6 +136,13 @@ jobs:
           $env:TAURI_CONFIG = Get-Content src-tauri/tauri.ci-build.conf.json -Raw
           cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
 
+      - name: Desktop command unit tests
+        if: ${{ !cancelled() }}
+        working-directory: desktop
+        run: |
+          $env:TAURI_CONFIG = Get-Content src-tauri/tauri.ci-build.conf.json -Raw
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
       - name: Upload WinFsp test logs
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

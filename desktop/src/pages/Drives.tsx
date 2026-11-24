@@ -1,9 +1,9 @@
 import { HardDrive, Plus, Sparkles } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import type { Page } from "../App";
 import { Banner, PageHeader } from "../components/common";
 import { DriveCard, type Busy, type DriveActions } from "../components/DriveCard";
-import { NewDriveDialog, type MountRequest, type NewDriveInitial } from "../components/NewDriveDialog";
+import type { MountRequest, NewDriveInitial } from "../components/NewDriveDialog";
 import { ConfirmDialog, useToast } from "../components/ui/overlay";
 import { Button, Card, Kbd, Spinner } from "../components/ui/primitives";
 import { api, errorInfo } from "../lib/api";
@@ -16,6 +16,8 @@ import type { MountInfo, Profile } from "../lib/types";
 import { useGuard } from "../hooks/useGuard";
 import { useUnmountReport } from "../hooks/useUnmountReport";
 import { plural } from "../lib/format";
+
+const NewDriveDialog = lazy(() => import("../components/NewDriveDialog").then((m) => ({ default: m.NewDriveDialog })));
 
 const SUGGESTIONS: NewDriveInitial[] = [
   { source_type: "model", id: "openai-community/gpt2" },
@@ -201,7 +203,7 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
         {overviewError && (
           <Banner
             tone="danger"
-            title={errorTitle(overviewError)}
+            title="Could not refresh drive status"
             actions={
               <Button size="sm" onClick={() => void refresh()}>
                 Retry
@@ -209,6 +211,12 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
             }
           >
             {sentence(overviewError.message)}
+          </Banner>
+        )}
+
+        {overview?.foreground_unavailable && !overviewError && (
+          <Banner tone="warn" title="Some foreground drives are unavailable">
+            One or more foreground mount hosts did not respond. Drives from other hosts are shown below.
           </Banner>
         )}
 
@@ -263,7 +271,7 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
           </div>
         )}
 
-        {overview && rows.length === 0 && (
+        {overview && !overviewError && !overview.foreground_unavailable && rows.length === 0 && (
           <EmptyState onNew={(initial) => setDialog({ open: true, initial })} />
         )}
 
@@ -278,21 +286,25 @@ export function DrivesPage({ newDriveRequest, onNavigate }: { newDriveRequest: n
         )}
       </div>
 
-      <NewDriveDialog
-        open={dialog.open}
-        onOpenChange={(open) => setDialog((d) => ({ ...d, open }))}
-        initial={dialog.initial}
-        freeLetters={free}
-        profiles={profiles}
-        account={account}
-        driverInstalled={driverInstalled}
-        onSubmit={(req) => doMount(req)}
-        onSignIn={() => {
-          setDialog({ open: false });
-          onNavigate("account");
-        }}
-        onInstallDriver={() => void installDriver()}
-      />
+      {dialog.open && (
+        <Suspense fallback={null}>
+          <NewDriveDialog
+            open
+            onOpenChange={(open) => setDialog((d) => ({ ...d, open }))}
+            initial={dialog.initial}
+            freeLetters={free}
+            profiles={profiles}
+            account={account}
+            driverInstalled={driverInstalled}
+            onSubmit={(req) => doMount(req)}
+            onSignIn={() => {
+              setDialog({ open: false });
+              onNavigate("account");
+            }}
+            onInstallDriver={() => void installDriver()}
+          />
+        </Suspense>
+      )}
 
       <ConfirmDialog
         open={!!forceAsk}

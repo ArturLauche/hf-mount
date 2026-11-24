@@ -83,6 +83,11 @@ pub fn process_user_sid(pid: u32) -> io::Result<String> {
 
 /// Whether this process runs with an elevated (administrator) token.
 pub fn is_elevated() -> bool {
+    // This is the process token, including in the long-lived desktop app.
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&value) = ELEVATED.get() {
+        return value;
+    }
     let Ok(token) = process_token(unsafe { GetCurrentProcess() }) else {
         return false;
     };
@@ -90,7 +95,8 @@ pub fn is_elevated() -> bool {
         return false;
     };
     // SAFETY: the buffer holds a TOKEN_ELEVATION.
-    unsafe { &*(buf.as_ptr().cast::<TOKEN_ELEVATION>()) }.TokenIsElevated != 0
+    let elevated = unsafe { &*(buf.as_ptr().cast::<TOKEN_ELEVATION>()) }.TokenIsElevated != 0;
+    *ELEVATED.get_or_init(|| elevated)
 }
 
 /// Terminal Services session of this process (drive letters are scoped to

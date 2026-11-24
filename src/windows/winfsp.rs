@@ -154,7 +154,12 @@ fn load_uncached() -> Result<WinFspApi, LoadError> {
             match p {
                 // SAFETY: the symbol has the signature declared in winfsp.h.
                 Some(f) => unsafe { std::mem::transmute::<RawProc, $ty>(f) },
-                None => return Err(LoadError::MissingSymbol($name)),
+                None => {
+                    // Only successful loads are cached. A broken installation
+                    // must release this reference on each failed probe.
+                    unsafe { windows_sys::Win32::Foundation::FreeLibrary(module) };
+                    return Err(LoadError::MissingSymbol($name));
+                }
             }
         }};
     }

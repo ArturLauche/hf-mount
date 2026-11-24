@@ -1,5 +1,5 @@
 import { AlertTriangle, CheckCircle2, ClipboardCopy, FolderOpen, Info, RefreshCw, XCircle } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PageHeader } from "../components/common";
 import { useToast } from "../components/ui/overlay";
 import { Button, Card, cn, Segmented, Spinner } from "../components/ui/primitives";
@@ -7,16 +7,13 @@ import { api, errorInfo } from "../lib/api";
 import { clockTime } from "../lib/format";
 import { copyText } from "../lib/native";
 import type { ActivityEvent } from "../lib/types";
+import { useVisiblePolling } from "../hooks/useVisiblePolling";
+import { useActivityHosts, useWindowVisible } from "../lib/state";
+import { sameSnapshot } from "../lib/snapshot";
 import { useGuard } from "../hooks/useGuard";
 
 type Tab = "events" | "log";
 type Filter = "all" | "problems";
-
-const REFRESH_MS = 3000;
-
-function sameJson(a: unknown, b: unknown): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
-}
 
 export function ActivityPage() {
   const toast = useToast();
@@ -31,28 +28,46 @@ export function ActivityPage() {
   // Follow new log lines only while the reader is at the bottom.
   const followLog = useRef(true);
 
-  const load = useCallback(async () => {
+  const visible = useWindowVisible();
+  const hosts = useActivityHosts();
+  const noLiveHosts = hosts === "empty" || hosts === "unavailable";
+  const skipEvents = tab === "events" && noLiveHosts;
+  const previous = useRef<{ events: ActivityEvent[] | null; log: string[] | null }>({ events: null, log: null });
+  const read = useCallback(async (signal: AbortSignal) => {
     try {
+      let changed;
       if (tab === "events") {
         const next = await api.activity(300);
-        setEvents((prev) => (sameJson(prev, next) ? prev : next));
+        if (signal.aborted) return false;
+        changed = !sameSnapshot(previous.current.events, next);
+        if (changed) {
+          previous.current.events = next;
+          setEvents(next);
+        }
       } else {
         const next = await api.logTail(400);
-        setLog((prev) => (sameJson(prev, next) ? prev : next));
+        if (signal.aborted) return false;
+        changed = !sameSnapshot(previous.current.log, next);
+        if (changed) {
+          previous.current.log = next;
+          setLog(next);
+        }
       }
       setLoadError(null);
+      return changed;
     } catch (e) {
+      if (signal.aborted) return false;
       setLoadError(errorInfo(e).message);
+      return false;
     }
   }, [tab]);
-
+  const load = useVisiblePolling(visible && !skipEvents, read, 3000, 9000);
   useEffect(() => {
-    void load();
-    const t = setInterval(() => {
-      if (document.visibilityState === "visible") void load();
-    }, REFRESH_MS);
-    return () => clearInterval(t);
-  }, [load]);
+    if (noLiveHosts) {
+      previous.current.events = null;
+      setEvents(null);
+    }
+  }, [noLiveHosts]);
 
   useEffect(() => {
     const box = logBox.current;
@@ -71,7 +86,7 @@ export function ActivityPage() {
     }
   };
 
-  const shown = (events ?? []).filter((e) => filter === "all" || e.level !== "info").slice().reverse();
+  const shown = useMemo(() => (events ?? []).filter((e) => filter === "all" || e.level !== "info").reverse(), [events, filter]);
 
   return (
     <>
@@ -119,11 +134,13 @@ export function ActivityPage() {
         )}
       </div>
 
-      {loadError && <p className="mb-3 text-[13px] text-danger">{loadError}</p>}
+      {loadError && !skipEvents && <p className="mb-3 text-[13px] text-danger">{loadError}</p>}
 
       {tab === "events" && (
         <Card className="overflow-hidden">
-          {events === null ? (
+          {hosts === "unavailable" ? (
+            <p className="p-6 text-[13px] text-fg-3" role="status">Drive activity is unavailable until a mount host responds.</p>
+          ) : events === null && !skipEvents ? (
             <div className="flex items-center gap-2 p-6 text-[13px] text-fg-3" role="status">
               <Spinner /> Loading…
             </div>

@@ -17,9 +17,8 @@ use crate::manager::protocol::{
 use crate::manager::registry::Registry;
 use crate::manager::spec::MountSpec;
 
-/// The supervisor exits after this long with no mounts and no client requests.
+/// The supervisor exits after this long with no mounts and no state-changing client requests.
 const IDLE_EXIT: Duration = Duration::from_secs(10 * 60);
-const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 
 fn env_filter() -> tracing_subscriber::EnvFilter {
     if std::env::var("RUST_LOG").is_ok() {
@@ -67,14 +66,11 @@ fn host_info(kind: HostKind) -> HostInfo {
     }
 }
 
-/// Run `f` on a plain OS thread and await it (keeps blocking engine work off
-/// tokio workers).
-async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    rx.await.ok()
+async fn check_health(registry: Arc<Registry>) {
+    // A loss can require blocking upload drain/recovery.
+    if let Err(e) = tokio::task::spawn_blocking(move || registry.check_health()).await {
+        error!("checking mount health: {e}");
+    }
 }
 
 /// `hf-mount supervise`: host background mounts until idle or asked to stop.
@@ -129,25 +125,27 @@ pub fn run_supervisor() -> i32 {
 
     let watch = registry.clone();
     let stop = async move {
-        loop {
-            tokio::time::sleep(HEALTH_INTERVAL).await;
-            let r = watch.clone();
-            off_runtime(move || r.check_health()).await;
-            if watch.shutdown_requested() {
-                info!("shutdown requested");
-                break;
+        while !watch.shutdown_requested() {
+            match watch.idle_shutdown_delay(IDLE_EXIT) {
+                Some(Duration::ZERO) => {
+                    info!("idle with no mounts; exiting");
+                    break;
+                }
+                Some(delay) => tokio::select! {
+                    _ = tokio::time::sleep(delay) => continue,
+                    _ = watch.changed() => {}
+                },
+                None => watch.changed().await,
             }
-            if watch.active_count() == 0 && watch.idle_for() > IDLE_EXIT {
-                info!("idle with no mounts; exiting");
-                break;
-            }
+            check_health(watch.clone()).await;
         }
         // Tear down while the control pipe still exists: clients see the
         // drives stopping, and a second supervisor cannot start (and fight
         // over the drive letters) until the uploads are finished or saved.
         watch.request_shutdown();
+        watch.wait_for_work().await;
         let r = watch.clone();
-        if let Some(reports) = off_runtime(move || r.unmount_all()).await {
+        if let Ok(reports) = tokio::task::spawn_blocking(move || r.unmount_all()).await {
             log_reports(&watch, &reports);
         }
     };
@@ -165,6 +163,7 @@ pub fn run_supervisor() -> i32 {
     // Normally a no-op: `stop` already unmounted everything, unless the pipe
     // failed first.
     registry.request_shutdown();
+    runtime.block_on(registry.wait_for_work());
     let reports = registry.unmount_all();
     log_reports(&registry, &reports);
     registry.record(EventLevel::Info, None, "Supervisor stopped");
@@ -253,19 +252,20 @@ pub fn run_foreground(
                 _ = tokio::signal::ctrl_c() => return "Ctrl+C",
                 _ = async { match ctrl_close.as_mut() { Some(s) => { s.recv().await; } None => std::future::pending().await } } => return "console closing",
                 _ = async { match ctrl_break.as_mut() { Some(s) => { s.recv().await; } None => std::future::pending().await } } => return "Ctrl+Break",
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    let r = registry.clone();
-                    off_runtime(move || r.check_health()).await;
+                _ = registry.changed() => {
+                    check_health(registry.clone()).await;
                     if registry.shutdown_requested() {
                         return "shutdown requested";
                     }
-                    if registry.active_count() == 0 {
+                    if registry.idle_shutdown_delay(Duration::ZERO) == Some(Duration::ZERO) {
                         return "unmounted";
                     }
                 }
             }
         }
     });
+    registry.request_shutdown();
+    runtime.block_on(registry.wait_for_work());
     report(ForegroundEvent::Stopping(reason));
     let reports = registry.unmount_all();
     report(ForegroundEvent::Stopped(&reports));

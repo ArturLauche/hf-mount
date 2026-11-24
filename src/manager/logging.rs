@@ -1,7 +1,7 @@
 //! Tracing output that is redacted before it is written anywhere.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -94,12 +94,39 @@ impl<'a> MakeWriter<'a> for RedactingWriter {
 /// Last `max_lines` lines of a log file (for diagnostics), already redacted
 /// at write time and redacted again defensively.
 pub fn tail(path: &Path, max_lines: usize) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    if max_lines == 0 {
         return Vec::new();
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].iter().map(|l| redact(l)).collect()
+    }
+    read_tail(path, max_lines).unwrap_or_default()
+}
+
+fn read_tail(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    let mut file = File::open(path)?;
+    let end = file.metadata()?.len();
+    let mut start = end;
+    let mut buf = [0; 8192];
+    let mut remaining = max_lines;
+    'blocks: while start > 0 {
+        let size = start.min(buf.len() as u64) as usize;
+        start -= size as u64;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf[..size])?;
+        for i in (0..size).rev() {
+            let after = start + i as u64 + 1;
+            if buf[i] == b'\n' && after < end {
+                remaining -= 1;
+                if remaining == 0 {
+                    start = after;
+                    break 'blocks;
+                }
+            }
+        }
+    }
+    // Bound the read to the same EOF even if new events have been appended.
+    file.seek(SeekFrom::Start(start))?;
+    let mut text = String::new();
+    file.take(end - start).read_to_string(&mut text)?;
+    Ok(text.lines().map(redact).collect())
 }
 
 #[cfg(test)]
@@ -124,6 +151,20 @@ mod tests {
         assert!(!content.contains("abcdefghijklmnop"), "{content}");
         assert_eq!(tail(&path, 1), vec!["second line".to_string()]);
         assert_eq!(tail(&path, 10).len(), 2);
+    }
+
+    #[test]
+    fn tail_matches_lines_at_block_and_utf8_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        for ending in ["", "\n", "\r\n", "\n\n"] {
+            let text = format!("first\n{}é\r\n{}\nlast{ending}", "x".repeat(8191), "z".repeat(20_000));
+            std::fs::write(&path, &text).unwrap();
+            let lines: Vec<_> = text.lines().collect();
+            for n in 0..=lines.len() + 1 {
+                assert_eq!(tail(&path, n), lines[lines.len().saturating_sub(n)..]);
+            }
+        }
     }
 
     #[test]

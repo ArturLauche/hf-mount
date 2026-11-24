@@ -2,15 +2,15 @@
 //! separates hiding the window, quitting the app (drives stay mounted) and
 //! quitting with all drives unmounted.
 
-use std::time::Duration;
+use std::sync::atomic::Ordering;
 
-use hf_mount::manager::protocol::MountState;
-use hf_mount::windows::ops;
+use hf_mount::manager::protocol::{MountInfo, MountState};
+use hf_mount::windows::{client, ops};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
-use crate::{AppState, navigate, quit, show_main, unmount_all_or_ask};
+use crate::{AppState, hide_main, navigate, quit, show_main, unmount_all_or_ask};
 
 const TRAY_ID: &str = "main";
 
@@ -43,9 +43,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             "open" => show_main(app),
             "new-drive" => navigate(app, "new-drive"),
             "hide" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.hide();
-                }
+                let _ = hide_main(app);
             }
             "unmount-all" => {
                 let app = app.clone();
@@ -58,7 +56,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
+            if matches!(event, TrayIconEvent::Enter { .. }) {
+                refresh_on_hover(tray.app_handle());
+            } else if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
@@ -75,40 +75,93 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn set_status(app: &AppHandle, text: &str) {
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let _ = tray.set_tooltip(Some(text));
+    let state = app.state::<AppState>();
+    let mut previous = state.tooltip.lock().unwrap_or_else(|e| e.into_inner());
+    if *previous != text
+        && let Some(tray) = app.tray_by_id(TRAY_ID)
+        && tray.set_tooltip(Some(text)).is_ok()
+    {
+        text.clone_into(&mut previous);
     }
 }
 
-/// Keep the tray tooltip in sync with the mounted drives (including drives
-/// mounted from the command line).
-pub async fn keep_status_fresh(app: AppHandle) {
-    let mut last = String::new();
-    loop {
-        let identity = app.state::<AppState>().identity.clone();
-        let ov = ops::overview(&identity).await;
-        let mounted: Vec<&str> = ov
-            .mounts
-            .iter()
-            .filter(|m| m.state == MountState::Mounted)
-            .map(|m| m.spec.target.as_str())
-            .collect();
-        let failed = ov.mounts.iter().filter(|m| m.state == MountState::Failed).count();
-        let mut text = match mounted.len() {
-            0 => "hf-mount — no drives mounted".to_string(),
-            1 => format!("hf-mount — {} mounted", mounted[0]),
-            n => format!("hf-mount — {n} drives mounted ({})", mounted.join(" ")),
-        };
-        if failed > 0 {
-            text.push_str(&format!(", {failed} failed"));
-        }
-        if !ov.driver.installed {
-            text = "hf-mount — WinFsp is not installed".to_string();
-        }
-        if text != last {
-            set_status(&app, &text);
-            last = text;
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+/// Visible overview reads already feed the tooltip. With the window hidden,
+/// only someone inspecting the tray needs a live list (including CLI hosts).
+fn refresh_on_hover(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.window.visible.load(Ordering::Acquire) || state.quitting.load(Ordering::Acquire) {
+        return;
     }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let Ok(_read) = state.status_read.try_lock() else {
+            return;
+        };
+        if state.window.visible.load(Ordering::Acquire) {
+            return;
+        }
+        // A stalled host should not hold up the next window restore for
+        // the full control-request timeout just to populate a tooltip.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client::read_host_status(&state.identity),
+        )
+        .await
+        {
+            Ok(status) => update_status(
+                &app,
+                ops::driver_status().installed,
+                status.hosts.iter().flat_map(|h| &h.mounts),
+                status.is_incomplete(),
+            ),
+            Err(_) if !state.quitting.load(Ordering::Acquire) => {
+                set_status(&app, "hf-mount — mount status unavailable")
+            }
+            Err(_) => {}
+        }
+    });
+}
+
+pub(crate) fn update_status<'a>(
+    app: &AppHandle,
+    installed: bool,
+    mounts: impl Iterator<Item = &'a MountInfo>,
+    incomplete: bool,
+) {
+    if app.state::<AppState>().quitting.load(Ordering::Acquire) {
+        return;
+    }
+    if !installed {
+        set_status(app, "hf-mount — WinFsp is not installed");
+        return;
+    }
+    let mut mounted = Vec::new();
+    let mut failed = 0;
+    let mut failed_uploads = 0;
+    for mount in mounts {
+        match mount.state {
+            MountState::Mounted => mounted.push(mount.spec.target.as_str()),
+            MountState::Failed => failed += 1,
+            _ => {}
+        }
+        failed_uploads += mount.stats.as_ref().map_or(0, |s| s.failed_uploads);
+    }
+    mounted.sort_unstable();
+    let mut text = match mounted.len() {
+        0 if incomplete => "hf-mount — mount status unavailable".to_string(),
+        0 => "hf-mount — no drives mounted".to_string(),
+        1 => format!("hf-mount — {} mounted", mounted[0]),
+        n => format!("hf-mount — {n} drives mounted ({})", mounted.join(" ")),
+    };
+    if incomplete && !mounted.is_empty() {
+        text.push_str(", some hosts unavailable");
+    }
+    if failed > 0 {
+        text.push_str(&format!(", {failed} failed"));
+    }
+    if failed_uploads > 0 {
+        text.push_str(&format!(", {failed_uploads} failed uploads"));
+    }
+    set_status(app, &text);
 }

@@ -2,8 +2,6 @@
 
 use windows_sys::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
 
-use super::util::wide;
-
 /// Letters offered for new mounts. A–C are left alone (floppy legacy and the
 /// system drive).
 pub const CANDIDATE_LETTERS: std::ops::RangeInclusive<char> = 'D'..='Z';
@@ -17,20 +15,25 @@ pub fn is_letter_free(letter: char) -> bool {
         return false;
     }
     // SAFETY: plain Win32 call.
-    let mask = unsafe { GetLogicalDrives() };
+    free_in_mask(letter, unsafe { GetLogicalDrives() })
+}
+
+fn free_in_mask(letter: char, mask: u32) -> bool {
     if mask & (1 << (letter as u32 - 'A' as u32)) != 0 {
         return false;
     }
-    let device = wide(format!("{letter}:"));
+    let device = [letter as u16, b':' as u16, 0];
     let mut target = [0u16; 512];
     // SAFETY: valid buffers; returns 0 when the name has no mapping.
     let n = unsafe { QueryDosDeviceW(device.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
-    n == 0
+    n == 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
 }
 
 /// Free letters among [`CANDIDATE_LETTERS`], in order.
 pub fn free_letters() -> Vec<char> {
-    CANDIDATE_LETTERS.filter(|&c| is_letter_free(c)).collect()
+    // One snapshot for the whole list. Mount itself still checks the live letter.
+    let mask = unsafe { GetLogicalDrives() };
+    CANDIDATE_LETTERS.filter(|&c| free_in_mask(c, mask)).collect()
 }
 
 /// Whether a drive root (e.g. `H:\`) currently exists.

@@ -1,4 +1,5 @@
 // Thin wrappers over the Tauri plugins, with browser fallbacks for previews.
+import { invoke } from "@tauri-apps/api/core";
 import { isTauri } from "./api";
 
 export async function copyText(text: string): Promise<void> {
@@ -29,21 +30,33 @@ export async function pickFolder(title: string, defaultPath?: string): Promise<s
 
 export async function hideWindow(): Promise<void> {
   if (!isTauri) return;
-  const { getCurrentWindow } = await import("@tauri-apps/api/window");
-  await getCurrentWindow().hide();
+  await invoke("hide_main");
 }
 
 /** Subscribe to an app event emitted by the Rust side (tray menu, second launch). */
-export function onAppEvent<T>(name: string, handler: (payload: T) => void): () => void {
+export function onAppEvent<T>(name: string, handler: (payload: T) => void, onFailure?: () => void): () => void {
   if (!isTauri) return () => {};
   let unlisten: (() => void) | undefined;
   let cancelled = false;
-  void import("@tauri-apps/api/event").then(({ listen }) =>
-    listen<T>(name, (e) => handler(e.payload)).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    }),
-  );
+  void (async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    if (cancelled) return;
+    const stop = await listen<T>(name, (e) => {
+      if (!cancelled) handler(e.payload);
+    });
+    if (cancelled) {
+      stop();
+      return;
+    }
+    unlisten = stop;
+    // Initial visibility and tray actions can predate the first WebView.
+    await invoke("ui_listener_ready", { event: name });
+  })().catch((e: unknown) => {
+    if (!cancelled) {
+      console.error(`Subscribing to ${name}`, e);
+      onFailure?.();
+    }
+  });
   return () => {
     cancelled = true;
     unlisten?.();

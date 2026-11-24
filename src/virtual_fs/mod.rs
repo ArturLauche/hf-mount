@@ -1594,7 +1594,7 @@ impl VirtualFs {
             return PendingUploads::default();
         };
         PendingUploads {
-            dirty_files: self.inode_table.read().expect("inodes poisoned").dirty_inos().len(),
+            dirty_files: self.inode_table.read().expect("inodes poisoned").dirty_file_count(),
             pending_deletes: fm.pending_delete_count(),
             failed_files: fm.error_count(),
         }

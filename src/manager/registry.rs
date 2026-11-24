@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use super::protocol::{
@@ -27,6 +28,9 @@ pub trait MountHandle: Send + Sync {
     fn stats(&self) -> MountStats;
     /// `Some(reason)` when the volume stopped being served on its own.
     fn lost(&self) -> Option<String>;
+    /// Wake the host when the volume stops serving. The host also checks
+    /// once after registering, covering a loss during mount setup.
+    fn notify_on_loss(&self, _wake: Arc<Notify>) {}
     /// Re-queue failed uploads; returns how many files were queued.
     fn retry_uploads(&self) -> usize;
     /// Remove the drive, drain pending uploads (bounded) and free resources.
@@ -53,12 +57,33 @@ pub struct Registry {
     host: HostInfo,
     entries: Mutex<Vec<Entry>>,
     activity: Mutex<VecDeque<ActivityEvent>>,
-    last_request: Mutex<Instant>,
+    clients: Mutex<ClientActivity>,
+    /// One maintenance loop per host. A stored permit covers changes that
+    /// arrive between inspecting the registry and starting to wait.
+    changed: Arc<Notify>,
+    journal_retry: AtomicBool,
     shutdown: AtomicBool,
     journal: Option<PathBuf>,
     /// Last journal content written, so unchanged state is not rewritten on
     /// every status query.
     journal_written: Mutex<Option<Vec<u8>>>,
+}
+
+struct ClientActivity {
+    last: Instant,
+    working: usize,
+}
+
+/// Covers the whole operation, including recovery after a driver loss.
+struct Working<'a>(&'a Registry);
+
+impl Drop for Working<'_> {
+    fn drop(&mut self) {
+        let mut clients = lock(&self.0.clients);
+        clients.last = Instant::now();
+        clients.working -= 1;
+        self.0.changed.notify_one();
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -85,7 +110,12 @@ impl Registry {
             host,
             entries: Mutex::new(Vec::new()),
             activity: Mutex::new(VecDeque::new()),
-            last_request: Mutex::new(Instant::now()),
+            clients: Mutex::new(ClientActivity {
+                last: Instant::now(),
+                working: 0,
+            }),
+            changed: Arc::new(Notify::new()),
+            journal_retry: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             journal,
             journal_written: Mutex::new(None),
@@ -121,11 +151,44 @@ impl Registry {
 
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.changed.notify_one();
     }
 
-    /// Time since the last client request.
+    pub async fn changed(&self) {
+        if self.journal_retry.load(Ordering::Relaxed) {
+            // Keep trying to persist crash recovery state even with no clients.
+            let _ = tokio::time::timeout(Duration::from_secs(30), self.changed.notified()).await;
+        } else {
+            self.changed.notified().await;
+        }
+    }
+
+    /// Wait for a mount, unmount or recovery already in progress to finish
+    /// before tearing down the runtime that its I/O depends on.
+    pub async fn wait_for_work(&self) {
+        while lock(&self.clients).working != 0 {
+            self.changed.notified().await;
+        }
+    }
+
+    /// While empty, sleep to the actual idle deadline. Claim shutdown under
+    /// the same lock that admits work so a racing mount either wins or gets a
+    /// shutdown response before it creates a volume.
+    pub fn idle_shutdown_delay(&self, timeout: Duration) -> Option<Duration> {
+        let clients = lock(&self.clients);
+        if clients.working != 0 || self.active_count() != 0 {
+            return None;
+        }
+        let remaining = timeout.saturating_sub(clients.last.elapsed());
+        if remaining.is_zero() {
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+        Some(remaining)
+    }
+
+    /// Time since the last operation that changed host state.
     pub fn idle_for(&self) -> Duration {
-        lock(&self.last_request).elapsed()
+        lock(&self.clients).last.elapsed()
     }
 
     /// Number of mounts that are starting, mounted or stopping.
@@ -138,7 +201,23 @@ impl Registry {
 
     /// Handle one client request. Blocking: call from a blocking thread.
     pub fn handle(&self, request: Request) -> Response {
-        *lock(&self.last_request) = Instant::now();
+        let _working = match &request {
+            Request::Mount { .. }
+            | Request::Unmount { .. }
+            | Request::RetryUploads { .. }
+            | Request::Dismiss { .. } => {
+                let mut clients = lock(&self.clients);
+                if self.shutdown_requested() {
+                    return error_response(
+                        ErrorInfo::new(ErrorCode::HostUnavailable, "this hf-mount host is shutting down")
+                            .with_hint("try again in a moment"),
+                    );
+                }
+                clients.working += 1;
+                Some(Working(self))
+            }
+            Request::Hello { .. } | Request::List | Request::Activity { .. } | Request::Shutdown => None,
+        };
         match request {
             Request::Hello { protocol, .. } => {
                 if protocol != PROTOCOL_VERSION {
@@ -191,14 +270,18 @@ impl Registry {
     /// Mark mounts whose volume disappeared as failed (and release them).
     pub fn check_health(&self) {
         let mut lost = Vec::new();
-        {
+        let _working = {
+            let mut clients = lock(&self.clients);
+            if self.shutdown_requested() {
+                return;
+            }
             let mut entries = lock(&self.entries);
             for entry in entries.iter_mut() {
                 if entry.info.state != MountState::Mounted {
                     continue;
                 }
                 if let Some(reason) = entry.handle.as_ref().and_then(|h| h.lost()) {
-                    entry.info.state = MountState::Failed;
+                    entry.info.state = MountState::Stopping;
                     entry.info.error = Some(ErrorInfo::new(ErrorCode::DriverUnavailable, reason.clone()));
                     entry.info.stats = None;
                     if let Some(handle) = entry.handle.take() {
@@ -206,27 +289,53 @@ impl Registry {
                     }
                 }
             }
+            if lost.is_empty() {
+                None
+            } else {
+                clients.working += 1;
+                Some(Working(self))
+            }
+        };
+        if lost.is_empty() {
+            if self.journal_retry.load(Ordering::Relaxed) {
+                self.write_journal();
+            }
+            return;
         }
+        // A lost volume may still have uploads to drain or files to recover.
+        // Keep it active and reserve its letter until the handle is released.
         for (target, reason, handle) in lost {
             self.record(EventLevel::Error, Some(&target), format!("Mount lost: {reason}"));
             let report = handle.unmount();
+            if let Some(summary) = report.incomplete_summary() {
+                self.record(EventLevel::Error, Some(&target), summary);
+            }
             for w in report.warnings {
                 self.record(EventLevel::Warning, Some(&target), w);
             }
+            if let Some(entry) = lock(&self.entries).iter_mut().find(|e| e.info.spec.target == target) {
+                entry.info.state = MountState::Failed;
+            }
         }
-        if !lock(&self.entries).is_empty() {
-            self.write_journal();
-        }
+        self.write_journal();
     }
 
     pub fn list(&self) -> Vec<MountInfo> {
-        self.check_health();
         lock(&self.entries)
             .iter()
             .map(|e| {
                 let mut info = e.info.clone();
                 if let Some(handle) = &e.handle {
-                    info.stats = Some(handle.stats());
+                    if let Some(reason) = handle.lost() {
+                        // The monitor drains and recovers outside the IPC request.
+                        // Report the loss even if this read beat the notification.
+                        info.state = MountState::Stopping;
+                        info.error = Some(ErrorInfo::new(ErrorCode::DriverUnavailable, reason));
+                        info.stats = None;
+                        self.changed.notify_one();
+                    } else {
+                        info.stats = Some(handle.stats());
+                    }
                 }
                 info
             })
@@ -314,6 +423,7 @@ impl Registry {
                         entry.info.resolved_source = handle.resolved_source();
                         let mut info = entry.info.clone();
                         info.stats = Some(handle.stats());
+                        handle.notify_on_loss(self.changed.clone());
                         entry.handle = Some(handle);
                         Ok(info)
                     }
@@ -500,6 +610,9 @@ impl Registry {
 
     fn write_journal(&self) {
         let Some(path) = &self.journal else { return };
+        // Serialize writers before taking the snapshot so an older snapshot
+        // cannot overwrite a newer one after a concurrent lifecycle change.
+        let mut written = lock(&self.journal_written);
         let mounts: Vec<JournalMount> = lock(&self.entries)
             .iter()
             .filter(|e| e.info.state == MountState::Mounted)
@@ -516,8 +629,8 @@ impl Registry {
         let Ok(json) = serde_json::to_vec_pretty(&journal) else {
             return;
         };
-        let mut written = lock(&self.journal_written);
         if written.as_deref() == Some(json.as_slice()) {
+            self.journal_retry.store(false, Ordering::Relaxed);
             return;
         }
         // Write a temporary file and rename it over the journal, so a crash
@@ -528,6 +641,7 @@ impl Registry {
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| std::fs::write(&tmp, &json))
             .and_then(|()| std::fs::rename(&tmp, path));
+        self.journal_retry.store(result.is_err(), Ordering::Relaxed);
         match result {
             Ok(()) => *written = Some(json),
             Err(e) => warn!("could not write session journal {}: {e}", path.display()),
@@ -536,8 +650,10 @@ impl Registry {
 
     pub fn remove_journal(&self) {
         if let Some(path) = &self.journal {
+            let mut written = lock(&self.journal_written);
             let _ = std::fs::remove_file(path);
-            *lock(&self.journal_written) = None;
+            *written = None;
+            self.journal_retry.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -578,6 +694,7 @@ mod tests {
         taken: Mutex<Vec<String>>,
         fail_with: Mutex<Option<ErrorInfo>>,
         unmounted: AtomicUsize,
+        teardown: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
 
     struct FakeMounter(Arc<FakeState>);
@@ -608,6 +725,10 @@ mod tests {
             self.unflushed
         }
         fn unmount(self: Box<Self>) -> UnmountReport {
+            if let Some((started, finish)) = lock(&self.state.teardown).take() {
+                started.send(()).unwrap();
+                finish.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
             self.state.unmounted.fetch_add(1, Ordering::SeqCst);
             lock(&self.state.taken).retain(|t| t != &self.target);
             UnmountReport {
@@ -785,6 +906,14 @@ mod tests {
         assert!(matches!(r.handle(mount_req("acme/l", "L:")), Response::Mounted { .. }));
         NEXT.with(|n| *n.borrow_mut() = (0, 0, None));
         lost.store(true, Ordering::SeqCst);
+        let pending = mounts(&r);
+        assert_eq!(pending[0].state, MountState::Stopping);
+        assert_eq!(
+            state.unmounted.load(Ordering::SeqCst),
+            0,
+            "a status read must not drain uploads"
+        );
+        r.check_health();
         let listed = mounts(&r);
         assert_eq!(listed[0].state, MountState::Failed);
         assert_eq!(listed[0].error.as_ref().unwrap().code, ErrorCode::DriverUnavailable);
@@ -814,6 +943,72 @@ mod tests {
         }
         assert!(matches!(r.handle(Request::Shutdown), Response::Ok));
         assert!(r.shutdown_requested());
+    }
+
+    #[test]
+    fn passive_clients_do_not_extend_idle_lifetime() {
+        let (r, _) = registry();
+        let last = lock(&r.clients).last;
+        for _ in 0..10 {
+            r.handle(Request::Hello {
+                protocol: PROTOCOL_VERSION,
+                client: "desktop".into(),
+            });
+            r.handle(Request::List);
+            r.handle(Request::Activity { limit: 300 });
+        }
+        assert_eq!(lock(&r.clients).last, last);
+        assert_eq!(r.idle_shutdown_delay(Duration::ZERO), Some(Duration::ZERO));
+        assert!(r.shutdown_requested());
+        assert!(matches!(r.handle(mount_req("acme/late", "H:")), Response::Error { .. }));
+    }
+
+    #[test]
+    fn idle_deadline_starts_after_last_operation_finishes() {
+        let (r, _) = registry();
+        let timeout = Duration::from_secs(600);
+        r.handle(mount_req("acme/active", "H:"));
+        assert_eq!(r.idle_shutdown_delay(Duration::ZERO), None);
+        let mounted = lock(&r.clients).last;
+        // Ensure an implementation that leaves the timestamp at mount time
+        // cannot pass even on a clock with coarse resolution.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            r.handle(Request::Unmount {
+                target: "H:".into(),
+                force: false
+            }),
+            Response::Unmounted { .. }
+        ));
+        assert!(lock(&r.clients).last > mounted);
+        assert!(r.idle_shutdown_delay(timeout).unwrap() > timeout / 2);
+        assert!(!r.shutdown_requested());
+    }
+
+    #[test]
+    fn lost_volume_recovery_reserves_the_letter_and_keeps_host_alive() {
+        let (r, state) = registry();
+        let lost = Arc::new(AtomicBool::new(false));
+        NEXT.with(|n| *n.borrow_mut() = (0, 3, Some(lost.clone())));
+        r.handle(mount_req("acme/recover", "H:"));
+        NEXT.with(|n| *n.borrow_mut() = (0, 0, None));
+        let (started, recovering) = std::sync::mpsc::channel();
+        let (finish, resume) = std::sync::mpsc::channel();
+        *lock(&state.teardown) = Some((started, resume));
+        lost.store(true, Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            scope.spawn(|| r.check_health());
+            recovering.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(mounts(&r)[0].state, MountState::Stopping);
+            assert_eq!(r.idle_shutdown_delay(Duration::ZERO), None);
+            assert!(matches!(
+                r.handle(mount_req("acme/other", "H:")),
+                Response::Error { .. }
+            ));
+            finish.send(()).unwrap();
+        });
+        assert_eq!(mounts(&r)[0].state, MountState::Failed);
+        assert_eq!(state.unmounted.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -48,16 +48,85 @@ fn bundled_winfsp(app: &AppHandle) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-#[tauri::command]
-pub async fn overview(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Overview> {
-    let mut ov = ops::overview(&state.identity).await;
-    ov.driver.bundled_installer = bundled_winfsp(&app).is_some();
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DesktopOverview {
+    #[serde(flatten)]
+    overview: Overview,
+    has_hosts: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_error: Option<ErrorInfo>,
+    foreground_unavailable: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct OverviewReader {
+    revision: u64,
+    last: Option<DesktopOverview>,
+    hosts: client::StatusConnections,
+}
+
+impl OverviewReader {
+    pub(crate) fn suspend(&mut self) {
+        self.last = None;
+        self.hosts = Default::default();
+    }
+
+    fn since(&mut self, known: Option<u64>, next: DesktopOverview) -> Option<(u64, DesktopOverview)> {
+        if self.last.as_ref() != Some(&next) {
+            self.revision += 1;
+            self.last = Some(next.clone());
+        } else if known == Some(self.revision) {
+            return None;
+        }
+        Some((self.revision, next))
+    }
+}
+
+async fn read_overview(app: &AppHandle, state: &AppState, reader: &mut OverviewReader) -> DesktopOverview {
+    let status = reader.hosts.list(&state.identity).await;
+    let has_hosts = !status.hosts.is_empty();
+    let incomplete = status.is_incomplete();
+    let mut ov = ops::overview_from_hosts(status.hosts);
+    crate::tray::update_status(app, ov.driver.installed, ov.mounts.iter(), incomplete);
+    ov.driver.bundled_installer = *state.bundled_installer.get_or_init(|| bundled_winfsp(app).is_some());
     let mut lost = state.lost.lock().unwrap_or_else(|e| e.into_inner());
-    if lost.is_none() {
+    if lost.is_none() && ov.supervisor.is_none() {
         *lost = client::take_lost_session(&state.identity);
     }
     ov.lost = lost.clone();
-    Ok(ov)
+    DesktopOverview {
+        overview: ov,
+        has_hosts,
+        status_error: status.supervisor_error,
+        foreground_unavailable: status.foreground_unavailable,
+    }
+}
+
+#[tauri::command]
+pub async fn overview(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Overview> {
+    let mut reader = state.status_read.lock().await;
+    let next = read_overview(&app, &state, &mut reader).await;
+    if !state.window.visible.load(Ordering::Acquire) {
+        reader.suspend();
+    }
+    Ok(next.overview)
+}
+
+/// Always refresh from the live hosts. Only the WebView serialization and
+/// transfer are conditional on the revision the caller actually received.
+#[tauri::command]
+pub(crate) async fn overview_since(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    revision: Option<u64>,
+) -> CmdResult<Option<(u64, DesktopOverview)>> {
+    let mut reader = state.status_read.lock().await;
+    let next = read_overview(&app, &state, &mut reader).await;
+    let response = reader.since(revision, next);
+    if !state.window.visible.load(Ordering::Acquire) {
+        reader.suspend();
+    }
+    Ok(response)
 }
 
 fn cli_exe(state: &AppState) -> CmdResult<&Path> {
@@ -92,7 +161,7 @@ pub async fn dismiss_mount(state: State<'_, AppState>, target: String) -> CmdRes
 
 #[tauri::command]
 pub fn dismiss_lost(state: State<'_, AppState>) -> CmdResult<()> {
-    // Keep a marker so the journal is not re-read; it was already removed.
+    // The journal was consumed when this report was read.
     *state.lost.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
 }
@@ -109,9 +178,18 @@ pub async fn activity(state: State<'_, AppState>, limit: usize) -> CmdResult<Vec
 }
 
 #[tauri::command]
-pub fn log_tail(lines: usize) -> CmdResult<Vec<String>> {
-    let path = config::logs_dir().join("supervisor.log");
-    Ok(hf_mount::manager::logging::tail(&path, lines.clamp(1, 2000)))
+pub async fn log_tail(lines: usize) -> CmdResult<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = config::logs_dir().join("supervisor.log");
+        hf_mount::manager::logging::tail(&path, lines.clamp(1, 2000))
+    })
+    .await
+    .map_err(internal)
+}
+
+#[tauri::command]
+pub fn hide_main(app: AppHandle) -> CmdResult<()> {
+    crate::window::hide_main(&app).map_err(internal)
 }
 
 #[tauri::command]
@@ -308,4 +386,43 @@ pub fn quit_app(app: AppHandle, state: State<'_, AppState>, unmount_all: bool, f
     }
     crate::quit(&app, Some(unmount_all), force.unwrap_or(false));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_status_can_be_omitted_only_for_the_matching_revision() {
+        let mut reader = OverviewReader::default();
+        let mut next = DesktopOverview {
+            overview: Overview {
+                driver: ops::DriverStatus {
+                    installed: true,
+                    bundled_installer: false,
+                    version: None,
+                    install_dir: None,
+                    error: None,
+                },
+                mounts: Vec::new(),
+                supervisor: None,
+                lost: None,
+                elevated: false,
+                free_letters: vec!["X:".into()],
+            },
+            has_hosts: false,
+            status_error: None,
+            foreground_unavailable: false,
+        };
+        let (first, _) = reader.since(None, next.clone()).unwrap();
+        assert!(reader.since(Some(first), next.clone()).is_none());
+        assert_eq!(reader.since(None, next.clone()).unwrap().0, first);
+        next.status_error = Some(ErrorInfo::new(ErrorCode::Timeout, "host timed out"));
+        let (second, snapshot) = reader.since(Some(first), next.clone()).unwrap();
+        assert!(snapshot.status_error.is_some());
+        assert_ne!(first, second);
+        assert_eq!(reader.since(Some(first), next.clone()).unwrap().0, second);
+        reader.suspend();
+        assert!(reader.since(Some(second), next).is_some());
+    }
 }

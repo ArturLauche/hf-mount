@@ -13,8 +13,9 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 use tracing::{debug, error, info, warn};
 
@@ -156,7 +157,7 @@ struct Adapter {
     security: SecurityDescriptor,
     label: Vec<u16>,
     stats: Arc<AdapterStats>,
-    stopped_abnormally: Arc<AtomicBool>,
+    dispatcher: Arc<DispatcherStatus>,
     hidden_logged: Mutex<HashSet<String>>,
 }
 
@@ -1044,11 +1045,20 @@ unsafe extern "system" fn get_dir_info_by_name(
     })
 }
 
+#[derive(Default)]
+struct DispatcherStatus {
+    lost: AtomicBool,
+    wake: OnceLock<Arc<Notify>>,
+}
+
 unsafe extern "system" fn dispatcher_stopped(fs: *mut FspFileSystem, normally: BOOLEAN) {
     if normally == 0 {
         // SAFETY: called by WinFsp for our file system.
         let a = unsafe { adapter(fs) };
-        a.stopped_abnormally.store(true, Ordering::SeqCst);
+        a.dispatcher.lost.store(true, Ordering::Release);
+        if let Some(wake) = a.dispatcher.wake.get() {
+            wake.notify_one();
+        }
         error!("WinFsp stopped serving this volume unexpectedly (driver unloaded or uninstalled?)");
     }
 }
@@ -1118,7 +1128,7 @@ pub struct WinFspMount {
     _interface: Box<FileSystemInterface>,
     mount_point: String,
     stats: Arc<AdapterStats>,
-    stopped_abnormally: Arc<AtomicBool>,
+    dispatcher: Arc<DispatcherStatus>,
     unmounted: Mutex<bool>,
 }
 
@@ -1159,7 +1169,7 @@ impl WinFspMount {
         }
 
         let stats = Arc::new(AdapterStats::default());
-        let stopped_abnormally = Arc::new(AtomicBool::new(false));
+        let dispatcher = Arc::new(DispatcherStatus::default());
         let adapter = Box::into_raw(Box::new(Adapter {
             api,
             vfs,
@@ -1171,7 +1181,7 @@ impl WinFspMount {
             security,
             label: config.volume_label.encode_utf16().take(32).collect(),
             stats: stats.clone(),
-            stopped_abnormally: stopped_abnormally.clone(),
+            dispatcher: dispatcher.clone(),
             hidden_logged: Mutex::new(HashSet::new()),
         }));
         // SAFETY: `fs` is a freshly created FSP_FILE_SYSTEM.
@@ -1222,7 +1232,7 @@ impl WinFspMount {
             _interface: iface,
             mount_point,
             stats,
-            stopped_abnormally,
+            dispatcher,
             unmounted: Mutex::new(false),
         })
     }
@@ -1237,7 +1247,11 @@ impl WinFspMount {
 
     /// WinFsp stopped the volume on its own (driver unload/uninstall).
     pub fn stopped_abnormally(&self) -> bool {
-        self.stopped_abnormally.load(Ordering::SeqCst)
+        self.dispatcher.lost.load(Ordering::Acquire)
+    }
+
+    pub(super) fn notify_on_loss(&self, wake: Arc<Notify>) {
+        let _ = self.dispatcher.wake.set(wake);
     }
 
     /// Remove the drive letter and stop serving requests. Open handles fail

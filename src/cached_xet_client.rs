@@ -7,7 +7,7 @@ use xet_client::ClientError;
 use xet_client::cas_client::adaptive_concurrency::ConnectionPermit;
 use xet_client::cas_client::{Client, ProgressCallback, ShardUploadProgressCallback, URLProvider};
 use xet_client::cas_types::{
-    BatchQueryReconstructionResponse, ChunkLayoutResponse, FileChunkHashesResponse, FileRange, HexMerkleHash,
+    BatchQueryReconstructionResponse, ChunkLayoutResponse, FileChunkHashesResponse, FileRange,
     QueryReconstructionResponseV2, XorbReconstructionTerm,
 };
 use xet_core_structures::merklehash::MerkleHash;
@@ -57,13 +57,34 @@ pub struct CachedXetClient {
     /// Reconstruction plan cache. Key is (file_hash, range) where `None` = full-file plan.
     /// Full-file plans are preferred: range queries are derived locally when available.
     /// Range-scoped entries serve as fast fallback while the full plan warms up.
-    cache: Mutex<HashMap<ReconCacheKey, CacheEntry>>,
-    /// Single-flight: in-flight CAS requests. When multiple callers request the same
-    /// key concurrently, only the first makes the CAS call; others wait and read from cache.
-    inflight: Mutex<HashMap<ReconCacheKey, tokio::sync::broadcast::Sender<()>>>,
+    cache: Mutex<CacheState>,
     ttl: Duration,
     /// Range plans derived from window plans and chunk layouts.
     windows: Option<Arc<WindowPlans>>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<ReconCacheKey, CacheEntry>,
+    inflight: HashMap<ReconCacheKey, tokio::sync::broadcast::Sender<()>>,
+}
+
+/// Removing the only sender wakes the followers, including if a timed-out
+/// read drops the CAS future before it can publish a result.
+struct Fetching<'a> {
+    client: &'a CachedXetClient,
+    key: ReconCacheKey,
+}
+
+impl Drop for Fetching<'_> {
+    fn drop(&mut self) {
+        self.client
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .inflight
+            .remove(&self.key);
+    }
 }
 
 impl CachedXetClient {
@@ -74,8 +95,7 @@ impl CachedXetClient {
     fn new_with_ttl(inner: Arc<dyn Client>, ttl: Duration) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            cache: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+            cache: Mutex::new(CacheState::default()),
             ttl,
             windows: None,
         })
@@ -84,8 +104,7 @@ impl CachedXetClient {
     pub fn with_window_plans(inner: Arc<dyn Client>, windows: Option<Arc<WindowPlans>>) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            cache: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+            cache: Mutex::new(CacheState::default()),
             ttl: CACHE_TTL,
             windows,
         })
@@ -121,7 +140,7 @@ fn derive_range_response(full: &QueryReconstructionResponseV2, range: FileRange)
     let mut cur_offset: u64 = 0;
     let mut result_terms: Vec<XorbReconstructionTerm> = Vec::new();
     let mut offset_into_first: u64 = 0;
-    let mut needed_hashes: std::collections::HashSet<HexMerkleHash> = std::collections::HashSet::new();
+    let mut xorbs = HashMap::new();
 
     for term in &full.terms {
         let term_start = cur_offset;
@@ -138,17 +157,14 @@ fn derive_range_response(full: &QueryReconstructionResponseV2, range: FileRange)
         if result_terms.is_empty() {
             offset_into_first = range.start.saturating_sub(term_start);
         }
-        needed_hashes.insert(term.hash);
+        if let std::collections::hash_map::Entry::Vacant(slot) = xorbs.entry(term.hash)
+            && let Some(fetches) = full.xorbs.get(&term.hash)
+        {
+            slot.insert(fetches.clone());
+        }
         result_terms.push(term.clone());
         cur_offset = term_end;
     }
-
-    let xorbs = full
-        .xorbs
-        .iter()
-        .filter(|(k, _)| needed_hashes.contains(*k))
-        .map(|(k, v)| (*k, v.clone()))
-        .collect();
 
     QueryReconstructionResponseV2 {
         offset_into_first_range: offset_into_first,
@@ -166,27 +182,19 @@ impl CachedXetClient {
     ) -> Result<Option<QueryReconstructionResponseV2>> {
         let key: ReconCacheKey = (*file_id, bytes_range);
 
-        // Single-flight action: either wait for an in-flight request or lead the fetch.
-        enum Action {
+        enum Lookup {
+            ExactHit(Arc<QueryReconstructionResponseV2>),
+            FullPlan(Arc<QueryReconstructionResponseV2>, FileRange),
             Wait(tokio::sync::broadcast::Receiver<()>),
-            Lead(tokio::sync::broadcast::Sender<()>),
+            Fetch,
         }
 
         loop {
-            // --- 1. Cache check ---
-            // Single lock: check exact key first, then full-file plan as fallback.
-            // For range queries the exact CAS response has tighter ChunkRanges (trimmed
-            // at chunk granularity) than what derive_range_response produces from the
-            // full plan, so prefer it when available.
-            enum CacheResult {
-                ExactHit(Arc<QueryReconstructionResponseV2>),
-                FullPlan(Arc<QueryReconstructionResponseV2>, FileRange),
-                Miss,
-            }
-
-            let cached = {
-                let mut cache = self.cache.lock().expect("cache poisoned");
-
+            // Checking the cache and claiming a miss are atomic: another
+            // reader cannot fill the cache between the two.
+            let lookup = {
+                let mut state = self.cache.lock().expect("cache poisoned");
+                let cache = &mut state.entries;
                 let try_get = |cache: &mut HashMap<ReconCacheKey, CacheEntry>,
                                key: ReconCacheKey|
                  -> Option<Arc<QueryReconstructionResponseV2>> {
@@ -203,20 +211,23 @@ impl CachedXetClient {
                     }
                 };
 
-                if let Some(resp) = try_get(&mut cache, key) {
-                    CacheResult::ExactHit(resp)
-                } else if let Some(range) = bytes_range {
-                    match try_get(&mut cache, (*file_id, None)) {
-                        Some(full) => CacheResult::FullPlan(full, range),
-                        None => CacheResult::Miss,
-                    }
+                if let Some(resp) = try_get(cache, key) {
+                    Lookup::ExactHit(resp)
+                } else if let Some(range) = bytes_range
+                    && let Some(full) = try_get(cache, (*file_id, None))
+                {
+                    Lookup::FullPlan(full, range)
+                } else if let Some(tx) = state.inflight.get(&key) {
+                    Lookup::Wait(tx.subscribe())
                 } else {
-                    CacheResult::Miss
+                    let (tx, _) = tokio::sync::broadcast::channel(1);
+                    state.inflight.insert(key, tx);
+                    Lookup::Fetch
                 }
             };
 
-            match cached {
-                CacheResult::ExactHit(resp) => {
+            match lookup {
+                Lookup::ExactHit(resp) => {
                     tracing::debug!(
                         "recon: HIT  file={:.8} range={:?} terms={}",
                         file_id,
@@ -225,7 +236,7 @@ impl CachedXetClient {
                     );
                     return Ok(Some((*resp).clone()));
                 }
-                CacheResult::FullPlan(full, range) => {
+                Lookup::FullPlan(full, range) => {
                     let resp = derive_range_response(&full, range);
                     // Mirror the CAS server's EOF contract:
                     // - Non-empty file, range past EOF → None
@@ -242,34 +253,18 @@ impl CachedXetClient {
                     );
                     return Ok(Some(resp));
                 }
-                CacheResult::Miss => {}
-            }
-
-            // --- 2. Single-flight: coalesce concurrent requests for the same key ---
-            let action = {
-                let mut inflight = self.inflight.lock().expect("inflight poisoned");
-                if let Some(tx) = inflight.get(&key) {
-                    Action::Wait(tx.subscribe())
-                } else {
-                    let (tx, _) = tokio::sync::broadcast::channel(1);
-                    inflight.insert(key, tx.clone());
-                    Action::Lead(tx)
-                }
-            };
-
-            match action {
-                Action::Wait(mut rx) => {
-                    // Another caller is fetching this key — wait, then re-check cache.
+                Lookup::Wait(mut rx) => {
                     let _ = rx.recv().await;
-                    continue;
                 }
-                Action::Lead(tx) => {
-                    // We're the leader — make the CAS call.
+                Lookup::Fetch => {
+                    let _fetching = Fetching { client: self, key };
                     tracing::debug!("recon: CAS  file={:.8} range={:?}", file_id, bytes_range);
                     let result = self.inner.get_reconstruction(file_id, bytes_range).await;
 
                     if let Ok(Some(response)) = &result {
-                        let mut cache = self.cache.lock().expect("cache poisoned");
+                        let entry = CacheEntry::new(Arc::new(response.clone()));
+                        let mut state = self.cache.lock().expect("cache poisoned");
+                        let cache = &mut state.entries;
 
                         // When inserting a full plan, purge redundant range entries for this hash
                         // (they're now derivable from the full plan, no point keeping them).
@@ -292,17 +287,13 @@ impl CachedXetClient {
                                 }
                             }
                         }
-                        cache.insert(key, CacheEntry::new(Arc::new(response.clone())));
+                        cache.insert(key, entry);
                     }
-
-                    // Notify waiters and clean up.
-                    self.inflight.lock().expect("inflight poisoned").remove(&key);
-                    let _ = tx.send(());
 
                     return result;
                 }
             }
-        } // loop
+        }
     }
 }
 
@@ -570,6 +561,73 @@ mod tests {
         compute_data_hash(&i.to_le_bytes())
     }
 
+    fn fragmented_plan() -> QueryReconstructionResponseV2 {
+        use xet_client::cas_types::{ChunkRange, HexMerkleHash, XorbMultiRangeFetch};
+        let mut terms = Vec::new();
+        let mut xorbs = HashMap::new();
+        for i in 0..4096 {
+            let hash = HexMerkleHash(hash_for(i % 1024));
+            xorbs.entry(hash).or_insert_with(|| {
+                vec![XorbMultiRangeFetch {
+                    url: format!("https://example.invalid/xorb/{hash}"),
+                    ranges: Vec::new(),
+                }]
+            });
+            let chunk = (i / 1024) as u32;
+            terms.push(XorbReconstructionTerm {
+                hash,
+                unpacked_length: 256 * 1024,
+                range: ChunkRange::new(chunk, chunk + 1),
+            });
+        }
+        QueryReconstructionResponseV2 {
+            terms,
+            xorbs,
+            offset_into_first_range: 0,
+        }
+    }
+
+    #[test]
+    fn ranges_include_only_intersecting_terms_and_their_fetches() {
+        let mut full = fragmented_plan();
+        full.terms.truncate(3);
+        // Two terms share a physical xorb, one has no descriptor in the plan.
+        full.terms[1].hash = full.terms[0].hash;
+        full.xorbs.remove(&full.terms[2].hash);
+        let length = u64::from(full.terms[0].unpacked_length);
+        let prefix = derive_range_response(&full, FileRange::new(length - 1, length * 2));
+        assert_eq!(prefix.offset_into_first_range, length - 1);
+        assert_eq!(prefix.terms.len(), 2);
+        assert_eq!(prefix.xorbs.len(), 1);
+        assert!(prefix.xorbs.contains_key(&full.terms[0].hash));
+
+        let suffix = derive_range_response(&full, FileRange::new(length * 2, length * 4));
+        assert_eq!(suffix.offset_into_first_range, 0);
+        assert_eq!(suffix.terms.len(), 1);
+        assert_eq!(suffix.terms[0].hash, full.terms[2].hash);
+        assert!(suffix.xorbs.is_empty());
+        let eof = derive_range_response(&full, FileRange::new(length * 3, length * 4));
+        assert!(eof.terms.is_empty() && eof.xorbs.is_empty());
+    }
+
+    #[test]
+    #[ignore = "offline performance measurement"]
+    fn fragmented_random_range_plans() {
+        let full = fragmented_plan();
+        for _ in 0..5 {
+            let start = Instant::now();
+            for i in 0..2000 {
+                let offset = (i * 991 % 4096) * 256 * 1024 + 8;
+                let response =
+                    derive_range_response(std::hint::black_box(&full), FileRange::new(offset, offset + 4096));
+                assert_eq!(response.offset_into_first_range, 8);
+                assert_eq!(response.terms.len(), 1);
+                assert!(response.xorbs.contains_key(&response.terms[0].hash));
+            }
+            eprintln!("2000 random 4 KiB range plans: {:?}", start.elapsed());
+        }
+    }
+
     #[tokio::test]
     async fn caches_successful_response_for_same_key() {
         let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
@@ -802,6 +860,28 @@ mod tests {
         // It's either still cached (1 call total) or was the evicted victim (refetched).
         // Either way, the important thing is we didn't clear ALL full plans.
         assert!(inner_impl.total_calls() <= total_before + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_plan_fetch_releases_followers() {
+        let inner = Arc::new(MockClient::with_delay(MockMode::ReturnSome, Duration::from_secs(1)));
+        let client = CachedXetClient::new(inner.clone());
+        let key = hash_for(3);
+        let read = || {
+            let c = client.clone();
+            tokio::spawn(async move { c.get_reconstruction(&key, None).await })
+        };
+        let leader = read();
+        tokio::task::yield_now().await;
+        assert_eq!(inner.total_calls(), 1);
+        let follower = read();
+        tokio::task::yield_now().await;
+        leader.abort();
+        let result = tokio::time::timeout(Duration::from_secs(5), follower)
+            .await
+            .expect("follower stalled");
+        assert!(result.unwrap().unwrap().is_some());
+        assert_eq!(inner.total_calls(), 2);
     }
 
     #[tokio::test]

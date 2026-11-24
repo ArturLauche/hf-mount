@@ -16,7 +16,8 @@ import {
 } from "lucide-react";
 import type { DriveRow } from "../lib/drives";
 import { errorTitle, sentence } from "../lib/errors";
-import { formatBytes, plural, relativeTime } from "../lib/format";
+import { useRelativeTime } from "../hooks/useRelativeTime";
+import { formatBytes, plural } from "../lib/format";
 import { displayName, sourceLine, typeLabel } from "../lib/source";
 import { Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger } from "./ui/overlay";
 import { Badge, Button, cn, Spinner, Tooltip } from "./ui/primitives";
@@ -68,6 +69,11 @@ function Status({ row, busy, letterBusy }: { row: DriveRow; busy: Busy; letterBu
   return <Badge tone="outline">Not mounted</Badge>;
 }
 
+function LastMounted({ at }: { at: string }) {
+  const age = useRelativeTime(at);
+  return <>Last mounted {age}</>;
+}
+
 function Meta({ row }: { row: DriveRow }) {
   const m = row.mount;
   const s = m?.stats;
@@ -100,7 +106,7 @@ function Meta({ row }: { row: DriveRow }) {
     if (s.failed_uploads > 0)
       items.push({ key: "failed", node: <span className="text-danger">{plural(s.failed_uploads, "upload")} failed</span> });
   } else if (!m && row.profile?.last_mounted_at) {
-    items.push({ key: "last", node: `Last mounted ${relativeTime(row.profile.last_mounted_at)}` });
+    items.push({ key: "last", node: <LastMounted at={row.profile.last_mounted_at} /> });
   }
   if (row.profile?.auto_mount) items.push({ key: "auto", node: "Mounts at startup" });
   if (m?.host_kind === "foreground")
