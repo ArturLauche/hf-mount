@@ -46,8 +46,23 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
   }
 }
 
+// A revision belongs to the snapshot in this WebView. A new window or
+// reload asks for the full response on its first request.
+let lastOverview: [number, Overview] | null = null;
+async function overview(): Promise<Overview> {
+  if (!isTauri) return call<Overview>("overview");
+  const previous = lastOverview;
+  const next = await call<[number, Overview] | null>("overview_since", { revision: previous?.[0] ?? null });
+  if (next) {
+    lastOverview = next;
+    return next[1];
+  }
+  if (previous) return previous[1];
+  throw new Error("Missing initial overview");
+}
+
 export const api = {
-  overview: () => call<Overview>("overview"),
+  overview,
   startMount: (spec: MountSpec, useStoredToken: boolean) =>
     call<MountInfo>("start_mount", { spec, useStoredToken }),
   stopMount: (target: string, force: boolean) => call<UnmountReport>("stop_mount", { target, force }),

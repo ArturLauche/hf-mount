@@ -83,7 +83,7 @@ export function NewDriveDialog({ open, onOpenChange, initial, freeLetters, profi
 
   // Keep the chosen letter valid as drives come and go.
   useEffect(() => {
-    if (open && !submitting && target && !freeLetters.includes(target)) setTarget(defaultLetter(freeLetters, profiles));
+    if (open && !submitting && !freeLetters.includes(target)) setTarget(defaultLetter(freeLetters, profiles));
   }, [open, submitting, target, freeLetters, profiles]);
 
   /**

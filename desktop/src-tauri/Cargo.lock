@@ -2091,6 +2091,8 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "tracing",
+ "webview2-com",
+ "windows-core",
 ]
 
 [[package]]
@@ -5819,8 +5821,6 @@ dependencies = [
 [[package]]
 name = "tray-icon"
 version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2b9c52859a94554803ccd4a24b98f74148ebc73b90676d783f3490b1bff9d72"
 dependencies = [
  "crossbeam-channel",
  "dirs 7.0.0",

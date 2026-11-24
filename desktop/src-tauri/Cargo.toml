@@ -10,6 +10,11 @@ publish = false
 # targets Windows and pulls in Tauri, which the CLI and the Linux/macOS
 # builds of hf-mount do not need.
 [workspace]
+exclude = ["vendor/tray-icon"]
+
+# Remove this patch once Tauri can resolve a release containing tray-icon #393.
+[patch.crates-io]
+tray-icon = { path = "vendor/tray-icon" }
 
 [lib]
 name = "hf_mount_desktop"
@@ -31,6 +36,11 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["time", "sync"] }
 tracing = "0.1"
+
+# The WebView2 bindings already used by Tauri. Set the memory target on its UI thread.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows-core = "0.62"
 
 [profile.release]
 codegen-units = 1

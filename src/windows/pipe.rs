@@ -68,7 +68,7 @@ impl Identity {
 
 /// Full names of this user's/session's host pipes currently in existence.
 pub fn list_host_pipes(identity: &Identity) -> Vec<String> {
-    let prefix = identity.prefix();
+    let prefix: Vec<u16> = identity.prefix().encode_utf16().collect();
     let pattern = wide(r"\\.\pipe\*");
     let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
     // SAFETY: valid pattern and out struct.
@@ -83,8 +83,8 @@ pub fn list_host_pipes(identity: &Identity) -> Vec<String> {
             .iter()
             .position(|&c| c == 0)
             .unwrap_or(data.cFileName.len());
-        if let Ok(name) = String::from_utf16(&data.cFileName[..len])
-            && name.starts_with(&prefix)
+        if data.cFileName[..len].starts_with(&prefix)
+            && let Ok(name) = String::from_utf16(&data.cFileName[..len])
         {
             names.push(format!(r"\\.\pipe\{name}"));
         }
@@ -161,19 +161,17 @@ async fn read_message(reader: &mut BufReader<ReadHalf<impl tokio::io::AsyncRead>
     Ok(Some(line))
 }
 
-/// Run a registry request on a plain OS thread: mounting blocks on the
-/// runtime and on WinFsp, so it must not run on a tokio worker.
+/// Handshakes and event reads are bounded in-memory operations. Drive stats
+/// can contend with an inode writer, so List stays on the blocking pool.
 async fn dispatch(registry: Arc<Registry>, request: Request) -> Response {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("hf-mount-request".into())
-        .spawn(move || {
-            let _ = tx.send(registry.handle(request));
+    if matches!(request, Request::Hello { .. } | Request::Activity { .. }) {
+        return registry.handle(request);
+    }
+    tokio::task::spawn_blocking(move || registry.handle(request))
+        .await
+        .unwrap_or_else(|_| Response::Error {
+            error: ErrorInfo::new(ErrorCode::Internal, "request handler panicked"),
         })
-        .expect("spawn request thread");
-    rx.await.unwrap_or(Response::Error {
-        error: ErrorInfo::new(ErrorCode::Internal, "request handler panicked"),
-    })
 }
 
 async fn serve_connection(pipe: NamedPipeServer, registry: Arc<Registry>, sid: String) {
@@ -201,6 +199,13 @@ async fn serve_connection(pipe: NamedPipeServer, registry: Arc<Registry>, sid: S
             }
         };
         let response = match decode::<Request>(&line) {
+            Ok(Request::Shutdown) => {
+                // Deliver the acknowledgement before waking the host to exit.
+                let _ = w.write_all(encode(&Response::Ok).as_bytes()).await;
+                let _ = w.flush().await;
+                registry.request_shutdown();
+                return;
+            }
             Ok(request) => dispatch(registry.clone(), request).await,
             Err(error) => Response::Error { error },
         };

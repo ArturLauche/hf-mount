@@ -1,6 +1,6 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// How long a file remembers the hashes this mount committed for it: see
@@ -283,6 +283,10 @@ impl InodeEntry {
 }
 
 pub struct InodeTable {
+    /// Status only. Mutable entry access, unlink, and subtree removal
+    /// invalidate this count under the table's existing write lock. New
+    /// entries are clean; eviction removes only clean files or orphans.
+    dirty_count: OnceLock<usize>,
     inodes: HashMap<u64, InodeEntry>,
     /// Path → inode reverse lookup. Key is shared with `InodeEntry.full_path`
     /// (same `Arc`) so each path is allocated once.
@@ -319,6 +323,7 @@ impl InodeTable {
     /// LRU order; left false in tests/configs that exercise neither.
     pub fn new(track_touches: bool) -> Self {
         let mut table = Self {
+            dirty_count: OnceLock::new(),
             inodes: HashMap::new(),
             path_to_inode: HashMap::new(),
             next_inode: AtomicU64::new(2),
@@ -370,6 +375,7 @@ impl InodeTable {
     }
 
     pub fn get_mut(&mut self, inode: u64) -> Option<&mut InodeEntry> {
+        self.dirty_count.take();
         self.inodes.get_mut(&inode)
     }
 
@@ -732,13 +738,20 @@ impl InodeTable {
         self.path_to_inode.insert(Arc::from(path), inode);
     }
 
-    /// Return inodes of all dirty files (excludes symlinks — they have no content to flush).
-    pub fn dirty_inos(&self) -> Vec<u64> {
+    fn dirty_files(&self) -> impl Iterator<Item = &InodeEntry> {
         self.inodes
             .values()
             .filter(|e| e.kind == InodeKind::File && e.is_dirty() && e.nlink > 0)
-            .map(|e| e.inode)
-            .collect()
+    }
+
+    /// Number of linked files with uncommitted writes, for repeated status reads.
+    pub fn dirty_file_count(&self) -> usize {
+        *self.dirty_count.get_or_init(|| self.dirty_files().count())
+    }
+
+    /// Return inodes of all dirty files (excludes symlinks — they have no content to flush).
+    pub fn dirty_inos(&self) -> Vec<u64> {
+        self.dirty_files().map(|e| e.inode).collect()
     }
 
     /// Snapshot of files still linked into the tree. An open, unlinked inode
@@ -1034,6 +1047,7 @@ impl InodeTable {
     /// If the inode is a directory, all descendants are removed recursively to
     /// prevent orphaned entries in the table.
     pub fn remove(&mut self, inode: u64) -> Option<InodeEntry> {
+        self.dirty_count.take();
         let entry = self.inodes.remove(&inode)?;
         self.path_to_inode.remove(&*entry.full_path);
         self.detach_from_parent(entry.parent, inode, entry.kind, false);
@@ -1073,7 +1087,7 @@ impl InodeTable {
 
         // Decrement nlink
         let entry_snapshot = {
-            let entry = self.inodes.get_mut(&child_ino)?;
+            let entry = self.get_mut(child_ino)?;
             entry.nlink = entry.nlink.saturating_sub(1);
             entry.ctime = SystemTime::now();
             entry.clone()
@@ -1896,6 +1910,60 @@ mod tests {
             0,
             0,
         );
+    }
+
+    #[test]
+    fn dirty_count_tracks_generation_unlink_and_subtree_removal() {
+        let mut table = InodeTable::default();
+        let dir = table.insert(
+            ROOT_INODE,
+            "d".into(),
+            "d".into(),
+            InodeKind::Directory,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o755,
+            0,
+            0,
+        );
+        let file = table.insert(
+            dir,
+            "a".into(),
+            "d/a".into(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        let other = table.insert(
+            dir,
+            "b".into(),
+            "d/b".into(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.get_mut(dir).unwrap().set_dirty();
+        assert_eq!(table.dirty_file_count(), 0);
+        table.get_mut(file).unwrap().set_dirty();
+        table.get_mut(other).unwrap().set_dirty();
+        assert_eq!(table.dirty_file_count(), 2);
+        table.get_mut(file).unwrap().apply_commit("hash", 0, 1);
+        assert_eq!(table.dirty_file_count(), 1);
+        table.get_mut(file).unwrap().set_dirty();
+        assert_eq!(table.dirty_file_count(), 2);
+        table.unlink_one(dir, "b").unwrap(); // open orphan is no longer counted
+        assert_eq!(table.dirty_file_count(), 1);
+        table.remove(dir);
+        assert_eq!(table.dirty_file_count(), 0);
     }
 
     #[test]

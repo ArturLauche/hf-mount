@@ -17,7 +17,7 @@ use crate::manager::protocol::{
 use crate::manager::spec::MountSpec;
 
 /// State of the WinFsp driver on this machine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DriverStatus {
     pub installed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,7 +59,7 @@ pub fn driver_status() -> DriverStatus {
 }
 
 /// Everything the drives screen shows, from every host of this session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Overview {
     pub driver: DriverStatus,
     /// The background supervisor, when it is running.
@@ -73,7 +73,11 @@ pub struct Overview {
 }
 
 pub async fn overview(identity: &Identity) -> Overview {
-    let hosts = client::list_hosts(identity).await;
+    overview_from_hosts(client::list_hosts(identity).await)
+}
+
+/// Build an overview from a single live discovery pass.
+pub fn overview_from_hosts(hosts: Vec<client::HostSummary>) -> Overview {
     let supervisor = hosts
         .iter()
         .find(|h| h.host.kind == HostKind::Supervisor)
@@ -210,8 +214,8 @@ pub async fn retry_uploads(identity: &Identity, target: &str) -> Result<(), Erro
 /// Recent events of every host, oldest first.
 pub async fn activity(identity: &Identity, limit: usize) -> Vec<ActivityEvent> {
     let mut events = Vec::new();
-    for host in client::list_hosts(identity).await {
-        if let Ok(mut conn) = Connection::open(&host.pipe, identity).await
+    for pipe in client::host_pipes(identity) {
+        if let Ok(mut conn) = Connection::open(&pipe, identity).await
             && let Ok(Response::Activity { events: e }) = conn.call(&Request::Activity { limit }).await
         {
             events.extend(e);

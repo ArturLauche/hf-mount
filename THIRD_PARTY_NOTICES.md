@@ -30,6 +30,7 @@ License 2.0) uses WinFsp under that exception. The full license text is in
 | Component | License |
 | --- | --- |
 | [Tauri](https://tauri.app) 2 and its plugins (dialog, opener, autostart, clipboard-manager, single-instance) | Apache-2.0 OR MIT |
+| [tray-icon](https://github.com/tauri-apps/tray-icon), including the upstream Windows leave-timer fix in the desktop build | Apache-2.0 OR MIT |
 | [React](https://react.dev) and React DOM | MIT |
 | [Radix UI primitives](https://www.radix-ui.com) | MIT |
 | [Lucide](https://lucide.dev) icons (`lucide-react`) | ISC |

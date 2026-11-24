@@ -6,19 +6,26 @@
 
 mod commands;
 mod tray;
+mod window;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use hf_mount::manager::config;
 use hf_mount::manager::protocol::ErrorCode;
 use hf_mount::windows::client::LostSession;
 use hf_mount::windows::ops;
 use hf_mount::windows::pipe::Identity;
-use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
+
+use window::{hide_main, show_main};
 
 pub(crate) struct AppState {
+    window: window::MainWindow,
+    status_read: tokio::sync::Mutex<commands::OverviewReader>,
+    tooltip: Mutex<String>,
+    bundled_installer: OnceLock<bool>,
     identity: Identity,
     /// `hf-mount.exe` installed next to the app; it runs the supervisor.
     cli_exe: Option<PathBuf>,
@@ -31,6 +38,10 @@ impl AppState {
     fn new() -> Result<Self, String> {
         let identity = Identity::current().map_err(|e| format!("cannot determine the current Windows user: {e}"))?;
         Ok(Self {
+            window: window::MainWindow::default(),
+            status_read: Default::default(),
+            tooltip: Mutex::new(String::new()),
+            bundled_installer: OnceLock::new(),
             identity,
             cli_exe: find_cli(),
             lost: Mutex::new(None),
@@ -53,18 +64,10 @@ fn find_cli() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-pub(crate) fn show_main(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.unminimize();
-        let _ = w.show();
-        let _ = w.set_focus();
-    }
-}
-
 /// Ask the window to switch page (`drives`, `new-drive`, ...).
 pub(crate) fn navigate(app: &AppHandle, page: &str) {
     show_main(app);
-    let _ = app.emit("navigate", page);
+    window::send_when_ready(app, "navigate", page);
 }
 
 /// Drives that a bulk unmount left mounted because files are open for
@@ -111,7 +114,7 @@ pub(crate) async fn unmount_all_or_ask(app: &AppHandle, force: bool, quitting: b
         return true;
     }
     navigate(app, "drives");
-    let _ = app.emit("unmount-blocked", BlockedUnmount { drives, quit: quitting });
+    window::send_when_ready(app, "unmount-blocked", BlockedUnmount { drives, quit: quitting });
     false
 }
 
@@ -128,9 +131,7 @@ pub(crate) fn quit(app: &AppHandle, unmount: Option<bool>, force: bool) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if unmount {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.hide();
-            }
+            let _ = hide_main(&app);
             tray::set_status(&app, "hf-mount — unmounting drives…");
             if !unmount_all_or_ask(&app, force, true).await {
                 tray::set_status(&app, "hf-mount — some drives are still in use");
@@ -151,6 +152,10 @@ async fn reconnect_saved_drives(app: AppHandle) {
     let Ok(profiles) = config::load_profiles() else {
         return;
     };
+    let mut profiles = profiles.into_iter().filter(|p| p.auto_mount).peekable();
+    if profiles.peek().is_none() {
+        return;
+    }
     let state = app.state::<AppState>();
     let Some(cli) = state.cli_exe.clone() else {
         return;
@@ -159,7 +164,7 @@ async fn reconnect_saved_drives(app: AppHandle) {
     if !overview.driver.installed {
         return;
     }
-    for profile in profiles.into_iter().filter(|p| p.auto_mount) {
+    for profile in profiles {
         if overview.mounts.iter().any(|m| m.spec.target == profile.spec.target) {
             continue;
         }
@@ -197,9 +202,18 @@ pub fn run() {
     };
     let minimized = std::env::args().any(|a| a == "--minimized");
 
+    let mut context = tauri::generate_context!();
+    if minimized && let Some(main) = context.config_mut().app.windows.iter_mut().find(|w| w.label == "main") {
+        // An autostart in the tray needs no WebView2 processes until Open.
+        main.create = false;
+    }
     let app = tauri::Builder::default()
-        // A second launch (Start menu, autostart) focuses the running app.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| show_main(app)))
+        // Start-menu launches reveal the app. Repeated autostarts stay in the tray.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if !argv.iter().any(|arg| arg == "--minimized") {
+                show_main(app);
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -209,7 +223,10 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
+            window::ui_listener_ready,
+            commands::hide_main,
             commands::overview,
+            commands::overview_since,
             commands::start_mount,
             commands::stop_mount,
             commands::dismiss_mount,
@@ -240,20 +257,22 @@ pub fn run() {
                 show_main(app.handle());
             }
             tauri::async_runtime::spawn(reconnect_saved_drives(app.handle().clone()));
-            tauri::async_runtime::spawn(tray::keep_status_fresh(app.handle().clone()));
             Ok(())
         })
         .on_window_event(|window, event| {
+            if matches!(event, WindowEvent::Focused(_) | WindowEvent::Resized(_)) {
+                window::publish_visibility(window.app_handle(), false);
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 if config::load_settings().unwrap_or_default().close_to_tray {
-                    let _ = window.hide();
+                    let _ = hide_main(window.app_handle());
                 } else {
                     quit(window.app_handle(), None, false);
                 }
             }
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building the hf-mount desktop app");
 
     app.run(|app, event| {

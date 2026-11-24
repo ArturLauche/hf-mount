@@ -54,6 +54,28 @@ $log = Join-Path $data 'logs\desktop.log'
 if (-not (Test-Path -LiteralPath $log)) { throw "the desktop app did not create $log" }
 Write-Host "ok  running as pid $($app.Id); log at $log"
 Get-Content -LiteralPath $log -Tail 20
+$webviewFilter = "ParentProcessId = $($app.Id) AND Name = 'msedgewebview2.exe'"
+if (Get-CimInstance Win32_Process -Filter $webviewFilter) { throw 'tray-only launch started WebView2' }
+
+Step "A repeated minimized launch keeps the existing instance in the tray"
+$second = Start-Process -FilePath (Join-Path $dir 'hf-mount-desktop.exe') -ArgumentList '--minimized' -PassThru
+if (-not $second.WaitForExit(15000) -or $second.ExitCode -ne 0) { throw 'second minimized launch did not exit cleanly' }
+$app.Refresh()
+if ($app.HasExited -or $app.MainWindowHandle -ne [IntPtr]::Zero -or (Get-CimInstance Win32_Process -Filter $webviewFilter)) {
+    throw 'a second minimized launch interrupted the tray-only session'
+}
+
+Step "Opening the installed app creates its first window and WebView2"
+Start-Process -FilePath (Join-Path $dir 'hf-mount-desktop.exe')
+$deadline = [DateTime]::UtcNow.AddSeconds(45)
+do {
+    $app.Refresh()
+    if ($app.HasExited) { throw 'the tray app exited during restore' }
+    $opened = $app.MainWindowHandle -ne [IntPtr]::Zero -and (Get-CimInstance Win32_Process -Filter $webviewFilter)
+    if ($opened) { break }
+    Start-Sleep -Milliseconds 250
+} while ([DateTime]::UtcNow -lt $deadline)
+if (-not $opened) { throw 'the running tray instance did not open its window and WebView2' }
 Stop-Process -Id $app.Id -Force
 Start-Sleep -Seconds 2
 

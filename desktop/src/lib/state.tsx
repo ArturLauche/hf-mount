@@ -1,4 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { updateRelativeTimes } from "../hooks/useRelativeTime";
+import { useVisiblePolling } from "../hooks/useVisiblePolling";
+import { onAppEvent } from "./native";
+import { sameSnapshot } from "./snapshot";
 import { api, errorInfo, isTauri } from "./api";
 import type { AccountStatus, AppInfo, ErrorInfo, Overview, Profile, Settings, Theme } from "./types";
 
@@ -33,44 +37,64 @@ export function applyTheme(theme: Theme) {
   else root.dataset.theme = theme;
 }
 
-const POLL_VISIBLE_MS = 2000;
-const POLL_HIDDEN_MS = 10000;
+const Visibility = createContext(false);
+const ActivityHosts = createContext<boolean | undefined>(undefined);
+export const useActivityHosts = () => useContext(ActivityHosts);
+export const useWindowVisible = () => useContext(Visibility);
+
+function useMainVisibility() {
+  const [visible, setVisible] = useState(() => !isTauri && document.visibilityState === "visible");
+  useEffect(() => {
+    let nativeVisible = !isTauri;
+    const update = () => setVisible(nativeVisible && document.visibilityState === "visible");
+    const onVisibility = (value: boolean) => {
+      nativeVisible = value;
+      update();
+    };
+    const stop = onAppEvent<boolean>("window-visibility", onVisibility, () => onVisibility(true));
+    document.addEventListener("visibilitychange", update);
+    update();
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, []);
+  return visible;
+}
 
 export function AppStateProvider({ children }: { children: ReactNode }) {
-  const [overview, setOverview] = useState<Overview | null>(null);
-  const [overviewError, setOverviewError] = useState<ErrorInfo | null>(null);
+  const [status, setStatus] = useState<Pick<AppState, "overview" | "overviewError">>({ overview: null, overviewError: null });
+  const { overview, overviewError } = status;
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [account, setAccount] = useState<AccountStatus | null>(null);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
-  const inFlight = useRef<Promise<void> | null>(null);
-  const again = useRef(false);
+  const visible = useMainVisibility();
+  const lastStatus = useRef(status);
+  const loaded = useRef(false);
   const savedSettings = useRef<Settings | null>(null);
   const settingsQueue = useRef<Promise<unknown>>(Promise.resolve());
 
-  // One request at a time. A refresh asked for while one is running (a poll
-  // tick racing a button) is not dropped: it runs once more afterwards, and
-  // every caller's promise resolves only after that fresh result is in.
-  const refresh = useCallback((): Promise<void> => {
-    if (inFlight.current) {
-      again.current = true;
-      return inFlight.current;
+  const readOverview = useCallback(async (signal: AbortSignal) => {
+    updateRelativeTimes();
+    let next: Overview | null;
+    let error: ErrorInfo | null;
+    try {
+      next = await api.overview();
+      error = next.status_error ?? null;
+    } catch (e) {
+      next = null;
+      error = errorInfo(e);
     }
-    const run = async () => {
-      do {
-        again.current = false;
-        try {
-          setOverview(await api.overview());
-          setOverviewError(null);
-        } catch (e) {
-          setOverviewError(errorInfo(e));
-        }
-      } while (again.current);
-      inFlight.current = null;
-    };
-    inFlight.current = run();
-    return inFlight.current;
+    if (signal.aborted) return false;
+    const changed = !sameSnapshot(lastStatus.current.overview, next);
+    if (changed || !sameSnapshot(lastStatus.current.overviewError, error)) {
+      lastStatus.current = { overview: next, overviewError: error };
+      setStatus(lastStatus.current);
+    }
+    return next !== null && (changed || next.mounts.some((m) => m.state === "starting" || m.state === "stopping"));
   }, []);
+  const refresh = useVisiblePolling(visible, readOverview, 2000, 8000);
 
   const refreshProfiles = useCallback(async () => {
     try {
@@ -107,6 +131,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    if (!visible || loaded.current) return;
+    loaded.current = true;
     void (async () => {
       try {
         const s = await api.settings();
@@ -122,27 +148,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         /* optional */
       }
     })();
-    void refresh();
     void refreshProfiles();
     void refreshAccount(true);
-  }, [refresh, refreshProfiles, refreshAccount]);
-
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout>;
-    const tick = () => {
-      void refresh();
-      timer = setTimeout(tick, document.visibilityState === "visible" ? POLL_VISIBLE_MS : POLL_HIDDEN_MS);
-    };
-    timer = setTimeout(tick, POLL_VISIBLE_MS);
-    const onVisible = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [refresh]);
+  }, [visible, refreshProfiles, refreshAccount]);
 
   const value = useMemo<AppState>(
     () => ({
@@ -162,5 +170,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }),
     [overview, overviewError, profiles, settings, account, appInfo, refresh, refreshProfiles, updateSettings, refreshAccount],
   );
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+  return (
+    <Visibility.Provider value={visible}>
+      <ActivityHosts.Provider value={overview?.has_hosts}>
+        <Ctx.Provider value={value}>{children}</Ctx.Provider>
+      </ActivityHosts.Provider>
+    </Visibility.Provider>
+  );
 }

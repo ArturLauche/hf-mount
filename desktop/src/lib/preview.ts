@@ -137,6 +137,7 @@ let lost: Overview["lost"] =
     ? { pid: 3920, started_at: now(), mounts: [{ target: "R:", source: "dataset/HuggingFaceFW/fineweb/main" }] }
     : null;
 
+const supervisorStarted = now();
 function overview(): Overview {
   return {
     driver: driverInstalled
@@ -144,7 +145,7 @@ function overview(): Overview {
       : { installed: false, bundled_installer: true },
     supervisor:
       mounts.length > 0
-        ? { pid: 4128, kind: "supervisor", version: "0.13.1", protocol: 1, started_at: now(), elevated: false, winfsp_version: "2.1" }
+        ? { pid: 4128, kind: "supervisor", version: "0.13.1", protocol: 1, started_at: supervisorStarted, elevated: false, winfsp_version: "2.1" }
         : null,
     mounts,
     lost,
@@ -182,7 +183,7 @@ export const previewBackend = {
     await sleep(80);
     switch (cmd) {
       case "overview":
-        return overview();
+        return structuredClone(overview());
       case "start_mount": {
         const s = args.spec as MountSpec;
         if (!driverInstalled) fail({ code: "driver_missing", message: "WinFsp is not installed" });

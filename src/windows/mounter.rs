@@ -258,6 +258,12 @@ impl MountHandle for WinMountHandle {
             .map(|_| "WinFsp stopped serving the volume (driver unloaded or uninstalled)".to_string())
     }
 
+    fn notify_on_loss(&self, wake: Arc<tokio::sync::Notify>) {
+        if let Some(mount) = &self.mount {
+            mount.notify_on_loss(wake);
+        }
+    }
+
     fn retry_uploads(&self) -> usize {
         self.setup.as_ref().map(|s| s.virtual_fs.requeue_dirty()).unwrap_or(0)
     }
